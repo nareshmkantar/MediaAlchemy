@@ -6695,21 +6695,22 @@ def propose_mapping(job_id):
         ai_mapper = SchemaMapper(llm_client=agent.llm_client, prompts_dir="prompts")
 
         import asyncio
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
 
         def _run_propose_on_df(df_block):
-            return loop.run_until_complete(
-                ai_mapper.propose_mapping(
-                    df_block,
-                    target_columns=target_columns,
-                    allow_heuristic_fallback=False,
-                    primary_targets=primary_targets,
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                return loop.run_until_complete(
+                    ai_mapper.propose_mapping(
+                        df_block,
+                        target_columns=target_columns,
+                        allow_heuristic_fallback=False,
+                        primary_targets=primary_targets,
+                    )
                 )
-            )
+            finally:
+                loop.close()
+                asyncio.set_event_loop(None)
 
         if multi_block_sheet and len(main_blocks_for_mapping) >= 2:
             mapping_blocks_sections: List[Dict[str, Any]] = []
