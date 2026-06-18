@@ -1352,7 +1352,7 @@ def _serialize_plan_for_review(plan_obj: Any) -> Dict[str, Any]:
 
 
 def _build_agent_from_config(config: Dict[str, Any]) -> StructureInferenceAgent:
-    model_name = config.get('llm_model', 'gemini-3-flash-preview')
+    model_name = config.get('llm_model', 'azure-gpt-5.3-chat')
     api_key = '' if model_name == 'rule-based' else config.get('api_key', '')
     return StructureInferenceAgent(
         config_path=str(Path(__file__).parent / 'config' / 'semantic_config.yaml'),
@@ -3147,10 +3147,13 @@ def load_user_config():
     """Load user configuration. Secrets come from env vars / .env only."""
     config = {
         "api_key": "",
-        "llm_model": "gemini-3-flash-preview",
+        "llm_model": "azure-gpt-5.3-chat",
         "debug_enabled": True,
-        # Paused by default: LLM judge adds latency and can force review from FAIL/REVIEW verdicts.
         "enable_llm_judge": False,
+        "azure_api_version": "2025-04-01-preview",
+        "azure_deployment": "gpt-5.3-chat",
+        "azure_endpoint": "",
+        "azure_ssl_verify": True,
     }
     
     if CONFIG_FILE.exists():
@@ -3162,6 +3165,25 @@ def load_user_config():
             config.update(persisted)
         except Exception as e:
             logger.error(f"Failed to load user config: {e}")
+
+    # Optional env override for cloud deploys (Render) where user_config.json is not committed
+    env_model = os.environ.get("SIA_LLM_MODEL") or os.environ.get("LLM_MODEL")
+    if env_model and str(env_model).strip():
+        config["llm_model"] = str(env_model).strip()
+    elif (
+        config.get("llm_model", "").startswith("azure-")
+        and not config.get("azure_deployment")
+        and os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+    ):
+        config["azure_deployment"] = os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+    elif (
+        config.get("llm_model") == "gemini-3-flash-preview"
+        and os.environ.get("AZURE_OPENAI_API_KEY")
+        and os.environ.get("AZURE_OPENAI_ENDPOINT")
+    ):
+        deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT") or "gpt-5.3-chat"
+        config["llm_model"] = f"azure-{deployment}"
+        config["azure_deployment"] = deployment
             
     config['keys'] = {}
         
@@ -3175,11 +3197,8 @@ def load_user_config():
                'azure' if current_model.startswith('azure-') else \
                'openai' if current_model.startswith('gpt-') else 'gemini'
         
-    config['api_key'] = config['keys'].get(provider) or \
-                        os.environ.get('OPENAI_API_KEY') or \
-                        os.environ.get('AZURE_OPENAI_API_KEY') or \
-                        os.environ.get('GEMINI_API_KEY') or \
-                        os.environ.get('GROQ_API_KEY')
+    # Use only the API key for the selected provider (never send Azure key to Gemini, etc.)
+    config['api_key'] = config['keys'].get(provider, '')
 
     if not config.get('azure_endpoint'):
         config['azure_endpoint'] = os.environ.get('AZURE_OPENAI_ENDPOINT')
@@ -3197,6 +3216,94 @@ def load_user_config():
         config["enable_llm_judge"] = False
 
     return config
+
+
+def verify_llm_credentials(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Test the configured LLM provider with a lightweight API call."""
+    model_name = str(config.get("llm_model") or "gemini-3-flash-preview")
+    api_key = str(config.get("api_key") or "").strip()
+
+    if model_name == "rule-based":
+        return {"ok": True, "provider": "rule-based", "message": "Rule-based mode (no LLM)."}
+
+    if not api_key:
+        return {
+            "ok": False,
+            "provider": model_name,
+            "message": "No API key configured for the selected model. Add your key in Settings.",
+            "redirect_settings": True,
+        }
+
+    is_azure = model_name.lower().startswith("azure-")
+    is_openai = model_name.lower().startswith("gpt-")
+
+    try:
+        if is_azure:
+            from openai import AzureOpenAI
+            import httpx
+
+            endpoint = str(config.get("azure_endpoint") or "").strip().rstrip("/")
+            if not endpoint:
+                return {
+                    "ok": False,
+                    "provider": model_name,
+                    "message": "Azure endpoint is missing. Set it in Settings or AZURE_OPENAI_ENDPOINT.",
+                    "redirect_settings": True,
+                }
+            if "/openai/" in endpoint:
+                endpoint = endpoint.split("/openai/")[0]
+            api_version = config.get("azure_api_version") or "2024-02-15-preview"
+            verify_ssl = bool(config.get("azure_ssl_verify", True))
+            try:
+                client = AzureOpenAI(
+                    api_key=api_key,
+                    api_version=api_version,
+                    azure_endpoint=endpoint,
+                    **({} if verify_ssl else {"http_client": httpx.Client(verify=False)}),
+                )
+                client.models.list()
+            except Exception as first_err:
+                full_err_msg = f"{str(first_err)} {str(getattr(first_err, '__cause__', ''))}".lower()
+                if verify_ssl and any(
+                    term in full_err_msg for term in ("certificate verify failed", "ssl", "cert", "handshake")
+                ):
+                    client = AzureOpenAI(
+                        api_key=api_key,
+                        api_version=api_version,
+                        azure_endpoint=endpoint,
+                        http_client=httpx.Client(verify=False),
+                    )
+                    client.models.list()
+                else:
+                    raise
+            return {
+                "ok": True,
+                "provider": model_name,
+                "message": "Verified with Azure OpenAI.",
+            }
+
+        if is_openai:
+            from openai import OpenAI
+
+            client = OpenAI(api_key=api_key)
+            client.models.list()
+            return {"ok": True, "provider": model_name, "message": "Verified with OpenAI."}
+
+        import google.generativeai as genai
+
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(model_name)
+        model.generate_content("Reply with exactly: API key valid")
+        return {"ok": True, "provider": model_name, "message": f"Verified with {model_name}."}
+
+    except Exception as e:
+        logger.warning("LLM credential verification failed (%s): %s", model_name, e)
+        return {
+            "ok": False,
+            "provider": model_name,
+            "message": f"LLM verification failed: {e}",
+            "redirect_settings": True,
+        }
 
 
 def save_user_config(config):
@@ -3250,6 +3357,16 @@ def get_config():
     for key in SECRET_CONFIG_KEYS:
         config.pop(key, None)
     return jsonify(config)
+
+
+@app.route('/api/config/verify', methods=['GET'])
+def verify_config():
+    """Verify that the active LLM API key and model settings work."""
+    config = load_user_config()
+    result = verify_llm_credentials(config)
+    result["api_key_set"] = bool(config.get("api_key"))
+    result["llm_model"] = config.get("llm_model")
+    return jsonify(result), (200 if result.get("ok") else 503)
 
 
 @app.route('/api/config', methods=['POST'])
@@ -3307,70 +3424,11 @@ def update_config():
     
     save_user_config(config)
     
-    # Verify API key with selected model
     if config.get('api_key'):
-        try:
-            model_name = config.get('llm_model', '')
-            is_azure = model_name.lower().startswith('azure-')
-            is_openai = model_name.lower().startswith('gpt-') or config.get('api_key', '').startswith('sk-')
-            
-            if is_azure:
-                # Verify with Azure OpenAI
-                from openai import AzureOpenAI
-                import httpx
-                endpoint = config.get('azure_endpoint', '').strip().rstrip('/')
-                if '/openai/' in endpoint:
-                    endpoint = endpoint.split('/openai/')[0]
-                
-                try:
-                    # Try with SSL verification first
-                    client = AzureOpenAI(
-                        api_key=config['api_key'],
-                        api_version=config.get('azure_api_version', '2024-02-15-preview'),
-                        azure_endpoint=endpoint
-                    )
-                    client.models.list()
-                    return jsonify({"success": True, "message": f"Settings saved! Verified with Azure OpenAI"})
-                except Exception as first_err:
-                    full_err_msg = f"{str(first_err)} {str(getattr(first_err, '__cause__', ''))}".lower()
-                    if any(term in full_err_msg for term in ["certificate verify failed", "ssl", "cert", "handshake"]):
-                        logger.warning(f"SSL/Connection issue detected for {endpoint}. Retrying without verification...")
-                        try:
-                            # Fallback: Disable SSL verification for corporate proxies
-                            client = AzureOpenAI(
-                                api_key=config['api_key'],
-                                api_version=config.get('azure_api_version', '2024-02-15-preview'),
-                                azure_endpoint=endpoint,
-                                http_client=httpx.Client(verify=False)
-                            )
-                            client.models.list()
-                            return jsonify({
-                                "success": True, 
-                                "message": f"Settings saved! Verified with Azure OpenAI"
-                            })
-                        except Exception as second_err:
-                             return jsonify({"success": False, "message": f"Azure Connection failed even without SSL verification: {str(second_err)}"})
-                    
-                    import traceback
-                    logger.error(f"Azure verification failed for {endpoint}: {str(first_err)}")
-                    logger.error(traceback.format_exc())
-                    return jsonify({"success": False, "message": f"Azure Connection failed (Endpoint: {endpoint}). Details: {str(first_err)}"})
-            elif is_openai:
-                # Verify with OpenAI
-                from openai import OpenAI
-                client = OpenAI(api_key=config['api_key'])
-                client.models.list() # Lightweight check
-                return jsonify({"success": True, "message": f"Settings saved! Verified with OpenAI"})
-            else:
-                # Verify with Google Gemini
-                import google.generativeai as genai
-                genai.configure(api_key=config['api_key'])
-                model = genai.GenerativeModel(model_name)
-                # Quick test
-                response = model.generate_content("Say 'API key valid' in 3 words")
-                return jsonify({"success": True, "message": f"Settings saved! Verified with {model_name}"})
-        except Exception as e:
-            return jsonify({"success": False, "message": f"Settings saved but verification failed: {str(e)}"})
+        result = verify_llm_credentials(config)
+        if result.get("ok"):
+            return jsonify({"success": True, "message": f"Settings saved! {result.get('message', '')}"})
+        return jsonify({"success": False, "message": result.get("message", "Verification failed.")})
     
     return jsonify({"success": True, "message": "Configuration saved"})
 
@@ -6681,15 +6739,26 @@ def propose_mapping(job_id):
             blocks = existing_scope.get("main_blocks") or []
 
         config = load_user_config()
-        agent = StructureInferenceAgent(
-            config_path=str(Path(__file__).parent / 'config' / 'semantic_config.yaml'),
-            api_key=config.get('api_key') or os.environ.get('GEMINI_API_KEY'),
-            model_name=config.get('llm_model') or config.get('model_name'),
-            azure_endpoint=config.get('azure_endpoint'),
-            azure_deployment=config.get('azure_deployment'),
-            azure_api_version=config.get('azure_api_version'),
-            azure_ssl_verify=config.get('azure_ssl_verify', True),
-        )
+        verify = verify_llm_credentials(config)
+        if not verify.get("ok"):
+            _set_mapping_propose_progress(
+                job_id,
+                verify.get("message") or "LLM not configured",
+                phase="error",
+                done=True,
+                error=verify.get("message"),
+                sheet_name=str(selected_sheet or ""),
+                source_id=progress_src,
+            )
+            return jsonify({
+                "error": verify.get("message"),
+                "redirect_settings": True,
+            }), 503
+
+        agent = _build_agent_from_config(config)
+        if not agent.llm_client:
+            msg = getattr(agent, "init_error", None) or "LLM client could not be initialized."
+            return jsonify({"error": msg, "redirect_settings": True}), 503
         from sia.debug.llm_observer import init_observer
         init_observer(run_id=f"mapping_{job_id}", model_id=getattr(agent, "model_name", "") or "")
         ai_mapper = SchemaMapper(llm_client=agent.llm_client, prompts_dir="prompts")

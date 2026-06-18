@@ -14,13 +14,58 @@ const appState = {
 };
 
 // ===== API Helpers =====
+async function parseJsonResponse(res) {
+    const contentType = res.headers.get('content-type') || '';
+    if (contentType.includes('application/json')) {
+        return res.json();
+    }
+    const text = await res.text();
+    const snippet = (text || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+    throw new Error(snippet ? `Server returned non-JSON (${res.status}): ${snippet}` : `Server returned non-JSON (${res.status})`);
+}
+
 async function fetchJson(url, options = {}) {
     const res = await fetch(API_BASE + url, {
         headers: { 'Content-Type': 'application/json', ...options.headers },
         ...options
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-    return res.json();
+    const data = await parseJsonResponse(res);
+    if (!res.ok) {
+        const err = new Error(data.error || data.message || `HTTP ${res.status}: ${res.statusText}`);
+        err.status = res.status;
+        err.data = data;
+        throw err;
+    }
+    return data;
+}
+
+async function verifyLlmConfig() {
+    const res = await fetch(API_BASE + '/api/config/verify');
+    const data = await parseJsonResponse(res);
+    return { ...data, httpOk: res.ok };
+}
+
+async function requireValidLlmConfig(options = {}) {
+    const { redirectOnFail = true, silent = false } = options;
+    const result = await verifyLlmConfig();
+    if (result.ok) {
+        appState.apiKeySet = true;
+        return result;
+    }
+    appState.apiKeySet = false;
+    const message = result.message || 'Configure a valid LLM API key in Settings.';
+    if (!silent) {
+        showToast(message, 'error');
+    }
+    if (redirectOnFail && result.redirect_settings !== false) {
+        const returnUrl = encodeURIComponent(window.location.pathname + window.location.search);
+        setTimeout(() => {
+            window.location.href = `/pages/settings.html?return=${returnUrl}&reason=llm`;
+        }, redirectOnFail === 'immediate' ? 0 : 1800);
+    }
+    const err = new Error(message);
+    err.redirectSettings = true;
+    throw err;
 }
 
 async function getJobStatus(jobId) {

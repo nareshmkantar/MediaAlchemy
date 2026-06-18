@@ -27,10 +27,33 @@ async function loadSettings() {
 
         // API status
         const statusEl = document.getElementById('apiStatus');
+        const params = new URLSearchParams(window.location.search);
+        if (params.get('reason') === 'llm') {
+            showToast('Configure and verify your LLM API key to continue.', 'warning');
+        }
+
         if (config.api_key_set) {
-            statusEl.innerHTML = `<span class="status-ok">✓ API Key configured</span>`;
+            statusEl.innerHTML = `<span class="status-ok">✓ API key configured — verifying…</span>`;
+            try {
+                const verify = await verifyLlmConfig();
+                if (verify.ok) {
+                    statusEl.innerHTML = `<span class="status-ok">✓ ${verify.message || 'LLM verified'}</span>`;
+                } else {
+                    statusEl.innerHTML = `<span class="status-warn">⚠ ${verify.message || 'Verification failed'}</span>`;
+                }
+            } catch (e) {
+                statusEl.innerHTML = `<span class="status-warn">⚠ Could not verify API key</span>`;
+            }
         } else {
             statusEl.innerHTML = `<span class="status-warn">⚠ No API key set</span>`;
+        }
+
+        const returnUrl = params.get('return');
+        if (returnUrl) {
+            const back = document.createElement('p');
+            back.className = 'help-text';
+            back.innerHTML = `<a href="${decodeURIComponent(returnUrl)}">← Back to where you left off</a>`;
+            statusEl.appendChild(back);
         }
 
         const judgeEl = document.getElementById('enableLlmJudgeToggle');

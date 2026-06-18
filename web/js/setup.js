@@ -2172,6 +2172,18 @@ async function loadMapping(force = false) {
         }
     }
 
+    try {
+        await requireValidLlmConfig({ redirectOnFail: 'immediate' });
+    } catch (e) {
+        if (statusEl) {
+            statusEl.textContent = 'Mapping Failed';
+            statusEl.className = 'status-badge danger';
+        }
+        elements.mappingGrid.innerHTML = `<p class="error-text">${escapeHtml(e.message || 'LLM not configured')}</p>
+            <p class="block-inline-note"><a href="/pages/settings.html">Open Settings</a> to configure your API key.</p>`;
+        return;
+    }
+
     const stopMappingProgressPoll = () => {
         if (mappingProgressTimer) {
             clearInterval(mappingProgressTimer);
@@ -2227,8 +2239,13 @@ async function loadMapping(force = false) {
         if (params.toString()) url += `?${params.toString()}`;
 
         const res = await fetch(url);
-        const data = await res.json();
+        const data = await parseJsonResponse(res);
         if (!res.ok || data.error) {
+            if (data.redirect_settings) {
+                const returnUrl = encodeURIComponent(window.location.pathname + window.location.search);
+                window.location.href = `/pages/settings.html?return=${returnUrl}&reason=llm`;
+                return;
+            }
             throw new Error(data.error || `Mapping request failed (${res.status})`);
         }
 
