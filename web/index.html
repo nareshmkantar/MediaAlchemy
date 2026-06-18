@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Structure Inference Agent</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+</head>
+
+<body>
+    <div class="app-container">
+        <!-- Hamburger Toggle Button (Outside Sidebar) -->
+        <button class="sidebar-toggle-btn active" id="sidebarToggle" title="Toggle Sidebar">
+            <span class="hamburger-line"></span>
+            <span class="hamburger-line"></span>
+            <span class="hamburger-line"></span>
+        </button>
+
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="sidebar-content">
+                <div class="logo">
+                    <div class="logo-icon">🔍</div>
+                    <span>Schema Agent 🚀</span>
+                </div>
+
+                <nav class="nav-menu">
+                    <button class="nav-item active" data-tab="upload">
+                        <span class="nav-icon">📤</span>
+                        Upload File
+                    </button>
+                    <button class="nav-item" data-tab="processing">
+                        <span class="nav-icon">⚙️</span>
+                        Processing
+                    </button>
+                    <button class="nav-item" data-tab="results">
+                        <span class="nav-icon">📊</span>
+                        Results
+                    </button>
+                    <button class="nav-item" data-tab="review">
+                        <span class="nav-icon">👁️</span>
+                        Review
+                        <span class="review-badge hidden" id="reviewBadge">0</span>
+                    </button>
+                    <button class="nav-item" data-tab="mapping">
+                        <span class="nav-icon">🎯</span>
+                        Schema Mapping
+                    </button>
+                    <button class="nav-item" data-tab="debug">
+                        <span class="nav-icon">🕷️</span>
+                        Debug
+                    </button>
+                    <button class="nav-item" data-tab="tests">
+                        <span class="nav-icon">🧪</span>
+                        Tests
+                    </button>
+                    <button class="nav-item" data-tab="settings">
+                        <span class="nav-icon">⚡</span>
+                        Settings
+                    </button>
+                </nav>
+
+                <div class="sidebar-footer">
+                    <div class="api-status" id="apiStatus">
+                        <span class="status-dot"></span>
+                        <span class="status-text">API Not Set</span>
+                    </div>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+
+        <main class="main-content">
+            <!-- Upload Tab -->
+            <section class="tab-content active" id="tab-upload">
+                <div class="page-header">
+                    <h1>Upload Excel File</h1>
+                    <p>Upload a messy Excel file to infer its schema automatically</p>
+                </div>
+
+                <div class="upload-zones-container">
+                    <div class="upload-zone" id="dropZoneExcel">
+                        <div class="upload-icon">📊</div>
+                        <div class="upload-text">
+                            <h3>Excel Data</h3>
+                            <p>Drag & Drop or Click</p>
+                            <span class="upload-hint">Supports: .xlsx, .xls, .csv</span>
+                        </div>
+                        <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" hidden>
+                    </div>
+
+                    <div class="upload-zone secondary-zone" id="dropZoneJson">
+                        <div class="upload-icon">📄</div>
+                        <div class="upload-text">
+                            <h3>JSON Template</h3>
+                            <p>Drag & Drop or Click</p>
+                            <span class="upload-hint">Optional: .json schema</span>
+                        </div>
+                        <input type="file" id="templateInput" accept=".json" hidden>
+                    </div>
+                </div>
+
+                <div class="file-info hidden" id="fileInfo">
+                    <div class="files-container">
+                        <div class="file-card" id="excelFileCard">
+                            <div class="file-icon">📊</div>
+                            <div class="file-details">
+                                <h4 id="fileName">-</h4>
+                                <p id="fileSize">-</p>
+                            </div>
+                            <button class="btn-icon" id="removeFile" title="Remove Excel">✕</button>
+                        </div>
+
+                        <div class="file-card hidden" id="templateFileCard">
+                            <div class="file-icon">📄</div>
+                            <div class="file-details">
+                                <h4 id="templateName">-</h4>
+                            </div>
+                            <button class="btn-icon" id="removeTemplate" title="Remove Template">✕</button>
+                        </div>
+                    </div>
+
+                    <button class="btn-primary btn-large" id="processBtn">
+                        <span class="btn-icon-left">🚀</span>
+                        Process File
+                    </button>
+                </div>
+            </section>
+
+            <!-- Processing Tab -->
+            <section class="tab-content" id="tab-processing">
+                <div class="page-header">
+                    <h1>Processing Pipeline</h1>
+                    <p>Watch the SIA pipeline process your file step by step</p>
+                </div>
+
+                <div class="processing-container">
+                    <!-- Log Timeline (Primary View) -->
+                    <div class="log-section">
+                        <h4>📜 Processing Activity Log</h4>
+                        <div class="steps-timeline" id="stepsTimeline">
+                            <div class="log-empty">Waiting for processing to start... 🔎</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Results Tab -->
+            <section class="tab-content" id="tab-results">
+                <div class="page-header">
+                    <h1>Inference Results</h1>
+                    <p>View inferred schema and normalized data</p>
+                </div>
+
+                <div class="results-container">
+
+
+                    <div class="tabs-inner">
+                        <button class="tab-btn active" data-inner-tab="schema">Schema</button>
+                        <button class="tab-btn" data-inner-tab="data">Data Preview</button>
+                        <button class="tab-btn" data-inner-tab="issues">
+                            Issues
+                            <span class="issue-badge hidden" id="issueCountBadge">0</span>
+                        </button>
+
+                        <div class="header-actions"
+                            style="margin-left: auto; display: flex; gap: 8px; align-items: center;">
+                            <button class="btn-secondary hidden" id="downloadButtons" style="display: contents;">
+                                <!-- kept for ID ref, but styled as contents -->
+                            </button>
+                            <button class="btn-secondary" id="downloadSchema"
+                                style="padding: 6px 12px; font-size: 13px; height: 32px;">
+                                <span>📥</span> Schema
+                            </button>
+                            <button class="btn-secondary" id="downloadData"
+                                style="padding: 6px 12px; font-size: 13px; height: 32px;">
+                                <span>📥</span> Data
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="inner-content active" id="inner-schema">
+                        <div class="schema-viewer" id="schemaViewer">
+                            <div class="empty-state">
+                                <div class="empty-icon">📋</div>
+                                <h3>No Schema Yet</h3>
+                                <p>Process a file to view the inferred schema</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="inner-content" id="inner-data">
+                        <div class="data-table-container" id="dataTableContainer">
+                            <div class="empty-state">
+                                <div class="empty-icon">📊</div>
+                                <h3>No Data Yet</h3>
+                                <p>Process a file to view normalized data</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="inner-content" id="inner-issues">
+                        <div class="issues-table-container" id="issuesTableContainer">
+                            <div class="empty-state">
+                                <div class="empty-icon">✅</div>
+                                <h3>No Issues Found</h3>
+                                <p>Verifier has not detected any structural issues</p>
+                            </div>
+                        </div>
+                    </div>
+
+
+
+
+                </div>
+            </section>
+
+            <!-- Schema Mapping Tab -->
+            <section class="tab-content" id="tab-mapping">
+                <div class="page-header">
+                    <h1>Schema Mapping (Step-0)</h1>
+                    <p>Classify source columns to create a balanced Media Canonical Working Table (MCWT)</p>
+                </div>
+
+                <div class="mapping-container">
+                    <div class="mapping-toolbar">
+                        <div class="mapping-stats">
+                            <span class="stat-pill"><span id="colCount">-</span> Columns</span>
+                            <span class="stat-pill success"><span id="keepCount">-</span> Keep</span>
+                            <span class="stat-pill danger"><span id="discardCount">-</span> Discard</span>
+                        </div>
+                        <button class="btn-primary" id="saveMappingBtn">
+                            <span>✅</span> Finalize Mapping
+                        </button>
+                    </div>
+
+                    <div class="mapping-workspace" id="mappingWorkspace">
+                        <div class="empty-state">
+                            <div class="empty-icon">🎯</div>
+                            <h3>No File Selected</h3>
+                            <p>Upload a file and start Step-0 mapping</p>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Review Tab -->
+            <section class="tab-content" id="tab-review">
+                <div class="page-header">
+                    <h1>Human Review Queue</h1>
+                    <p>Items flagged for review due to low confidence scores</p>
+                </div>
+
+                <div class="review-container">
+                    <!-- Review Stats -->
+                    <div class="review-stats" id="reviewStats">
+                        <div class="stat-card">
+                            <span class="stat-value" id="pendingCount">0</span>
+                            <span class="stat-label">Pending Reviews</span>
+                        </div>
+                        <div class="stat-card">
+                            <span class="stat-value" id="approvedCount">0</span>
+                            <span class="stat-label">Approved Today</span>
+                        </div>
+                        <div class="stat-card">
+                            <span class="stat-value" id="rejectedCount">0</span>
+                            <span class="stat-label">Rejected Today</span>
+                        </div>
+                    </div>
+
+                    <div class="review-table-container">
+                        <table class="review-table" id="reviewTable">
+                            <thead>
+                                <tr>
+                                    <th>Type</th>
+                                    <th>Item / File</th>
+                                    <th>Step / Tool</th>
+                                    <th>Confidence</th>
+                                    <th>Details</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="reviewTableBody">
+                                <!-- Populated dynamically -->
+                                <tr class="empty-row">
+                                    <td colspan="5">
+                                        <div class="empty-state">
+                                            <h3>No Pending Reviews</h3>
+                                            <p>All items have been reviewed or approved</p>
+                                        </div>
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Debug Tab -->
+            <section class="tab-content" id="tab-debug">
+                <div class="page-header" style="margin-bottom: 16px;">
+                    <h1>Debug Trace</h1>
+                    <p>Inspect execution flow, LLM prompts, and contexts</p>
+                </div>
+
+                <div class="split-pane-container">
+                    <!-- Left: Tree View -->
+                    <div class="pane-left">
+                        <div class="trace-viewer" id="traceViewer">
+                            <div class="empty-state">
+                                <div class="empty-icon">🕷️</div>
+                                <h3>No Debug Trace</h3>
+                                <p>Process a file with "Debug Mode" enabled</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Right: Details View -->
+                    <div class="pane-right">
+                        <div class="node-details-panel" id="nodeDetailsPanel">
+                            <div class="empty-detail-state">
+                                <p>Select a node to view details</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Settings Tab -->
+            <section class="tab-content" id="tab-settings">
+                <div class="page-header">
+                    <h1>Settings</h1>
+                    <p>Configure API key and processing options</p>
+                </div>
+
+                <div class="settings-container">
+                    <div class="settings-card">
+                        <h3>🤖 Model Selection</h3>
+                        <p>Choose the LLM model for AI-powered inference</p>
+
+                        <div class="input-group">
+                            <select id="modelSelect" class="form-select">
+                                <optgroup label="Gemini (Google)">
+                                    <option value="gemini-3-flash-preview" selected>Gemini 3 Flash Preview (Default)
+                                    </option>
+                                    <option value="gemini-2.0-flash">Gemini 2.0 Flash</option>
+                                    <option value="gemini-1.5-pro">Gemini 1.5 Pro</option>
+                                </optgroup>
+                                <optgroup label="Azure OpenAI">
+                                    <option value="azure-gpt-5.3-chat">azure-gpt-5.3-chat</option>
+                                    <option value="azure-gpt-5-mini">azure-gpt-5-mini</option>
+                                </optgroup>
+                                <optgroup label="Groq (Fast)">
+                                    <option value="groq-llama-3.3-70b-versatile">Groq Llama 3.3 70B</option>
+                                    <option value="groq-llama-3.1-8b-instant">Groq Llama 3.1 8B (Fast)</option>
+                                    <option value="groq-mixtral-8x7b-32768">Groq Mixtral 8x7B</option>
+                                    <option value="groq-gemma2-9b-it">Groq Gemma 2 9B</option>
+                                </optgroup>
+                                <optgroup label="Other">
+                                    <option value="rule-based">Rule-Based (No LLM)</option>
+                                    <option value="custom">Custom Model...</option>
+                                </optgroup>
+                            </select>
+                        </div>
+                        <div class="input-group hidden" id="customModelGroup">
+                            <input type="text" id="customModelInput"
+                                placeholder="Enter model name (e.g., gemini-1.0-pro or groq-llama3-8b-8192)">
+                        </div>
+                    </div>
+
+                    <div class="settings-card">
+                        <h3>🔑 API Key</h3>
+                        <p>Enter your API key (Gemini or Groq based on model selected above)</p>
+
+                        <div class="input-group">
+                            <input type="password" id="apiKeyInput" placeholder="Enter your API key">
+                            <button class="btn-icon" id="toggleApiKey">👁️</button>
+                        </div>
+
+                        <div class="api-key-status" id="apiKeyStatus"></div>
+
+                        <button class="btn-primary" id="saveApiKey">Save Settings</button>
+
+                        <div class="help-text">
+                            <p><strong>Gemini:</strong> Get from <a href="https://makersuite.google.com/app/apikey"
+                                    target="_blank">Google AI Studio</a></p>
+                            <p><strong>Groq:</strong> Get from <a href="https://console.groq.com/keys"
+                                    target="_blank">Groq Console</a></p>
+                        </div>
+                    </div>
+
+                    <div class="settings-card">
+                        <h3>📁 Output Format</h3>
+                        <p>Choose the format for exported data</p>
+
+                        <div class="radio-group">
+                            <label class="radio-option">
+                                <input type="radio" name="outputFormat" value="csv" checked>
+                                <span class="radio-custom"></span>
+                                <span>CSV</span>
+                            </label>
+                            <label class="radio-option">
+                                <input type="radio" name="outputFormat" value="parquet">
+                                <span class="radio-custom"></span>
+                                <span>Parquet</span>
+                            </label>
+                            <label class="radio-option">
+                                <input type="radio" name="outputFormat" value="json">
+                                <span class="radio-custom"></span>
+                                <span>JSON</span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="settings-card">
+                        <h3>🔧 Debug Mode</h3>
+                        <p>Enable detailed pipeline event logging for debugging</p>
+
+                        <div class="toggle-group">
+                            <label class="toggle-option">
+                                <input type="checkbox" id="debugModeToggle">
+                                <span class="toggle-switch"></span>
+                                <span>Enable Debug Mode</span>
+                            </label>
+                        </div>
+                        <div class="help-text">
+                            <p>When enabled, detailed debug events will be captured and displayed in the Execution Trace
+                                tab.</p>
+                        </div>
+                    </div>
+
+                    <div class="settings-card">
+                        <h3>⚖️ LLM quality judge</h3>
+                        <p>Optional post-run LLM critique of output vs. input sample (adds latency and can queue review).</p>
+                        <div class="toggle-group">
+                            <label class="toggle-option">
+                                <input type="checkbox" id="enableLlmJudgeToggle">
+                                <span class="toggle-switch"></span>
+                                <span>Run LLM judge after pipeline</span>
+                            </label>
+                        </div>
+                        <div class="help-text">
+                            <p>Off by default. Turn on to restore verdicts and per-step judge scores in the trace.</p>
+                        </div>
+                    </div>
+                </div>
+            </section>
+            <!-- Tests Tab -->
+            <section class="tab-content" id="tab-tests">
+                <div class="page-header">
+                    <h1>Agent Test Suite</h1>
+                    <p>Run tool-specific and pipeline tests on real-world datasets.</p>
+                    <p class="tests-doc-link"><a href="/pages/test-design-reference.html">Test design &amp; scenario reference</a> (union, join, duplicates, edge cases)</p>
+                </div>
+
+                <div class="tests-container">
+                    <div class="test-controls">
+                        <button class="btn-primary" id="runAllTests">Run All Tests</button>
+                    </div>
+
+                    <div class="test-grid" id="testGrid">
+                        <!-- Test cards will be injected here -->
+                    </div>
+                </div>
+
+                <div class="test-log-container hidden" id="testLogContainer">
+                    <div class="test-log-header">
+                        <h3>Execution Log</h3>
+                        <button class="btn-icon" id="closeTestLog">✕</button>
+                    </div>
+                    <div class="test-log" id="testLog"></div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Toast Notifications -->
+    <div class="toast-container" id="toastContainer"></div>
+
+    <script src="app.js"></script>
+</body>
+
+</html>

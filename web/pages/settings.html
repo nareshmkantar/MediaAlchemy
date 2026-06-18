@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Settings - Schema Agent</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="/styles.css">
+</head>
+
+<body>
+    <nav class="main-nav" id="mainNav" data-page="settings"></nav>
+
+    <main class="page-container">
+        <div class="page-header">
+            <h1>Settings</h1>
+            <p>Configure API keys and model options</p>
+        </div>
+
+        <div class="settings-grid">
+            <div class="settings-card">
+                <h3>🤖 Model Selection</h3>
+                <div class="form-group">
+                    <label>LLM Model</label>
+                    <select id="modelSelect" class="form-select">
+                        <optgroup label="Gemini (Google)">
+                            <option value="gemini-3-flash-preview" selected>Gemini 3 Flash Preview (Default)</option>
+                        </optgroup>
+                        <optgroup label="Azure OpenAI">
+                            <option value="azure-gpt-5.3-chat">azure-gpt-5.3-chat</option>
+                            <option value="azure-gpt-5-mini">azure-gpt-5-mini</option>
+                        </optgroup>
+                    </select>
+                </div>
+            </div>
+
+            <div id="azureFields" class="settings-card hidden">
+                <h3>☁️ Azure OpenAI Settings</h3>
+                <div class="form-group">
+                    <label>Azure Endpoint</label>
+                    <input type="text" id="azureEndpointInput" placeholder="https://resource.openai.azure.com/">
+                </div>
+                <div class="form-group">
+                    <label>Azure API Version</label>
+                    <input type="text" id="azureVersionInput" placeholder="2024-02-15-preview">
+                    <p class="help-text">Preview version from your Azure OpenAI resource</p>
+                </div>
+                <div class="form-group">
+                    <label>Azure Deployment Name (Model Name)</label>
+                    <input type="text" id="azureDeploymentInput" placeholder="gpt-5-mini">
+                    <p class="help-text">Use your Azure deployment/model name exactly as configured</p>
+                </div>
+            </div>
+
+            <div class="settings-card">
+                <h3>🔑 API Keys</h3>
+                <div class="form-group">
+                    <label>LLM API Key</label>
+                    <div class="input-row">
+                        <input type="password" id="apiKeyInput" placeholder="Azure/OpenAI/Gemini API Key">
+                        <button class="btn-icon toggle-key" data-target="apiKeyInput">👁️</button>
+                    </div>
+                </div>
+                <div class="api-status" id="apiStatus"></div>
+                <button class="btn-primary" id="saveBtn">Save Settings</button>
+            </div>
+
+            <div class="settings-card">
+                <h3>⚖️ LLM quality judge</h3>
+                <p>Optional post-run critique (extra model call; can affect review queue).</p>
+                <div class="toggle-group">
+                    <label class="toggle-option">
+                        <input type="checkbox" id="enableLlmJudgeToggle">
+                        <span class="toggle-switch"></span>
+                        <span>Run LLM judge after pipeline</span>
+                    </label>
+                </div>
+                <p class="help-text">Off by default. Saves immediately when toggled.</p>
+            </div>
+
+        </div>
+    </main>
+
+    <div class="toast-container" id="toastContainer"></div>
+
+    <script src="/js/common.js"></script>
+    <script src="/js/settings.js"></script>
+</body>
+
+</html>

@@ -1,0 +1,100 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://example.org/schemas/paid_media_impressions_minimal.json",
+  "title": "Paid Media Impressions (Minimal)",
+  "description": "Paid media impressions data with rule-driven derivations and explicit UID, metric, and supporting column separation.",
+  "type": "object",
+  "additionalProperties": false,
+
+  "x_scope": {
+    "variable_type": "Paid Media Impressions",
+
+    "modeling_period": {
+      "start_date": "2024-01-01",
+      "end_date": "2024-12-31"
+    },
+
+    "uid_hierarchy": [
+      "date",
+      "channel",
+      "publisher"
+    ],
+
+    "metrics": [
+      "spends",
+      "impressions"
+    ],
+
+    "supporting_columns": [
+      "region"
+    ],
+
+    "date_granularity": "daily"
+  },
+
+  "business_logic": {
+    "column_rules": [
+      {
+        "rule_id": "BL_PUBLISHER_DEFAULT",
+        "description": "Default publisher to 'total' when publisher is not available in source",
+        "source_column": "publisher",
+        "destination_column": "publisher",
+        "operator": "set_value",
+        "value": "total",
+        "condition": {
+          "type": "column_missing_or_null",
+          "column": "publisher"
+        }
+      }
+    ]
+  },
+
+  "aggregation_logic": {
+    "metric_rules": {
+      "impressions": "sum",
+      "spends": "sum"
+    },
+    "pmi_safe_rules": [
+      "When multiple rows exist for the same UID, sum impressions.",
+      "Never average impressions.",
+      "Do not split impressions across derived publishers."
+    ]
+  },
+
+  "properties": {
+    "date": {
+      "type": "string",
+      "format": "date",
+      "description": "Campaign execution date (YYYY-MM-DD)."
+    },
+
+    "channel": {
+      "type": "string",
+      "description": "Paid media channel.",
+      "enum": [
+        "TV",
+        "radio",
+        "out of home",
+        "print",
+        "digital"
+      ]
+    },
+
+    "publisher": {
+      "type": "string",
+      "description": "Publisher name. Derived as 'total' when not available in source."
+    },
+
+    "spends": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Net paid media spend (incl. fees, excl. VAT)."
+    },
+
+    "impressions": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Actual impressions delivered (raw counts, not in thousands)."
+    }
+  }
+}

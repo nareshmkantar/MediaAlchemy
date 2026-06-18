@@ -1,0 +1,9 @@
+{
+  "llm_model": "gemini-3-flash-preview",
+  "debug_enabled": true,
+  "enable_llm_judge": false,
+  "azure_api_version": "2025-04-01-preview",
+  "azure_deployment": "",
+  "azure_endpoint": "",
+  "azure_ssl_verify": true
+}

@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Review - Schema Agent</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="/styles.css">
+</head>
+
+<body>
+    <nav class="main-nav" id="mainNav" data-page="review"></nav>
+
+    <main class="page-container review-page">
+        <header class="review-page-header">
+            <h1>Review queue</h1>
+            <p class="review-page-lead">Paused runs that need a clear decision before processing continues.</p>
+        </header>
+
+        <div class="review-page-split review-split-pane">
+            <aside class="review-list-panel" aria-label="Pending reviews">
+                <h3>Waiting on you</h3>
+                <div class="review-list" id="reviewQueueList"></div>
+            </aside>
+            <section class="review-detail-panel" aria-label="Review detail">
+                <h3 class="review-detail-panel-title">Selected item</h3>
+                <div class="review-details" id="reviewDetails">
+                    <div class="empty-state compact">
+                        <div class="empty-icon">👈</div>
+                        <h3>Pick an item</h3>
+                        <p>Choose a row in the queue to open its review workspace.</p>
+                    </div>
+                </div>
+            </section>
+        </div>
+    </main>
+
+    <div class="toast-container" id="toastContainer"></div>
+
+    <script src="/js/common.js"></script>
+    <script src="/js/review.js?v=3.1"></script>
+</body>
+
+</html>

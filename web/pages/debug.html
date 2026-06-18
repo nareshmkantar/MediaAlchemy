@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Results - Schema Agent</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="/styles.css">
+</head>
+
+<body>
+    <nav class="main-nav" id="mainNav" data-page="debug"></nav>
+
+    <main class="page-container debug-layout compact">
+        <header class="debug-header results-top-bar" id="resultsExportBar" aria-label="Results header and actions">
+            <div class="results-top-bar__left header-left">
+                <h2>Results</h2>
+                <span class="job-info">Job: <strong id="jobId">-</strong> | <span id="jobStatus"
+                        class="status-badge">-</span></span>
+            </div>
+            <div class="results-top-bar__actions">
+                <button class="btn-primary btn-sm" id="downloadExcelBtn" type="button">📥 Download Excel</button>
+                <button class="btn-secondary btn-sm" id="previewResultBtn" type="button" aria-expanded="false" aria-controls="resultsPreviewPanel">👁️ Preview Result</button>
+                <div class="exports-dropdown" id="exportsAdvanced">
+                    <button class="btn-secondary btn-sm" type="button" id="exportsAdvancedToggle" aria-expanded="false" aria-controls="exportsAdvancedMenu" aria-haspopup="true">🗂️ Advanced exports</button>
+                    <div class="exports-dropdown-menu" id="exportsAdvancedMenu" role="menu" hidden>
+                        <button class="btn-secondary btn-sm" role="menuitem" id="downloadPreTransformBtn" type="button" title="Mapped + pruned sheet view before planner tools run">🧩 Pre-transform</button>
+                        <button class="btn-secondary btn-sm" role="menuitem" id="downloadPostTransformBtn" type="button" title="Final transformed grid as a separate workbook when available">🧾 Post-transform</button>
+                        <button class="btn-secondary btn-sm" role="menuitem" id="downloadArtifactsZipBtn" type="button" title="Zip of pre-transform file(s) plus post-transform if present">🗂️ Artifact bundle</button>
+                    </div>
+                </div>
+            </div>
+            <div class="debug-tabs results-top-bar__tabs" id="debugTabs">
+                <button class="debug-tab active" data-step="1" type="button">
+                    <span class="tab-icon">🔍</span>
+                    <span class="tab-label">Debug</span>
+                </button>
+                <button class="debug-tab" data-step="2" type="button">
+                    <span class="tab-icon">⏱️</span>
+                    <span class="tab-label">Lifecycle</span>
+                </button>
+                <button class="debug-tab" data-step="3" type="button">
+                    <span class="tab-icon">📊</span>
+                    <span class="tab-label">Run Summary</span>
+                </button>
+                <button class="debug-tab" data-step="4" type="button">
+                    <span class="tab-icon">🧠</span>
+                    <span class="tab-label">State</span>
+                </button>
+            </div>
+        </header>
+
+        <section id="resultsPreviewPanel" class="results-preview-panel" hidden aria-label="Combined output preview">
+            <div class="results-preview-header">
+                <h3 class="results-preview-title">Result preview</h3>
+                <div class="results-preview-actions">
+                    <span id="resultsPreviewMeta" class="results-preview-meta"></span>
+                    <button class="btn-secondary btn-sm" id="downloadTableCsvBtn" type="button" title="Download the exported table file">⬇️ Download CSV</button>
+                </div>
+            </div>
+            <p class="results-preview-help">Shows up to 20 rows from the same preview used for the job export. Use Download CSV for the full file.</p>
+            <div id="resultsPreviewTableHost" class="mini-data-preview results-preview-table-host"></div>
+        </section>
+
+        <div id="resultsSourceHint" class="results-source-hint" hidden></div>
+
+        <!-- Debug Content Panels -->
+        <div class="debug-content">
+            <!-- Tab 1: Job orchestration timeline + nested Agent Trace -->
+            <div class="debug-panel active" id="panel-1">
+                <div class="panel-body debug-orchestration-layout">
+                    <div class="debug-workspace">
+                        <section class="job-debug-section" id="jobDebugSection" aria-label="Job orchestration timeline">
+                            <header class="debug-section-heading debug-section-heading--sticky" id="jobDebugStickyHeader">
+                                <button type="button" class="section-collapse-btn" id="jobDebugCollapseBtn" aria-expanded="true" aria-controls="jobDebugBody" title="Collapse Job Debug">▼</button>
+                                <h3>Job Debug</h3>
+                                <span class="debug-section-help">Upload → setup → runs → export</span>
+                            </header>
+                            <div class="job-debug-body" id="jobDebugBody">
+                                <div class="debug-split-grid">
+                                    <div id="jobDebugTree" class="debug-split-list trace-tree"></div>
+                                    <div id="jobDebugDetail" class="debug-split-detail">
+                                        <div class="empty-state">Select a step</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </section>
+                        <section class="agent-trace-section" id="agentTraceSection" aria-label="LangGraph agent trace">
+                            <header class="debug-section-heading">
+                                <h3>Agent Trace</h3>
+                                <span class="debug-section-help">LangGraph tools · click an Agent run above to jump here</span>
+                            </header>
+                            <div class="debug-split-grid">
+                                <div id="traceTree" class="debug-split-list trace-tree"></div>
+                                <div id="nodeDetail" class="debug-split-detail">
+                                    <div class="empty-state">Select a step</div>
+                                </div>
+                            </div>
+                        </section>
+                    </div>
+                </div>
+            </div>
+
+
+
+            <!-- Tab 2: Lifecycle Timeline -->
+            <div class="debug-panel" id="panel-2">
+                <div class="panel-body" id="lifecycleContent" style="padding: 20px; overflow-y: auto;">
+                    <div class="lifecycle-header" style="display: flex; gap: 12px; align-items: center; margin-bottom: 16px;">
+                        <h3 style="margin: 0;">Run Lifecycle</h3>
+                        <span id="lifecycleStatus" class="status-badge" style="margin-left: auto;">-</span>
+                        <button id="lifecycleDownloadBtn" class="btn btn-primary btn-sm" style="display: none;">📥 Download Excel</button>
+                    </div>
+                    <div id="lifecycleTimeline" class="lifecycle-timeline">
+                        <div class="empty-state">No lifecycle events recorded</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab 3: Run Summary (formerly Metadata) -->
+            <div class="debug-panel" id="panel-3">
+                <div class="panel-body" id="summaryContent">
+                    <div class="summary-grid">
+                        <div class="summary-card">
+                            <h4>Model</h4>
+                            <div class="summary-value" id="metaModel">-</div>
+                        </div>
+                        <div class="summary-card">
+                            <h4>Total Calls</h4>
+                            <div class="summary-value" id="metaTotalCalls">0</div>
+                        </div>
+                        <div class="summary-card">
+                            <h4>Total Latency</h4>
+                            <div class="summary-value" id="metaLatency">0s</div>
+                        </div>
+                        <div class="summary-card">
+                            <h4>Tokens Used</h4>
+                            <div class="summary-value" id="metaTokens">0 in / 0 out</div>
+                        </div>
+                        <div class="summary-card">
+                            <h4>Avg Confidence</h4>
+                            <div class="summary-value" id="metaConfidence">-</div>
+                        </div>
+                        <div class="summary-card">
+                            <h4>Debug Enabled</h4>
+                            <div class="summary-value" id="metaDebug">Yes</div>
+                        </div>
+                    </div>
+                    <div class="planner-review-card" style="margin-top: 20px;">
+                        <h4>Final Output Preview</h4>
+                        <p class="planner-review-help">This is the latest finalized dataframe preview. Tool snapshots in the Trace tab are intermediate states captured after individual steps.</p>
+                        <div id="finalOutputPreview" class="mini-data-preview">
+                            <div class="empty-state">No final output preview available yet.</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab 4: Point-in-time State / Context / Memory snapshots -->
+            <div class="debug-panel" id="panel-4">
+                <div class="panel-body" id="stateSnapshotContent" style="padding: 20px; overflow-y: auto;">
+                    <div class="empty-state">No state snapshots recorded yet.</div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Modal for expanding prompts/code -->
+    <div class="modal-overlay" id="modalOverlay" onclick="closeModal()">
+        <div class="modal-content" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h3 id="modalTitle">Full Content</h3>
+                <div class="modal-actions">
+                    <button class="btn-icon" onclick="copyModalContent()" title="Copy">📋</button>
+                    <button class="btn-icon" onclick="closeModal()" title="Close">✕</button>
+                </div>
+            </div>
+            <div class="modal-body">
+                <div id="modalContent" class="modal-content-body code-block expanded"></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="toast-container" id="toastContainer"></div>
+
+    <script src="/js/common.js"></script>
+    <script src="/js/debug.js"></script>
+</body>
+
+</html>

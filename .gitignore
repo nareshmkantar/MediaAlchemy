@@ -1,0 +1,39 @@
+# Secrets & local config
+.env
+config/user_config.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+
+# Testing / tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Runtime data
+runtime/uploads/
+runtime/outputs/
+runtime/snapshots/
+runtime/logs/
+output/
+uploads/
+
+# Logs & debug
+*.log
+debug-*.log
+debug_output.txt
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

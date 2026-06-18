@@ -1,0 +1,12 @@
+{
+    "name": "merged_cells",
+    "description": "Table with merged cells in header and parent rows",
+    "expected_columns": ["Region", "Product", "Q1", "Q2", "Q3", "Q4"],
+    "expected_row_count_min": 5,
+    "expected_row_count_max": 50,
+    "expected_confidence_min": 0.6,
+    "should_require_review": true,
+    "review_reason_contains": ["merged", "fill"],
+    "expected_tools": ["extract_data_block", "fill_merged_cells"],
+    "max_iterations": 2
+}

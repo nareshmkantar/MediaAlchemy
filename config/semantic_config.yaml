@@ -1,0 +1,57 @@
+semantic_guidelines:
+  data_block_identification:
+    ignore_regions:
+      - "Header areas with > 80% empty cells"
+      - "Footer notes starting with 'Source:' or 'Confidential'"
+      - "Rows containing only formatting or decorative content"
+    candidate_criteria:
+      - "Rectangular regions with > 5 rows and > 2 columns"
+      - "Regions where column data types are consistent (> 90% match)"
+      - "Dense cell populations with minimal empty cells"
+  
+  attribute_classification:
+    dimensions:
+      keywords: ["Region", "Category", "SKU", "Name", "ID", "Code", "Type", "Status", "Country", "City"]
+      max_cardinality_ratio: 0.2
+      typical_types: ["string", "categorical"]
+    metrics:
+      keywords: ["Sales", "Revenue", "Qty", "Amount", "Total", "Price", "Cost", "Count", "Sum", "Value"]
+      data_types: ["int", "float", "currency"]
+    temporal:
+      keywords: ["Date", "Period", "Year", "Month", "Day", "Time", "Quarter", "Week"]
+  
+  temporal_recognition:
+    anchor_keywords: ["Date", "Period", "Year", "Month", "Day", "Timestamp"]
+    expected_formats:
+      - "%Y-%m-%d"
+      - "%d/%m/%Y"
+      - "%m/%d/%Y"
+      - "%b-%y"
+      - "%B %Y"
+      - "%d-%b-%Y"
+    output_format: "%Y-%m-%d"
+  
+  multi_sheet_strategy:
+    consolidation_mode: "auto_append"
+    partition_key_inference: true
+    similarity_threshold: 0.7
+    partition_patterns:
+      - "Q[1-4]"
+      - "\\d{4}_\\w+"
+      - "Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec"
+
+confidence_thresholds:
+  auto_approve: 0.9
+  flag_for_review: 0.6
+  stop_and_ask: 0.0
+
+llm_config:
+  provider: "gemini"
+  model: "gemini-3-flash-preview"
+  temperature: 0.1
+  max_tokens: 4096
+
+vector_store:
+  collection_name: "sia_examples"
+  embedding_model: "models/embedding-001"
+  top_k: 3

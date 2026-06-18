@@ -1,0 +1,21 @@
+# Schema Agent / Semantic Kernel stack — pin loosely for reproducible installs.
+openpyxl>=3.1.0,<4
+# Legacy Excel .xls (binary); pandas.read_excel needs this engine when users upload .xls
+xlrd>=2.0.1
+pandas>=2.0.0,<3
+numpy>=1.24.0
+pyarrow>=14.0.0
+pydantic>=2.0.0,<3
+python-dateutil>=2.8.0
+python-dotenv>=1.0.0
+PyYAML>=6.0.0
+google-generativeai>=0.3.0
+flask>=2.0.0,<4
+flask-cors>=4.0.0
+openai>=1.0.0
+langgraph>=0.0.10
+httpx>=0.25.0
+# Model Context Protocol — used by sia/mcp_server.py (FastMCP) and sia/utils/mcp_client.py
+mcp>=1.0.0,<2
+pytest>=7.0.0
+pytest-asyncio>=0.23.0

@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Schema Mapping - Schema Agent</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="/styles.css">
+</head>
+
+<body>
+    <nav class="main-nav" id="mainNav" data-page="setup"></nav>
+
+    <main class="page-container setup-page">
+        <section class="setup-top-stack" aria-label="Schema mapping">
+            <div class="setup-header setup-header--compact setup-context-header">
+                <div class="header-info setup-context-lines setup-context-lines--sources">
+                    <div id="setupSourcePanels" class="setup-source-panels">
+                        <div class="setup-source-panel">
+                            <div class="setup-source-panel-head">Files</div>
+                            <div id="setupFileList" class="setup-source-panel-scroll" role="listbox" aria-label="Workbooks"></div>
+                        </div>
+                        <div class="setup-source-panel">
+                            <div class="setup-source-panel-head">Sheets</div>
+                            <div id="setupSheetList" class="setup-source-panel-scroll" role="listbox" aria-label="Sheets in selected workbook"></div>
+                        </div>
+                    </div>
+                    <div class="setup-meta-row" aria-label="Job summary">
+                        <p class="setup-job-summary hidden" id="jobSummaryLine" aria-live="polite"></p>
+                        <p class="setup-progress-summary hidden" id="setupProgressSummary" aria-live="polite"></p>
+                        <p class="setup-stage-hint hidden" id="setupGlobalActionsHint" aria-live="polite"></p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <div class="workspace-container">
+            <div id="setupStickyWorkspaceHeader" class="setup-sticky-workspace-header">
+                <div id="setupContextStickyStrip" class="setup-context-sticky-strip setup-context-sticky-strip--stacked" aria-label="Current workbook and sheet">
+                    <div class="setup-context-sticky-inner setup-context-sticky-inner--with-actions">
+                        <div class="setup-context-sticky-left">
+                            <span class="setup-sticky-seg"><span class="setup-sticky-k">File</span> <span id="setupStickyFile" class="setup-sticky-v">—</span></span>
+                            <span class="setup-sticky-dot" aria-hidden="true">·</span>
+                            <span class="setup-sticky-seg"><span class="setup-sticky-k">Sheet</span> <span id="setupStickySheet" class="setup-sticky-v">—</span></span>
+                        </div>
+                        <button type="button" class="btn-secondary btn-setup-skip-compact" id="skipProcessBtn" title="Saves this sheet’s mapping draft if you are on mapping, opens Processing, and starts the run. Always available; incomplete jobs may error or pause for review.">Skip Set up &amp; Process</button>
+                    </div>
+                </div>
+                <div id="demarcationToolbarStickyRow" class="section-toolbar section-toolbar--demarcation-compact section-toolbar--sticky-row">
+                    <div class="toolbar-left">
+                        <h2>Layout Demarcation</h2>
+                        <span class="status-badge scanning" id="demarcationStatus">Scanning...</span>
+                    </div>
+                    <div class="toolbar-right demarcation-toolbar-actions">
+                        <button class="btn-secondary btn-sm" id="reScanBtn" type="button" title="Re-run layout detection for all sheets (new propose-all). Clears cached proposals. Uncertain regions still use the LLM when needed.">🔄 Re-Scan</button>
+                        <button type="button" class="btn-primary btn-sm btn-confirm-layout" id="confirmLayoutMapSheetBtn" title="Save this sheet’s layout and open column mapping for the same sheet">Confirm &amp; map →</button>
+                    </div>
+                </div>
+                <div id="mappingToolbarStickyRow" class="section-toolbar section-toolbar--mapping-compact section-toolbar--sticky-row hidden" aria-label="Semantic column mapping actions">
+                    <div class="toolbar-left">
+                        <h2 class="mapping-toolbar-heading">Semantic column mapping</h2>
+                        <span class="status-badge" id="mappingStatus">Pending</span>
+                    </div>
+                    <div class="toolbar-right demarcation-toolbar-actions mapping-toolbar-actions">
+                        <button type="button" class="btn-secondary btn-sm" id="backToLayoutBtn" title="Return to layout demarcation for this sheet">← Layout</button>
+                        <button type="button" class="btn-primary btn-sm btn-confirm-layout btn-confirm-mapping" id="saveMappingNextSheetBtn" title="Save mappings for this sheet and go to the next sheet">Save mapping &amp; next sheet →</button>
+                    </div>
+                </div>
+            </div>
+            <!-- Step 1: Demarcation Workspace -->
+            <div id="demarcationSection" class="section-container">
+                <div class="demarcation-workspace" id="demarcationWorkspace">
+                    <!-- Cards will be injected here -->
+                    <div class="empty-state">
+                        <span class="spinner"></span>
+                        <p>Analyzing spreadsheet layout patterns...</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Step 2: Mapping Workspace -->
+            <div id="mappingSection" class="section-container hidden">
+                <p id="mappingProposeLive" class="demarcation-scan-live mapping-propose-live" role="status" aria-live="polite" aria-atomic="true"></p>
+
+                <div class="mapping-grid" id="mappingGrid">
+                    <!-- Mapping cards will be injected here -->
+                    <div class="empty-state">
+                        <p>Waiting for layout confirmation...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Modal for Data Preview -->
+    <div id="previewModal" class="modal hidden">
+        <div class="modal-overlay"></div>
+        <div class="modal-content">
+            <div class="modal-header">
+                <div>
+                    <h3>Data Preview: <span id="previewRange">A1:C10</span></h3>
+                    <p class="modal-subtitle hidden" id="previewHeaderRowHint"></p>
+                </div>
+                <div class="modal-header-actions">
+                    <label class="inline-checkbox" title="Show detected header labels under column letters (otherwise letters only)">
+                        <input type="checkbox" id="previewShowHeaderLabelsChk" />
+                        <span>Show header labels in column row</span>
+                    </label>
+                    <button class="close-modal" id="closePreviewBtn">✕</button>
+                </div>
+            </div>
+            <div class="modal-body">
+                <div id="previewSpinner" class="hidden"><span class="spinner"></span> Loading preview...</div>
+                <div class="table-container" id="previewTableContainer">
+                    <table id="previewTable">
+                        <thead>
+                            <tr id="previewHeader"></tr>
+                        </thead>
+                        <tbody id="previewBody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="toast-container" id="toastContainer"></div>
+
+    <script src="/js/common.js"></script>
+    <script src="/js/setup.js"></script>
+</body>
+
+</html>

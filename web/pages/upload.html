@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Upload - Schema Agent</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="/styles.css">
+</head>
+
+<body>
+    <nav class="main-nav" id="mainNav" data-page="upload"></nav>
+
+    <main class="page-container upload-page">
+        <h1 class="upload-page-sr-only">Upload</h1>
+
+        <div class="upload-grid-container">
+            <div class="upload-grid">
+                <!-- Data File Zone -->
+                <div class="upload-column">
+                    <h3>1. Data Files (Required)</h3>
+                    <div class="upload-zone" id="dropZoneData">
+                        <div class="upload-icon">📊</div>
+                        <p>Drag Excel/CSV files here</p>
+                        <input type="file" id="fileInputData" accept=".xlsx,.xls,.csv" multiple hidden>
+                        <span class="upload-hint">Supports: .xlsx, .xls, .csv</span>
+                    </div>
+                    <div class="file-info hidden" id="fileInfoData" style="margin-top: 16px;">
+                        <div id="sourceSelectorContainer" class="upload-sources-panel sheet-selector-container hidden" style="margin-top: 16px;">
+                            <div id="sheetTabList" class="upload-sources-tree" role="region" aria-label="Uploaded workbooks and sheets"></div>
+                            <div id="sheetDropdownContainer" class="sheet-dropdown-container hidden">
+                                <label for="sheetDropdown" class="sheet-dropdown-label">All sheets (compact)</label>
+                                <select id="sheetDropdown" class="sheet-dropdown"></select>
+                            </div>
+                            <input type="hidden" id="sheetSelect">
+                            <input type="hidden" id="sourceSelect">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Target Scope File Zone -->
+                <div class="upload-column">
+                    <h3>2. Target Scope (Required)</h3>
+                    <div class="upload-zone secondary" id="dropZoneSchema">
+                        <div class="upload-icon">⚙️</div>
+                        <p>Drag JSON Scope Template here</p>
+                        <input type="file" id="fileInputSchema" accept=".json" hidden>
+                        <span class="upload-hint">Supports: .json (Target Scope Template)</span>
+                    </div>
+                    <div class="file-info hidden" id="fileInfoSchema" style="margin-top: 16px;">
+                        <div class="file-card">
+                            <div class="file-icon">📄</div>
+                            <div class="file-details">
+                                <h4 id="fileNameSchema">-</h4>
+                                <p id="fileSizeSchema">-</p>
+                            </div>
+                            <button class="btn-icon" id="removeFileSchema">✕</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="actions-row upload-actions-row">
+            <button class="btn-primary upload-action-btn" id="mappingBtn" disabled>
+                <span>🧭</span> Start Guided Setup
+            </button>
+        </div>
+
+        <div class="recent-jobs upload-recent-jobs" id="recentJobs">
+            <h3>Recent Jobs</h3>
+            <div class="jobs-list" id="jobsList">
+                <p class="empty-state">No recent jobs</p>
+            </div>
+        </div>
+    </main>
+
+    <div class="toast-container" id="toastContainer"></div>
+
+    <script src="/js/common.js"></script>
+    <script src="/js/upload.js"></script>
+</body>
+
+</html>

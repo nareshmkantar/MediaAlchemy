@@ -1,0 +1,26 @@
+{
+    "name": "messy_headers",
+    "description": "Table with messy headers, multiple header rows, summary rows",
+    "expected_columns": [
+        "Brand",
+        "Campaign",
+        "Metric",
+        "Value"
+    ],
+    "expected_row_count_min": 5,
+    "expected_row_count_max": 100,
+    "expected_confidence_min": 0.4,
+    "should_require_review": true,
+    "review_reason_contains": [
+        "confidence",
+        "header",
+        "summary"
+    ],
+    "expected_tools": [
+        "extract_data_block",
+        "filter_summary_rows",
+        "filter_header_rows"
+    ],
+    "max_iterations": 3,
+    "notes": "Complex scenario - may require multiple iterations"
+}

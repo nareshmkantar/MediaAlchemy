@@ -1,0 +1,158 @@
+{
+    "_version": "3.0",
+    "_description": "Synonym dictionary aligned to target_template.json. Keys match template column names exactly.",
+    "column_synonyms": {
+        "date": [
+            "date_paid_media",
+            "event_date",
+            "week_start_date",
+            "start_date",
+            "end_date",
+            "report_date",
+            "period",
+            "week",
+            "month",
+            "year",
+            "time_period",
+            "date_range",
+            "campaign_date",
+            "execution_date",
+            "media_date",
+            "flight_date"
+        ],
+        "publisher": [
+            "publisher_name",
+            "publisher_name_paid_media",
+            "pub_name",
+            "Pillar",
+            "pillar",
+            "station",
+            "site",
+            "site_name",
+            "media_owner",
+            "vendor",
+            "media_vendor",
+            "partner",
+            "media_partner",
+            "property",
+            "digital_publisher"
+        ],
+        "channel": [
+            "channel_paid_media",
+            "channel_name",
+            "media_channel",
+            "platform",
+            "media_type",
+            "ad_channel",
+            "marketing_channel",
+            "medium",
+            "media_medium",
+            "channel_type"
+        ],
+        "spends": [
+            "total_cost",
+            "total_cost_paid_media",
+            "spend",
+            "cost",
+            "total_spend",
+            "ad_spend",
+            "media_spend",
+            "gross_spend",
+            "net_spend",
+            "investment",
+            "budget",
+            "net_cost",
+            "media_cost",
+            "spending",
+            "expenditure",
+            "amount_spent"
+        ],
+        "impressions": [
+            "impressions_paid_media",
+            "impression",
+            "imps",
+            "total_impressions",
+            "gross_impressions",
+            "net_impressions",
+            "impression_count",
+            "views",
+            "ad_views",
+            "exposures"
+        ],
+        "region": [
+            "geo",
+            "geography",
+            "market",
+            "country",
+            "territory",
+            "area",
+            "location",
+            "region_name",
+            "dma"
+        ]
+    },
+    "value_synonyms": {
+        "channel_values": {
+            "TV": [
+                "television",
+                "tv_linear",
+                "linear_tv",
+                "broadcast_tv",
+                "cable_tv",
+                "spot_tv"
+            ],
+            "radio": [
+                "am_fm",
+                "terrestrial_radio",
+                "broadcast_radio",
+                "spot_radio"
+            ],
+            "out of home": [
+                "ooh",
+                "outdoor",
+                "billboard",
+                "billboards",
+                "transit",
+                "dooh",
+                "digital_out_of_home"
+            ],
+            "print": [
+                "newspaper",
+                "magazine",
+                "press",
+                "print_media",
+                "editorial"
+            ],
+            "digital": [
+                "display",
+                "digital_display",
+                "programmatic_display",
+                "online",
+                "digital_media",
+                "programmatic",
+                "banner",
+                "banners",
+                "native",
+                "video",
+                "social",
+                "search"
+            ]
+        },
+        "region_values": {
+            "national": [
+                "nationwide",
+                "all_markets",
+                "total_market",
+                "us",
+                "uk",
+                "total"
+            ],
+            "local": [
+                "regional",
+                "dma",
+                "metro",
+                "spot"
+            ]
+        }
+    }
+}

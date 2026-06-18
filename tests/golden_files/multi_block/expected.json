@@ -1,0 +1,22 @@
+{
+    "name": "multi_block",
+    "description": "Multiple data blocks on same sheet",
+    "expected_columns": [
+        "Name",
+        "Value",
+        "Category"
+    ],
+    "expected_row_count_min": 5,
+    "expected_row_count_max": 100,
+    "expected_confidence_min": 0.5,
+    "should_require_review": true,
+    "review_reason_contains": [
+        "multiple",
+        "block"
+    ],
+    "expected_tools": [
+        "extract_data_block"
+    ],
+    "max_iterations": 3,
+    "notes": "May need HITL to select correct block"
+}

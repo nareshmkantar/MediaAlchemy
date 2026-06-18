@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Schema Mapping - Schema Agent</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="/styles.css">
+</head>
+
+<body>
+    <nav class="main-nav" id="mainNav" data-page="mapping"></nav>
+
+    <main class="page-container">
+        <div class="page-header">
+            <h1>Schema Mapping (Step-0)</h1>
+            <p>Classify source columns to create a balanced Media Canonical Working Table (MCWT)</p>
+        </div>
+
+        <!-- Sheet Selection Bar -->
+        <div id="sheetSelectionBar" class="sheet-selection-bar hidden">
+            <label
+                style="display: block; font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-secondary); margin-bottom: 8px;">Switch
+                Sheet</label>
+            <div id="sheetTabList" class="sheet-tab-list">
+                <!-- Buttons will be injected here -->
+            </div>
+        </div>
+
+        <div class="mapping-container">
+            <div class="mapping-toolbar">
+                <div class="mapping-stats">
+                    <span class="stat-pill"><span id="colCount">-</span> Columns</span>
+                    <span class="stat-pill success"><span id="keepCount">-</span> Keep</span>
+                    <span class="stat-pill danger"><span id="discardCount">-</span> Discard</span>
+                </div>
+                <button class="btn-primary" id="saveMappingBtn">
+                    <span>✅</span> Finalize Mapping
+                </button>
+            </div>
+
+            <div class="mapping-workspace" id="mappingWorkspace">
+                <div class="empty-state">
+                    <div class="empty-icon">📤</div>
+                    <h3>No Active File Found</h3>
+                    <p>It looks like you haven't uploaded a data file yet, or your previous session has expired.</p>
+                    <p style="margin-top: 8px; font-size: 13px; color: var(--text-secondary);">
+                        Go to the <strong>Upload</strong> page to select a file and come back here for Step-0 column
+                        mapping.
+                    </p>
+                    <button class="btn-primary" style="margin-top: 20px;" onclick="navigateTo('upload')">
+                        Go to Uploads
+                    </button>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <div class="toast-container" id="toastContainer"></div>
+
+    <script src="/js/common.js"></script>
+    <script src="/js/mapping.js"></script>
+</body>
+
+</html>

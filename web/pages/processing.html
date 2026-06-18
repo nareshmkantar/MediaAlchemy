@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Console - Schema Agent</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="/styles.css">
+</head>
+
+<body>
+    <nav class="main-nav" id="mainNav" data-page="processing"></nav>
+
+    <main class="page-container">
+        <div class="page-header">
+            <h1>Console</h1>
+            <p>Job: <span id="jobId">-</span></p>
+        </div>
+
+        <div id="unionReadinessBanner" class="mapping-reuse-banner" hidden></div>
+
+        <div id="transformationPhaseBanner" class="transformation-phase-banner" hidden aria-live="polite"></div>
+
+        <div class="status-panel" id="statusPanel">
+            <div class="status-header">
+                <span class="status-icon">⏳</span>
+                <span class="status-title">Waiting...</span>
+            </div>
+            <div class="status-content">
+                <p>Upload a file to start processing</p>
+            </div>
+        </div>
+
+        <div class="log-section">
+            <details class="processing-log-details" id="processingLogDetails" open>
+                <summary class="processing-log-summary">Processing log <span class="processing-log-hint">(scrollable while running; collapses when finished)</span></summary>
+                <div class="log-timeline-scroll" id="logTimelineScroll">
+                    <div class="log-timeline" id="logTimeline">
+                        <div class="log-empty">Waiting for processing...</div>
+                    </div>
+                </div>
+            </details>
+        </div>
+    </main>
+
+    <div class="toast-container" id="toastContainer"></div>
+
+    <script src="/js/common.js"></script>
+    <script src="/js/processing.js"></script>
+</body>
+
+</html>

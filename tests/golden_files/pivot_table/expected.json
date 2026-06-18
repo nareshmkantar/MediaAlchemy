@@ -1,0 +1,22 @@
+{
+    "name": "pivot_table",
+    "description": "Crosstab/pivot table that needs unpivoting",
+    "expected_columns": [
+        "Entity",
+        "Period",
+        "Value"
+    ],
+    "expected_row_count_min": 10,
+    "expected_row_count_max": 200,
+    "expected_confidence_min": 0.5,
+    "should_require_review": true,
+    "review_reason_contains": [
+        "pivot",
+        "unpivot"
+    ],
+    "expected_tools": [
+        "extract_data_block",
+        "unpivot_columns"
+    ],
+    "max_iterations": 2
+}

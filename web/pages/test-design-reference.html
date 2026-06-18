@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Test design reference - Schema Agent</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="/styles.css">
+    <style>
+        .ref-doc {
+            max-width: 1100px;
+        }
+
+        .ref-doc .page-header p {
+            color: var(--text-secondary);
+            margin-top: 8px;
+        }
+
+        .ref-back {
+            margin-top: 12px;
+            font-size: 0.9rem;
+        }
+
+        .ref-back a {
+            color: var(--primary-light);
+        }
+
+        .ref-toc {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-lg);
+            padding: 20px 24px;
+            margin: 24px 0;
+        }
+
+        .ref-toc h2 {
+            font-size: 1rem;
+            margin: 0 0 12px;
+            font-weight: 600;
+        }
+
+        .ref-toc ol {
+            margin: 0;
+            padding-left: 20px;
+            color: var(--text-secondary);
+            line-height: 1.8;
+        }
+
+        .ref-toc a {
+            color: var(--text-primary);
+            text-decoration: none;
+        }
+
+        .ref-toc a:hover {
+            color: var(--primary-light);
+            text-decoration: underline;
+        }
+
+        .ref-section {
+            margin: 32px 0 40px;
+        }
+
+        .ref-section h2 {
+            font-size: 1.15rem;
+            font-weight: 600;
+            padding-bottom: 10px;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 16px;
+        }
+
+        .ref-section h3 {
+            font-size: 1rem;
+            font-weight: 600;
+            margin: 20px 0 10px;
+            color: var(--text-primary);
+        }
+
+        .ref-note {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-top: 8px;
+        }
+
+        .ref-table-wrap {
+            overflow-x: auto;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            margin: 12px 0;
+        }
+
+        .ref-table-wrap table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.9rem;
+        }
+
+        .ref-table-wrap th,
+        .ref-table-wrap td {
+            padding: 10px 12px;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
+            vertical-align: top;
+        }
+
+        .ref-table-wrap th {
+            background: var(--bg-card);
+            font-weight: 600;
+            color: var(--text-secondary);
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.02em;
+        }
+
+        .ref-table-wrap tr:last-child td {
+            border-bottom: none;
+        }
+
+        .ref-table-wrap tbody tr:nth-child(even) {
+            background: rgba(30, 41, 59, 0.5);
+        }
+
+        .ref-table-wrap code,
+        .ref-code {
+            font-family: 'Fira Code', ui-monospace, monospace;
+            font-size: 0.82rem;
+            background: rgba(15, 23, 42, 0.9);
+            padding: 2px 6px;
+            border-radius: 4px;
+            color: #cbd5e1;
+        }
+
+        .ref-blockquote {
+            margin: 12px 0;
+            padding: 12px 16px;
+            border-left: 3px solid var(--primary);
+            background: var(--bg-card);
+            border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+
+        .ref-pill {
+            display: inline-block;
+            font-size: 0.7rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            padding: 2px 8px;
+            border-radius: 4px;
+            background: rgba(99, 102, 241, 0.15);
+            color: var(--primary-light);
+            margin-right: 6px;
+        }
+
+        .ref-purpose {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+            gap: 12px;
+            margin: 16px 0;
+        }
+
+        .ref-purpose li {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            padding: 12px 14px;
+            list-style: none;
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+        }
+
+        .ref-purpose ul {
+            margin: 0;
+            padding: 0;
+            display: contents;
+        }
+    </style>
+</head>
+
+<body>
+    <nav class="main-nav" id="mainNav" data-page="tests"></nav>
+
+    <main class="page-container ref-doc">
+        <div class="page-header">
+            <h1>Test design reference</h1>
+            <p>Human-readable catalog of multi-source scenarios: what to feed in, what operation applies, and how to
+                judge correctness (decision logic and output shape — not individual tool names).</p>
+            <p class="ref-back"><a href="/pages/tests.html">Run automated tests</a></p>
+        </div>
+
+        <section class="ref-purpose">
+            <ul>
+                <li>UI validation (messages, warnings, recommended action)</li>
+                <li>LLM / planner decision correctness</li>
+                <li>Transformation output shape and row counts</li>
+            </ul>
+        </section>
+
+        <nav class="ref-toc" aria-label="On this page">
+            <h2>Contents</h2>
+            <ol>
+                <li><a href="#base-dataset">Base dataset (example input)</a></li>
+                <li><a href="#g1">1 · Union / stack (same schema)</a></li>
+                <li><a href="#g2">2 · Merge / join (different schema)</a></li>
+                <li><a href="#g3">3 · Duplicates and overlaps</a></li>
+                <li><a href="#g4">4 · Partial match / column mismatch</a></li>
+                <li><a href="#g5">5 · Multi-sheet / multi-file patterns</a></li>
+                <li><a href="#g6">6 · Bad data / conflict / failure</a></li>
+                <li><a href="#rules">When systems choose union vs join vs separate</a></li>
+                <li><a href="#matrix">Quick test matrix</a></li>
+            </ol>
+        </nav>
+
+        <section class="ref-section" id="base-dataset">
+            <h2>Base dataset (your input)</h2>
+            <p class="ref-note">Typical paid-media columns used as a running example in scenarios below.</p>
+            <div class="ref-table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Column</th>
+                            <th>Description</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><span class="ref-code">date_paid_media</span></td>
+                            <td>Event or spend date</td>
+                        </tr>
+                        <tr>
+                            <td><span class="ref-code">publisher_name_paid_media</span></td>
+                            <td>Publisher / vendor</td>
+                        </tr>
+                        <tr>
+                            <td><span class="ref-code">channel_paid_media</span></td>
+                            <td>Channel (e.g. Programmatic)</td>
+                        </tr>
+                        <tr>
+                            <td><span class="ref-code">total_cost_paid_media</span></td>
+                            <td>Spend / cost</td>
+                        </tr>
+                        <tr>
+                            <td><span class="ref-code">impressions_paid_media</span></td>
+                            <td>Impressions</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            <h3>Example rows</h3>
+            <div class="ref-table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>date_paid_media</th>
+                            <th>publisher_name_paid_media</th>
+                            <th>channel_paid_media</th>
+                            <th>total_cost_paid_media</th>
+                            <th>impressions_paid_media</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>6/26/2023</td>
+                            <td>Blis Media</td>
+                            <td>Programmatic</td>
+                            <td>6.33</td>
+                            <td>422</td>
+                        </tr>
+                        <tr>
+                            <td>6/27/2023</td>
+                            <td>Blis Media</td>
+                            <td>Programmatic</td>
+                            <td>20.175</td>
+                            <td>1345</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="ref-section" id="g1">
+            <h2><span class="ref-pill">Group 1</span> Union / stack (same schema)</h2>
+            <div class="ref-table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Scenario</th>
+                            <th>Input</th>
+                            <th>Expected</th>
+                            <th>Checks</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>1.1</td>
+                            <td>Perfect union</td>
+                            <td>File A through 26th; File B from 27th; same schema</td>
+                            <td>Stack rows; no structural transform</td>
+                            <td>Row count = A + B; no unintended dupes; columns aligned</td>
+                        </tr>
+                        <tr>
+                            <td>1.2</td>
+                            <td>Overlapping dates</td>
+                            <td>A has 6/26, 6/27; B has 6/27, 6/28</td>
+                            <td>Union allowed; warn that date/channel/publisher keys may duplicate</td>
+                            <td>Either keep dupes or apply explicit de-dupe rule — behaviour documented</td>
+                        </tr>
+                        <tr>
+                            <td>1.3</td>
+                            <td>Column order differs</td>
+                            <td>Same columns, shuffled order (e.g. publisher before date)</td>
+                            <td>Align by column name; safe union</td>
+                            <td>Stable mapping; no column drift</td>
+                        </tr>
+                        <tr>
+                            <td>1.4</td>
+                            <td>Missing column in one file</td>
+                            <td>File B missing <span class="ref-code">impressions</span></td>
+                            <td>Union OK; missing cells NULL (or explicit fill rule)</td>
+                            <td>Schema union; no row drop</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="ref-section" id="g2">
+            <h2><span class="ref-pill">Group 2</span> Merge / join (different schema)</h2>
+            <div class="ref-table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Scenario</th>
+                            <th>Input</th>
+                            <th>Expected</th>
+                            <th>Checks</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>2.1</td>
+                            <td>Lookup metadata</td>
+                            <td>Sheet 1: metrics; Sheet 2: publisher → region</td>
+                            <td>Join on publisher; new column(s)</td>
+                            <td>Cardinality sane; region populated where key matches</td>
+                        </tr>
+                        <tr>
+                            <td>2.2</td>
+                            <td>Multi-key join</td>
+                            <td>Keys: date + channel + publisher</td>
+                            <td>Inner or left join per policy; horizontal expansion</td>
+                            <td>Key coverage; NULLs only where policy allows</td>
+                        </tr>
+                        <tr>
+                            <td>2.3</td>
+                            <td>Partial key match</td>
+                            <td>Some publishers missing from lookup</td>
+                            <td>Left join: NULL for misses; no silent row loss</td>
+                            <td>Unmatched count surfaced</td>
+                        </tr>
+                        <tr>
+                            <td>2.4</td>
+                            <td>Wrong join (AI / planner)</td>
+                            <td>Two sheets, same grain and same metric columns</td>
+                            <td>Recommend <strong>union</strong>, not join</td>
+                            <td>Critical: no artificial key join that duplicates metrics</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="ref-section" id="g3">
+            <h2><span class="ref-pill">Group 3</span> Duplicates and overlaps</h2>
+            <div class="ref-table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Scenario</th>
+                            <th>Input</th>
+                            <th>Expected</th>
+                            <th>Checks</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>3.1</td>
+                            <td>Exact duplicates</td>
+                            <td>Two identical rows (same date, publisher, channel, metrics)</td>
+                            <td>Detect; optional remove or aggregate per policy</td>
+                            <td>User or config chooses outcome; deterministic</td>
+                        </tr>
+                        <tr>
+                            <td>3.2</td>
+                            <td>Near duplicates</td>
+                            <td>Same keys, different metric values</td>
+                            <td>Flag conflict; do not auto-merge silently</td>
+                            <td>Review state or error surfaced</td>
+                        </tr>
+                        <tr>
+                            <td>3.3</td>
+                            <td>Duplicates after union</td>
+                            <td>A + B produces duplicate keys</td>
+                            <td>Warn: combined set contains duplicate rows</td>
+                            <td>Message references natural key used</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="ref-section" id="g4">
+            <h2><span class="ref-pill">Group 4</span> Partial match / column mismatch</h2>
+            <div class="ref-table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Scenario</th>
+                            <th>Input</th>
+                            <th>Expected</th>
+                            <th>Checks</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>4.1</td>
+                            <td>Extra column in one file</td>
+                            <td>File B adds <span class="ref-code">campaign_name</span></td>
+                            <td>Union; new column; NULL in other file’s rows</td>
+                            <td>Wider schema; no row explosion</td>
+                        </tr>
+                        <tr>
+                            <td>4.2</td>
+                            <td>Same meaning, different names</td>
+                            <td><span class="ref-code">publisher_name_paid_media</span> vs <span
+                                    class="ref-code">publisher</span></td>
+                            <td>Semantic / fuzzy mapping; align then union</td>
+                            <td>Mapping confidence or review for low confidence</td>
+                        </tr>
+                        <tr>
+                            <td>4.3</td>
+                            <td>Different dimension values</td>
+                            <td>Channel values differ across files (valid business data)</td>
+                            <td>Union; values are data, not schema conflict</td>
+                            <td>No false “error” on value diversity alone</td>
+                        </tr>
+                        <tr>
+                            <td>4.4</td>
+                            <td>Unrelated schemas</td>
+                            <td>Media metrics vs finance ledger</td>
+                            <td>Suggest <strong>keep separate</strong></td>
+                            <td>No forced combine; explain why</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="ref-section" id="g5">
+            <h2><span class="ref-pill">Group 5</span> Multi-sheet / multi-file patterns</h2>
+            <div class="ref-table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Scenario</th>
+                            <th>Input</th>
+                            <th>Expected</th>
+                            <th>Checks</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>5.1</td>
+                            <td>Monthly sheets</td>
+                            <td>Sheet1 = Jan, Sheet2 = Feb, same layout</td>
+                            <td>Union (stack)</td>
+                            <td>Optional month column derivable</td>
+                        </tr>
+                        <tr>
+                            <td>5.2</td>
+                            <td>Country split</td>
+                            <td>File A UK, File B US, same metrics</td>
+                            <td>Union; ideally add country column</td>
+                            <td>No duplicate column semantics</td>
+                        </tr>
+                        <tr>
+                            <td>5.3</td>
+                            <td>Repeated tables in one sheet</td>
+                            <td>Two blocks same headers in one worksheet</td>
+                            <td>Stack (layout-level merge of blocks)</td>
+                            <td>Row order preserved or documented</td>
+                        </tr>
+                        <tr>
+                            <td>5.4</td>
+                            <td>Mixed relevant + irrelevant sheets</td>
+                            <td>Data + Pivot + Notes</td>
+                            <td>Include only data sheets; ignore pivots/notes</td>
+                            <td>Sheet selection explicit or explainable</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="ref-section" id="g6">
+            <h2><span class="ref-pill">Group 6</span> Bad data / conflict / failure</h2>
+            <div class="ref-table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Scenario</th>
+                            <th>Input</th>
+                            <th>Expected</th>
+                            <th>Checks</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>6.1</td>
+                            <td>Different granularity</td>
+                            <td>File A daily, File B weekly</td>
+                            <td>No automatic union without roll-up rule</td>
+                            <td>Clear grain mismatch message</td>
+                        </tr>
+                        <tr>
+                            <td>6.2</td>
+                            <td>Date format mismatch</td>
+                            <td><span class="ref-code">6/26/2023</span> vs <span class="ref-code">2023-06-26</span></td>
+                            <td>Normalize; then union</td>
+                            <td>Parsed dates equal where same calendar day</td>
+                        </tr>
+                        <tr>
+                            <td>6.3</td>
+                            <td>Type mismatch</td>
+                            <td>Cost numeric in A, text in B</td>
+                            <td>Cast or coerce with warnings</td>
+                            <td>Failed parses reported with row hints</td>
+                        </tr>
+                        <tr>
+                            <td>6.4</td>
+                            <td>Missing join keys</td>
+                            <td>Join requested but key column absent</td>
+                            <td>Block auto-join; require user input / mapping</td>
+                            <td>No silent Cartesian product</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="ref-section" id="rules">
+            <h2>Decision rules (typical ingestion behaviour)</h2>
+            <div class="ref-table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Operation</th>
+                            <th>When it applies</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>Union</strong></td>
+                            <td>Same grain; same or mappable columns; independent rows; append vertically</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Join</strong></td>
+                            <td>Additional attributes from another table; stable key relationship; horizontal enrich
+                            </td>
+                        </tr>
+                        <tr>
+                            <td><strong>Keep separate</strong></td>
+                            <td>Different business meaning; incompatible grain; no safe relationship</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Stack (layout)</strong></td>
+                            <td>Same physical table repeated in one sheet — internal extract then append</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="ref-blockquote">
+                Tests should assert <strong>decision correctness</strong> and <strong>output shape</strong> (row counts,
+                keys, NULL policy), not only that a particular tool was called.
+            </div>
+        </section>
+
+        <section class="ref-section" id="matrix">
+            <h2>Quick test matrix</h2>
+            <div class="ref-table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Scenario</th>
+                            <th>Operation</th>
+                            <th>Expected behaviour</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>Same schema</td>
+                            <td>Union</td>
+                            <td>Append rows</td>
+                        </tr>
+                        <tr>
+                            <td>Same schema + overlapping keys</td>
+                            <td>Union + warn</td>
+                            <td>Possible duplicates flagged</td>
+                        </tr>
+                        <tr>
+                            <td>Extra attributes in second table</td>
+                            <td>Join</td>
+                            <td>Add columns</td>
+                        </tr>
+                        <tr>
+                            <td>Same meaning, different names</td>
+                            <td>Union (after map)</td>
+                            <td>Align columns</td>
+                        </tr>
+                        <tr>
+                            <td>Unrelated data domains</td>
+                            <td>Separate</td>
+                            <td>No combine</td>
+                        </tr>
+                        <tr>
+                            <td>Duplicate rows</td>
+                            <td>Union + detect</td>
+                            <td>Flag or remove per policy</td>
+                        </tr>
+                        <tr>
+                            <td>Missing columns in one source</td>
+                            <td>Union</td>
+                            <td>Fill NULL / default</td>
+                        </tr>
+                        <tr>
+                            <td>Conflicting values for same key</td>
+                            <td>Flag</td>
+                            <td>Stop or review — no silent merge</td>
+                        </tr>
+                        <tr>
+                            <td>Different grain</td>
+                            <td>Block</td>
+                            <td>No automatic combine</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </main>
+
+    <script src="/js/common.js"></script>
+</body>
+
+</html>

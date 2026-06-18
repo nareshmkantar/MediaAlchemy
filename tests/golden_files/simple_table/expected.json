@@ -1,0 +1,11 @@
+{
+    "name": "simple_table",
+    "description": "Simple flat table with headers in row 0",
+    "expected_columns": ["Product", "Category", "Price", "Quantity", "Date"],
+    "expected_row_count_min": 10,
+    "expected_row_count_max": 100,
+    "expected_confidence_min": 0.8,
+    "should_require_review": false,
+    "expected_tools": ["extract_data_block"],
+    "max_iterations": 1
+}
