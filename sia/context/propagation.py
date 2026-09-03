@@ -224,11 +224,3 @@ def propagate_field(
         decision=decision,
         log_entry=entry,
     )
-
-
-def propagate_fields(
-    target_fields: Dict[str, ScopedField],
-    candidates: List[ScopedField],
-    **kwargs: Any,
-) -> List[PropagationResult]:
-    return [propagate_field(target_fields, c, **kwargs) for c in candidates]

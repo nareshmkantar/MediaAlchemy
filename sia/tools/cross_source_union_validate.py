@@ -123,18 +123,3 @@ def validate_column_sets_for_union(
         "columns_only_in_source": missing_intersection,
         "warnings": warnings,
     }
-
-
-def sample_dtypes_from_dataframe(df: pd.DataFrame, *, max_cols: int = 80) -> Dict[str, str]:
-    """Lightweight dtype map for validation (string names)."""
-    if df is None or df.empty:
-        return {}
-    out: Dict[str, str] = {}
-    for i, col in enumerate(df.columns):
-        if i >= max_cols:
-            break
-        try:
-            out[str(col)] = str(df[col].dtype)
-        except Exception:
-            out[str(col)] = "unknown"
-    return out

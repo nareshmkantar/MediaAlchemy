@@ -275,27 +275,6 @@ def append_tab_inference_evidence(
     return ic
 
 
-def enrich_interpreted_fields(
-    interpreted_context: Optional[Dict[str, Any]],
-    context_block_snippets: Optional[Sequence[Dict[str, Any]]],
-    sheet_name: Optional[str],
-    *,
-    source_id: str = "",
-) -> Dict[str, str]:
-    """
-    Merge interpreted context-block fields with tab-scope inference.
-
-    Context blocks win over tab naming when both define the same field.
-    """
-    scoped = build_scoped_fields(
-        interpreted_context,
-        context_block_snippets,
-        sheet_name,
-        source_id=source_id,
-    )
-    return scoped_fields_to_flat(scoped)
-
-
 def local_scoped_fields(context_packet: Optional[Dict[str, Any]]) -> Dict[str, ScopedField]:
     """Authoritative scoped dimension literals for the active sheet."""
     cp = context_packet or {}

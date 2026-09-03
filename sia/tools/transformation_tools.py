@@ -5607,21 +5607,6 @@ def execute_tool(tool_name: str, **params) -> ToolResult:
         )
 
 
-def get_tools_description() -> str:
-    """Get a formatted description of all available tools for the LLM prompt."""
-    lines = ["## Available Transformation Tools\n"]
-    
-    for tool in AVAILABLE_TOOLS:
-        lines.append(f"### {tool['name']}")
-        lines.append(f"{tool['description']}")
-        lines.append("\n**Parameters:**")
-        for param, desc in tool['params'].items():
-            lines.append(f"- `{param}`: {desc}")
-        lines.append("")
-    
-    return "\n".join(lines)
-
-
 # ===== Destructive Tool Identification =====
 
 DESTRUCTIVE_TOOLS = {

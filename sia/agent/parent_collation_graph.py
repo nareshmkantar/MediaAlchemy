@@ -300,11 +300,6 @@ def _numeric_measure_conflict_columns(df: pd.DataFrame, keys: List[str]) -> List
     return sorted(conflicting)
 
 
-def _needs_aggregate_on_keys(df: pd.DataFrame, keys: List[str]) -> bool:
-    """True when duplicate key groups disagree on any compared measure (numeric or number-like strings)."""
-    return bool(_numeric_measure_conflict_columns(df, keys))
-
-
 def baseline_collate_node(state: CollationState) -> Dict[str, Any]:
     frames = state.get("frames_by_source") or {}
     rels = list(state.get("relationships") or [])

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from sia.agent.context_packet import build_canonical_planning_view
-from sia.agent.nodes import _ensure_canonical_planning_summary, _summarize_mapping_state
+from sia.agent.nodes import _ensure_canonical_planning_summary
 
 
 def test_canonical_view_includes_interpreted_context():
@@ -25,18 +25,6 @@ def test_canonical_view_includes_interpreted_context():
     view = build_canonical_planning_view(packet)
     assert view["interpreted_context"]["fields"]["market"] == "Germany"
     assert view["layout_summary"]["context_blocks_count"] == 1
-
-
-def test_legacy_summarize_mapping_state_omits_interpreted_context():
-    """Regression guard: legacy helper must not replace canonical view in production."""
-    legacy = _summarize_mapping_state(
-        {},
-        [],
-        [],
-        {"sheet_name": "Radio_DE"},
-        [],
-    )
-    assert "interpreted_context" not in legacy
 
 
 def test_ensure_canonical_planning_summary_preserves_interpreted_context():

@@ -306,26 +306,6 @@ def is_issue_repeated(state: AgentState, issue_type: str, min_count: int = 2) ->
     return count >= min_count
 
 
-def get_confidence_trend(state: AgentState) -> str:
-    """
-    Analyze confidence trajectory to detect trends.
-    
-    Returns: "improving", "degrading", "stable", or "unknown"
-    """
-    trajectory = state.get("confidence_trajectory", [])
-    if len(trajectory) < 2:
-        return "unknown"
-    
-    recent = trajectory[-3:] if len(trajectory) >= 3 else trajectory
-    
-    if all(recent[i] < recent[i+1] for i in range(len(recent)-1)):
-        return "improving"
-    elif all(recent[i] > recent[i+1] for i in range(len(recent)-1)):
-        return "degrading"
-    else:
-        return "stable"
-
-
 def create_checkpoint(state: AgentState) -> Dict[str, Any]:
     """
     Create a checkpoint of current state for rollback.

@@ -259,38 +259,6 @@ class SourceMetadata:
 
 
 @dataclass
-class LayoutDecision:
-    layout_id: str
-    source_id: str
-    block_id: str
-    block_label: str = ""
-    block_category: str = "main_data"
-    start_row: int = 0
-    end_row: int = 0
-    start_col: int = 0
-    end_col: int = 0
-    header_row: int = 0
-    decision: str = "approved"
-    confidence: float = 1.0
-    approved_by: str = "system"
-    approved_at: str = ""
-    layout_version: int = 1
-    coordinates: Dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> Dict[str, Any]:
-        data = asdict(self)
-        if not data["coordinates"]:
-            data["coordinates"] = {
-                "start_row": self.start_row,
-                "end_row": self.end_row,
-                "start_col": self.start_col,
-                "end_col": self.end_col,
-                "header_row": self.header_row,
-            }
-        return data
-
-
-@dataclass
 class MappingDecision:
     mapping_id: str
     source_id: str

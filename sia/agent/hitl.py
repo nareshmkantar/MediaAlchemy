@@ -11,7 +11,6 @@ from datetime import datetime
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass, field, asdict
 from enum import Enum
-import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -555,43 +554,3 @@ class HITLManager:
                     numeric_ids.append(int(parts[1]))
             if numeric_ids:
                 self.checkpoint_counter = max(numeric_ids)
-
-
-# ===== Utility Functions =====
-
-def create_data_preview(df: pd.DataFrame, max_rows: int = 5) -> Dict:
-    """Create a preview dict for display in HITL UI."""
-    if df is None or df.empty:
-        return {"rows": 0, "columns": 0, "sample": []}
-    
-    return {
-        "rows": len(df),
-        "columns": len(df.columns),
-        "column_names": list(df.columns),
-        "sample": df.head(max_rows).to_dict(orient="records")
-    }
-
-
-def format_checkpoint_for_ui(checkpoint: HITLCheckpoint) -> Dict:
-    """Format checkpoint for web UI display."""
-    severity_emoji = {
-        "low": "ℹ️",
-        "medium": "⚠️",
-        "high": "🔶",
-        "critical": "🔴"
-    }
-    
-    return {
-        "id": checkpoint.checkpoint_id,
-        "type": checkpoint.checkpoint_type.value,
-        "title": checkpoint.title,
-        "description": checkpoint.description,
-        "severity": checkpoint.severity,
-        "severity_icon": severity_emoji.get(checkpoint.severity, "❓"),
-        "reason": checkpoint.trigger_reason,
-        "actions": checkpoint.available_actions,
-        "recommended": checkpoint.recommended_action,
-        "created_at": checkpoint.created_at,
-        "resolved": checkpoint.resolved,
-        "resolution": checkpoint.resolution_action if checkpoint.resolved else None
-    }

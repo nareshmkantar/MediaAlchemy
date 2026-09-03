@@ -46,37 +46,6 @@ class ConfidenceResult:
 
 
 @dataclass
-class HITLReviewItem:
-    """
-    An item queued for human review.
-    """
-    item_id: str
-    module_name: str
-    confidence: ConfidenceResult
-    proposed_output: Dict[str, Any]
-    grid_preview: Optional[str] = None  # Text representation of relevant grid
-    corrections_made: Optional[Dict[str, Any]] = None
-    reviewed: bool = False
-    
-    def apply_correction(self, corrections: Dict[str, Any]) -> None:
-        """Apply human corrections."""
-        self.corrections_made = corrections
-        self.reviewed = True
-    
-    def to_labeled_example(self) -> Dict[str, Any]:
-        """Convert to labeled example for training store."""
-        return {
-            "input_context": {
-                "grid_preview": self.grid_preview,
-                "module": self.module_name
-            },
-            "proposed_output": self.proposed_output,
-            "corrected_output": self.corrections_made or self.proposed_output,
-            "is_correction": self.corrections_made is not None
-        }
-
-
-@dataclass
 class ProcessingTrace:
     """
     Execution trace for observability and debugging.

@@ -13,7 +13,7 @@ import os
 import re
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -107,12 +107,6 @@ def append_processing_step(job_id: str, step: Dict[str, Any]) -> None:
         _append_text(processing_log_path(job_id), format_processing_line(step))
     except Exception as exc:
         logger.warning("Failed to write processing log for job %s: %s", job_id, exc)
-
-
-def append_processing_steps(job_id: str, steps: List[Dict[str, Any]]) -> None:
-    for step in steps or []:
-        if isinstance(step, dict):
-            append_processing_step(job_id, step)
 
 
 def append_debug_event(job_id: str, event: Dict[str, Any]) -> None:

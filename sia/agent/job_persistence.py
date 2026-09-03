@@ -374,22 +374,3 @@ def apply_hitl_aux_to_manager(manager, job: Dict[str, Any]) -> None:
     psm = aux.get("pending_schema_mappings")
     if isinstance(psm, dict):
         manager.pending_schema_mappings[job_id] = psm
-
-
-def payload_size_guard(obj: Any, *, max_chars: int = 4_000_000) -> str:
-    """Serialize for SQLite; log when checkpoint payload is very large."""
-    text = json_safe_dumps(obj)
-    if len(text) > max_chars:
-        logger.warning(
-            "HITL payload exceeds %s chars (%s) — truncating pending_state grid fields",
-            max_chars,
-            len(text),
-        )
-        if isinstance(obj, dict) and isinstance(obj.get("checkpoint"), dict):
-            slim = dict(obj)
-            cp = dict(slim["checkpoint"])
-            cp["pending_state"] = _sanitize_pending_state(cp.get("pending_state"))
-            slim["checkpoint"] = cp
-            slim["pending_state"] = cp.get("pending_state")
-            text = json_safe_dumps(slim)
-    return text

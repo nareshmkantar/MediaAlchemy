@@ -273,23 +273,6 @@ def _merge_stage_metrics(pe: Dict[str, Any], stage: str) -> Dict[str, Any]:
     return merged
 
 
-def _format_metric_value(key: str, val: Any) -> str:
-    if val is None:
-        return "—"
-    if isinstance(val, bool):
-        return "yes" if val else "no"
-    if isinstance(val, list):
-        return ", ".join(str(x) for x in val[:4]) if val else "—"
-    if key.endswith("_score") or key.endswith("_precision") or key == "analyzer_confidence":
-        try:
-            f = float(val)
-            if 0.0 <= f <= 1.0:
-                return f"{f:.0%}" if f <= 1.0 else str(f)
-        except (TypeError, ValueError):
-            pass
-    return str(val)
-
-
 def _stage_rollups(pe: Dict[str, Any], issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     rollups: List[Dict[str, Any]] = []
     per = dict(pe.get("per_source") or {})

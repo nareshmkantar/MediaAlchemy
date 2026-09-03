@@ -75,34 +75,6 @@ class DateParseError(SIAError):
         )
 
 
-class SchemaInferenceError(SIAError):
-    """Raised when schema inference fails."""
-    
-    def __init__(self, reason: str, confidence: float = 0.0):
-        super().__init__(
-            message=f"Schema inference failed: {reason}",
-            details={"reason": reason, "confidence": confidence},
-            user_message=f"Could not confidently determine the data structure. {reason}",
-            recoverable=True
-        )
-
-
-class MergeConflictError(SIAError):
-    """Raised when sheets cannot be merged due to conflicts."""
-    
-    def __init__(self, sheet_a: str, sheet_b: str, conflict_type: str):
-        super().__init__(
-            message=f"Merge conflict between {sheet_a} and {sheet_b}: {conflict_type}",
-            details={
-                "sheet_a": sheet_a,
-                "sheet_b": sheet_b,
-                "conflict_type": conflict_type
-            },
-            user_message=f"Sheets '{sheet_a}' and '{sheet_b}' have conflicting structures and cannot be automatically merged.",
-            recoverable=True
-        )
-
-
 class LLMError(SIAError):
     """Raised when LLM inference fails."""
     

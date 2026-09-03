@@ -895,85 +895,6 @@ def _build_mapping_stage_supplement(
     }
 
 
-def _summarize_mapping_state(
-    target_template: Dict[str, Any],
-    approved_mappings: List[Dict[str, Any]],
-    business_rules: List[Dict[str, Any]],
-    source_metadata: Dict[str, Any],
-    user_notes: List[str],
-    prepared_columns: Optional[List[str]] = None,
-    header_derivation: Optional[Dict[str, Any]] = None,
-    sparse_dimension_columns: Optional[List[Dict[str, Any]]] = None,
-) -> Dict[str, Any]:
-    """Legacy mapping-stage summary.
-
-    NOTE: retained for tests and backward compatibility only. Production code
-    should build the canonical planning view via ``build_canonical_planning_view``
-    and contribute mapping-stage data through ``_build_mapping_stage_supplement``.
-    """
-    mapped_columns = [
-        f"{item.get('source_column')} -> {item.get('target_column')}"
-        for item in approved_mappings
-        if (
-            not mapping_is_excluded(item)
-            and item.get("target_column")
-            and item.get("target_column") != "No match"
-        )
-    ]
-    excluded_columns = [
-        item.get("source_column")
-        for item in approved_mappings
-        if mapping_is_excluded(item) and item.get("source_column")
-    ]
-    mandatory_targets = sorted(mapping_targets_requiring_source(target_template)) if isinstance(target_template, dict) else []
-    mapped_targets = {
-        item.get("target_column")
-        for item in approved_mappings
-        if item.get("target_column") and item.get("target_column") != "No match"
-    }
-    unresolved_targets = [target for target in mandatory_targets if target not in mapped_targets]
-    rules_summary = [
-        f"{item.get('target_column')}: {item.get('rule_type')} -> {item.get('rule_expression')}"
-        for item in business_rules
-        if item.get("target_column") and item.get("rule_type")
-    ]
-
-    x_scope = (target_template or {}).get("x_scope") if isinstance((target_template or {}).get("x_scope"), dict) else {}
-
-    return {
-        "source_summary": {
-            "file_name": source_metadata.get("file_name"),
-            "sheet_name": source_metadata.get("sheet_name"),
-            "source_type": source_metadata.get("source_type"),
-            "variable_type": source_metadata.get("variable_type") or source_metadata.get("source_type"),
-            "modeling_period_start": source_metadata.get("modeling_period_start"),
-            "modeling_period_end": source_metadata.get("modeling_period_end"),
-            "uid": source_metadata.get("uid", []),
-            "date_granularity": source_metadata.get("date_granularity"),
-            "date_shape": source_metadata.get("date_shape"),
-            "range_start_column": source_metadata.get("range_start_column"),
-            "range_end_column": source_metadata.get("range_end_column"),
-            "aggregation_logic": source_metadata.get("aggregation_logic"),
-            "prepared_columns": list(prepared_columns or []),
-            "header_derivation": header_derivation or {},
-            "sparse_dimension_columns": list(sparse_dimension_columns or []),
-        },
-        "mapping_summary": {
-            "mapped_columns": mapped_columns[:20],
-            "mapped_count": len(mapped_columns),
-            "excluded_columns": excluded_columns[:20],
-            "unresolved_target_columns": unresolved_targets[:20],
-        },
-        "rules_summary": rules_summary[:20],
-        "user_notes": user_notes[:10],
-        "date_granularity_alignment": compute_date_granularity_alignment(
-            str(source_metadata.get("date_granularity") or ""),
-            effective_target_date_granularity(x_scope),
-            source_date_shape=str(source_metadata.get("date_shape") or ""),
-        ),
-    }
-
-
 def _find_sparse_dimension_columns(
     df: Optional[pd.DataFrame],
     approved_mappings: List[Dict[str, Any]],
@@ -1103,13 +1024,6 @@ def _evaluate_business_rules(df: pd.DataFrame, business_rules: List[Dict[str, An
 
     return issues
 
-def _log_to_file(message: str):
-    """Helper to log messages to a file for UI-based debugging."""
-    try:
-        with open("debug_nodes.log", "a") as f:
-            f.write(f"{message}\n")
-    except:
-        pass
 
 def trace_node(name: str, input_keys: List[str] = None):
     """Decorator to trace node execution with specific state keys as input."""
@@ -2490,21 +2404,6 @@ def _inject_infer_daily_before_aggregate_weekly(
     return out
 
 
-def _is_union_relationship(rec: Dict[str, Any]) -> bool:
-    return str(rec.get("relationship_kind") or rec.get("kind") or "").strip().lower() == "union"
-
-
-def _state_has_union_intent(state: AgentState) -> bool:
-    rels = list(state.get("approved_relationships") or [])
-    if any(isinstance(r, dict) and _is_union_relationship(r) for r in rels):
-        return True
-    cp = state.get("context_packet") or {}
-    for p in cp.get("relationship_proposals") or []:
-        if isinstance(p, dict) and _is_union_relationship(p):
-            return True
-    return False
-
-
 def _should_defer_weekly_rollup_until_post_collate(state: AgentState) -> bool:
     """Defer grain-changing transforms until after multi-source collation duplicate_check.
 
@@ -2544,14 +2443,6 @@ def _partition_deferred_post_collate_grain_tools(
         else:
             out.append(tc)
     return out, deferred
-
-
-def _partition_deferred_aggregate_weekly(
-    tools_to_run: List[Any],
-    state: AgentState,
-) -> tuple[List[Any], List[Dict[str, Any]]]:
-    """Backward-compatible alias for grain-tool deferral."""
-    return _partition_deferred_post_collate_grain_tools(tools_to_run, state)
 
 
 @trace_node("execute_tools", input_keys=["suggested_tools"])
