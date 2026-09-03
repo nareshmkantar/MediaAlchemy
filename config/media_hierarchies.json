@@ -10,51 +10,109 @@
         "options": [
           {
             "standard": "Asia Pacific",
-            "aliases": ["APAC", "Asia Pacific", "Asia-Pacific", "A-Pac"]
+            "aliases": [
+              "APAC",
+              "Asia Pacific",
+              "Asia-Pacific",
+              "A-Pac"
+            ]
           },
           {
             "standard": "Belgium",
-            "aliases": ["BE", "BEL", "Belgium"]
+            "aliases": [
+              "BE",
+              "BEL",
+              "Belgium"
+            ]
           },
           {
             "standard": "France",
-            "aliases": ["FR", "FRA", "France"]
+            "aliases": [
+              "FR",
+              "FRA",
+              "France"
+            ]
           },
           {
             "standard": "Germany",
-            "aliases": ["DE", "DEU", "Germany", "Deutschland"]
+            "aliases": [
+              "DE",
+              "DEU",
+              "Germany",
+              "Deutschland"
+            ]
           },
           {
             "standard": "Italy",
-            "aliases": ["IT", "ITA", "Italy", "Italia"]
+            "aliases": [
+              "IT",
+              "ITA",
+              "Italy",
+              "Italia"
+            ]
           },
           {
             "standard": "Latin America",
-            "aliases": ["LATAM", "Latin America", "LatAm"]
+            "aliases": [
+              "LATAM",
+              "Latin America"
+            ]
           },
           {
             "standard": "Netherlands",
-            "aliases": ["NL", "NLD", "Netherlands", "Holland"]
+            "aliases": [
+              "NL",
+              "NLD",
+              "Netherlands",
+              "Holland"
+            ]
           },
           {
             "standard": "Nordics",
-            "aliases": ["Nordics", "Nordic", "Scandinavia"]
+            "aliases": [
+              "Nordics",
+              "Nordic",
+              "Scandinavia"
+            ]
           },
           {
             "standard": "Poland",
-            "aliases": ["PL", "POL", "Poland"]
+            "aliases": [
+              "PL",
+              "POL",
+              "Poland"
+            ]
           },
           {
             "standard": "Spain",
-            "aliases": ["ES", "ESP", "Spain", "España"]
+            "aliases": [
+              "ES",
+              "ESP",
+              "Spain",
+              "España"
+            ]
           },
           {
             "standard": "United Kingdom",
-            "aliases": ["UK", "GB", "Great Britain", "United Kingdom", "England"]
+            "aliases": [
+              "UK",
+              "GB",
+              "Great Britain",
+              "United Kingdom",
+              "England"
+            ]
           },
           {
             "standard": "United States",
-            "aliases": ["US", "USA", "U.S.", "U.S.A.", "United States", "United States of America", "America"]
+            "aliases": [
+              "US",
+              "USA",
+              "U.S.",
+              "U.S.A.",
+              "United States",
+              "United States of America",
+              "America"
+            ]
           }
         ]
       },
@@ -63,13 +121,59 @@
         "name": "Category",
         "default": "Dairy",
         "options": [
-          { "standard": "Beverages", "aliases": ["Beverages", "Beverage", "Drinks", "Water"] },
-          { "standard": "Dairy", "aliases": ["Dairy", "Yoghurt", "Yogurt", "Milk"] },
-          { "standard": "Home Care", "aliases": ["Home Care", "Home care", "HC"] },
-          { "standard": "Personal Care", "aliases": ["Personal Care", "Personal care", "PC"] },
-          { "standard": "Pet Care", "aliases": ["Pet Care", "Pet care"] },
-          { "standard": "Plant-based", "aliases": ["Plant-based", "Plant based", "Plant Based", "PBD"] },
-          { "standard": "Snacks", "aliases": ["Snacks", "Snack"] }
+          {
+            "standard": "Beverages",
+            "aliases": [
+              "Beverages",
+              "Beverage",
+              "Drinks",
+              "Water"
+            ]
+          },
+          {
+            "standard": "Dairy",
+            "aliases": [
+              "Dairy",
+              "Yoghurt",
+              "Yogurt",
+              "Milk"
+            ]
+          },
+          {
+            "standard": "Home Care",
+            "aliases": [
+              "Home Care",
+              "HC"
+            ]
+          },
+          {
+            "standard": "Personal Care",
+            "aliases": [
+              "Personal Care",
+              "PC"
+            ]
+          },
+          {
+            "standard": "Pet Care",
+            "aliases": [
+              "Pet Care"
+            ]
+          },
+          {
+            "standard": "Plant-based",
+            "aliases": [
+              "Plant-based",
+              "Plant based",
+              "PBD"
+            ]
+          },
+          {
+            "standard": "Snacks",
+            "aliases": [
+              "Snacks",
+              "Snack"
+            ]
+          }
         ]
       },
       {
@@ -77,12 +181,42 @@
         "name": "Brand",
         "default": "Alpro",
         "options": [
-          { "standard": "Actimel", "aliases": ["Actimel"] },
-          { "standard": "Activia", "aliases": ["Activia"] },
-          { "standard": "Alpro", "aliases": ["Alpro"] },
-          { "standard": "Evian", "aliases": ["Evian"] },
-          { "standard": "Nutricia", "aliases": ["Nutricia"] },
-          { "standard": "Volvic", "aliases": ["Volvic"] }
+          {
+            "standard": "Actimel",
+            "aliases": [
+              "Actimel"
+            ]
+          },
+          {
+            "standard": "Activia",
+            "aliases": [
+              "Activia"
+            ]
+          },
+          {
+            "standard": "Alpro",
+            "aliases": [
+              "Alpro"
+            ]
+          },
+          {
+            "standard": "Evian",
+            "aliases": [
+              "Evian"
+            ]
+          },
+          {
+            "standard": "Nutricia",
+            "aliases": [
+              "Nutricia"
+            ]
+          },
+          {
+            "standard": "Volvic",
+            "aliases": [
+              "Volvic"
+            ]
+          }
         ]
       }
     ],
@@ -92,8 +226,18 @@
         "name": "Advertiser",
         "default": "",
         "options": [
-          { "standard": "Danone", "aliases": ["Danone", "DANONE"] },
-          { "standard": "EDP", "aliases": ["EDP"] }
+          {
+            "standard": "Danone",
+            "aliases": [
+              "Danone"
+            ]
+          },
+          {
+            "standard": "EDP",
+            "aliases": [
+              "EDP"
+            ]
+          }
         ]
       },
       {
@@ -101,10 +245,31 @@
         "name": "Business Unit",
         "default": "",
         "options": [
-          { "standard": "Corporate", "aliases": ["Corporate", "Corp"] },
-          { "standard": "EDP", "aliases": ["EDP"] },
-          { "standard": "Local", "aliases": ["Local"] },
-          { "standard": "Retail", "aliases": ["Retail"] }
+          {
+            "standard": "Corporate",
+            "aliases": [
+              "Corporate",
+              "Corp"
+            ]
+          },
+          {
+            "standard": "EDP",
+            "aliases": [
+              "EDP"
+            ]
+          },
+          {
+            "standard": "Local",
+            "aliases": [
+              "Local"
+            ]
+          },
+          {
+            "standard": "Retail",
+            "aliases": [
+              "Retail"
+            ]
+          }
         ]
       },
       {
@@ -112,17 +277,69 @@
         "name": "Region",
         "default": "",
         "options": [
-          { "standard": "Central", "aliases": ["Central", "Centre", "Center"] },
-          { "standard": "East", "aliases": ["East", "E"] },
-          { "standard": "National", "aliases": ["National", "Nationwide", "All"] },
-          { "standard": "North", "aliases": ["North", "N"] },
-          { "standard": "South", "aliases": ["South", "S"] },
-          { "standard": "West", "aliases": ["West", "W"] }
+          {
+            "standard": "Central",
+            "aliases": [
+              "Central",
+              "Centre",
+              "Center"
+            ]
+          },
+          {
+            "standard": "East",
+            "aliases": [
+              "East",
+              "E"
+            ]
+          },
+          {
+            "standard": "National",
+            "aliases": [
+              "National",
+              "Nationwide"
+            ]
+          },
+          {
+            "standard": "North",
+            "aliases": [
+              "North",
+              "N"
+            ]
+          },
+          {
+            "standard": "South",
+            "aliases": [
+              "South",
+              "S"
+            ]
+          },
+          {
+            "standard": "West",
+            "aliases": [
+              "West",
+              "W"
+            ]
+          }
         ]
       },
-      { "id": "sub_category_1", "name": "Sub Category 1", "default": "", "options": [] },
-      { "id": "sub_category_2", "name": "Sub Category 2", "default": "", "options": [] },
-      { "id": "sub_brand", "name": "Sub Brand", "default": "", "options": [] }
+      {
+        "id": "sub_category_1",
+        "name": "Sub Category 1",
+        "default": "",
+        "options": []
+      },
+      {
+        "id": "sub_category_2",
+        "name": "Sub Category 2",
+        "default": "",
+        "options": []
+      },
+      {
+        "id": "sub_brand",
+        "name": "Sub Brand",
+        "default": "",
+        "options": []
+      }
     ],
     "additional_columns": [
       {
@@ -139,171 +356,1131 @@
       "name": "Advertiser",
       "default": "",
       "mode": "fixed_or_column",
-      "help": "Legacy key — prefer optional_fields.advertiser."
+      "help": ""
     }
   },
   "media_hierarchy": [
-    { "level": 1, "id": "publisher", "name": "Publisher", "mandatory": true },
-    { "level": 2, "id": "campaign", "name": "Campaign", "mandatory": true },
-    { "level": 3, "id": "ad_group", "name": "Ad Group", "mandatory": false },
-    { "level": 4, "id": "ad", "name": "Ad", "mandatory": false },
-    { "level": 5, "id": "creative", "name": "Creative", "mandatory": false }
+    {
+      "level": 1,
+      "id": "publisher",
+      "name": "Publisher",
+      "mandatory": true
+    },
+    {
+      "level": 2,
+      "id": "campaign",
+      "name": "Campaign",
+      "mandatory": true
+    },
+    {
+      "level": 3,
+      "id": "ad_group",
+      "name": "Ad Group",
+      "mandatory": false
+    },
+    {
+      "level": 4,
+      "id": "ad",
+      "name": "Ad",
+      "mandatory": false
+    },
+    {
+      "level": 5,
+      "id": "creative",
+      "name": "Creative",
+      "mandatory": false
+    }
   ],
   "common_attributes": [
-    { "id": "advertiser", "name": "Advertiser", "group": "enterprise" },
-    { "id": "audience", "name": "Audience", "group": "delivery" },
-    { "id": "business_unit", "name": "Business Unit", "group": "enterprise" },
-    { "id": "buying_model", "name": "Buying Model / Optimization Goal", "group": "delivery" },
-    { "id": "campaign_objective", "name": "Campaign Objective", "group": "campaign" },
-    { "id": "campaign_type", "name": "Campaign Type", "group": "campaign" },
-    { "id": "campaign_kpi", "name": "Campaign KPI (ROAS)", "group": "campaign" },
-    { "id": "channel", "name": "Channel", "group": "delivery" },
-    { "id": "country", "name": "Country", "group": "geo" },
-    { "id": "creative_format", "name": "Creative Format", "group": "creative" },
-    { "id": "creative_size", "name": "Creative Size / Duration", "group": "creative" },
-    { "id": "creative_variant", "name": "Creative Concept / Variant", "group": "creative" },
-    { "id": "date", "name": "Date", "group": "time" },
-    { "id": "device", "name": "Device Type", "group": "delivery" },
-    { "id": "inventory", "name": "Inventory / Placement", "group": "delivery" }
+    {
+      "id": "advertiser",
+      "name": "Advertiser",
+      "group": "enterprise",
+      "options": []
+    },
+    {
+      "id": "audience",
+      "name": "Audience",
+      "group": "delivery",
+      "options": []
+    },
+    {
+      "id": "business_unit",
+      "name": "Business Unit",
+      "group": "enterprise",
+      "options": []
+    },
+    {
+      "id": "buying_model",
+      "name": "Buying Model / Optimization Goal",
+      "group": "delivery",
+      "options": [
+        {
+          "standard": "Auction",
+          "aliases": [
+            "Auction",
+            "RTB",
+            "Real-time bidding"
+          ]
+        },
+        {
+          "standard": "Reservation",
+          "aliases": [
+            "Reservation",
+            "Reserved"
+          ]
+        },
+        {
+          "standard": "Fixed Price",
+          "aliases": [
+            "Fixed",
+            "Fixed Price"
+          ]
+        },
+        {
+          "standard": "Programmatic Guaranteed",
+          "aliases": [
+            "PG",
+            "Programmatic Guaranteed"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "campaign_objective",
+      "name": "Campaign Objective",
+      "group": "campaign",
+      "options": [
+        {
+          "standard": "Awareness",
+          "aliases": [
+            "Awareness",
+            "AWAR",
+            "Brand"
+          ]
+        },
+        {
+          "standard": "Consideration",
+          "aliases": [
+            "Consideration",
+            "Consider",
+            "Traffic"
+          ]
+        },
+        {
+          "standard": "Conversion",
+          "aliases": [
+            "Conversion",
+            "Conver",
+            "Conv",
+            "Perf",
+            "Performance"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "campaign_type",
+      "name": "Campaign Type",
+      "group": "campaign",
+      "options": [
+        {
+          "standard": "Prospecting",
+          "aliases": [
+            "Prospecting",
+            "Prospect"
+          ]
+        },
+        {
+          "standard": "Retargeting",
+          "aliases": [
+            "Retargeting",
+            "Remarketing"
+          ]
+        },
+        {
+          "standard": "Always on",
+          "aliases": [
+            "Always on",
+            "AO",
+            "Always-on"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "campaign_kpi",
+      "name": "Campaign KPI",
+      "group": "campaign",
+      "options": [
+        {
+          "standard": "ROAS",
+          "aliases": [
+            "ROAS",
+            "Return on ad spend"
+          ]
+        },
+        {
+          "standard": "CTR",
+          "aliases": [
+            "CTR",
+            "Click-through rate"
+          ]
+        },
+        {
+          "standard": "CPI",
+          "aliases": [
+            "CPI",
+            "Cost per install"
+          ]
+        },
+        {
+          "standard": "CPA",
+          "aliases": [
+            "CPA",
+            "Cost per acquisition",
+            "Cost per action"
+          ]
+        },
+        {
+          "standard": "CPC",
+          "aliases": [
+            "CPC",
+            "Cost per click"
+          ]
+        },
+        {
+          "standard": "CPM",
+          "aliases": [
+            "CPM",
+            "Cost per mille",
+            "Cost per thousand"
+          ]
+        },
+        {
+          "standard": "VTR",
+          "aliases": [
+            "VTR",
+            "View-through rate"
+          ]
+        },
+        {
+          "standard": "CPV",
+          "aliases": [
+            "CPV",
+            "Cost per view"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "channel",
+      "name": "Channel",
+      "group": "delivery",
+      "options": [
+        {
+          "standard": "digital",
+          "aliases": [
+            "digital",
+            "Online"
+          ]
+        },
+        {
+          "standard": "TV",
+          "aliases": [
+            "TV",
+            "Television"
+          ]
+        },
+        {
+          "standard": "radio",
+          "aliases": [
+            "radio"
+          ]
+        },
+        {
+          "standard": "out of home",
+          "aliases": [
+            "OOH",
+            "out of home"
+          ]
+        },
+        {
+          "standard": "print",
+          "aliases": [
+            "print"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "country",
+      "name": "Country",
+      "group": "geo",
+      "options": [
+        {
+          "standard": "Asia Pacific",
+          "aliases": [
+            "APAC",
+            "Asia Pacific",
+            "Asia-Pacific",
+            "A-Pac"
+          ]
+        },
+        {
+          "standard": "Belgium",
+          "aliases": [
+            "BE",
+            "BEL",
+            "Belgium"
+          ]
+        },
+        {
+          "standard": "France",
+          "aliases": [
+            "FR",
+            "FRA",
+            "France"
+          ]
+        },
+        {
+          "standard": "Germany",
+          "aliases": [
+            "DE",
+            "DEU",
+            "Germany",
+            "Deutschland"
+          ]
+        },
+        {
+          "standard": "Italy",
+          "aliases": [
+            "IT",
+            "ITA",
+            "Italy",
+            "Italia"
+          ]
+        },
+        {
+          "standard": "Latin America",
+          "aliases": [
+            "LATAM",
+            "Latin America"
+          ]
+        },
+        {
+          "standard": "Netherlands",
+          "aliases": [
+            "NL",
+            "NLD",
+            "Netherlands",
+            "Holland"
+          ]
+        },
+        {
+          "standard": "Nordics",
+          "aliases": [
+            "Nordics",
+            "Nordic",
+            "Scandinavia"
+          ]
+        },
+        {
+          "standard": "Poland",
+          "aliases": [
+            "PL",
+            "POL",
+            "Poland"
+          ]
+        },
+        {
+          "standard": "Spain",
+          "aliases": [
+            "ES",
+            "ESP",
+            "Spain",
+            "España"
+          ]
+        },
+        {
+          "standard": "United Kingdom",
+          "aliases": [
+            "UK",
+            "GB",
+            "Great Britain",
+            "United Kingdom",
+            "England"
+          ]
+        },
+        {
+          "standard": "United States",
+          "aliases": [
+            "US",
+            "USA",
+            "U.S.",
+            "U.S.A.",
+            "United States",
+            "United States of America",
+            "America"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "creative_format",
+      "name": "Creative Format",
+      "group": "creative",
+      "options": []
+    },
+    {
+      "id": "creative_size",
+      "name": "Creative Size / Duration",
+      "group": "creative",
+      "options": []
+    },
+    {
+      "id": "creative_variant",
+      "name": "Creative Concept / Variant",
+      "group": "creative",
+      "options": []
+    },
+    {
+      "id": "date",
+      "name": "Date",
+      "group": "time",
+      "options": []
+    },
+    {
+      "id": "device",
+      "name": "Device Type",
+      "group": "delivery",
+      "options": [
+        {
+          "standard": "Desktop",
+          "aliases": [
+            "Desktop",
+            "DT",
+            "PC"
+          ]
+        },
+        {
+          "standard": "Mobile",
+          "aliases": [
+            "Mobile",
+            "MW",
+            "Phone"
+          ]
+        },
+        {
+          "standard": "Tablet",
+          "aliases": [
+            "Tablet",
+            "Tab"
+          ]
+        },
+        {
+          "standard": "CTV",
+          "aliases": [
+            "CTV",
+            "Connected TV",
+            "OTT"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "inventory",
+      "name": "Inventory / Placement",
+      "group": "delivery",
+      "options": []
+    }
   ],
   "metrics": [
-    { "id": "spends", "name": "Spend", "aliases": ["spend", "cost", "media_cost"], "supports_currency": true },
-    { "id": "impressions", "name": "Impressions", "aliases": ["imps", "impression"] },
-    { "id": "clicks", "name": "Clicks", "aliases": ["click"] },
-    { "id": "video_views", "name": "Video Views", "aliases": ["views", "video views"] },
-    { "id": "roas", "name": "ROAS (Campaign KPI)", "aliases": ["return on ad spend", "campaign kpi", "kpi"], "group": "campaign_kpi" }
+    {
+      "id": "spends",
+      "name": "Spend",
+      "aliases": [
+        "spend",
+        "cost",
+        "media_cost"
+      ],
+      "supports_currency": true
+    },
+    {
+      "id": "impressions",
+      "name": "Impressions",
+      "aliases": [
+        "imps",
+        "impression"
+      ],
+      "supports_currency": false
+    },
+    {
+      "id": "clicks",
+      "name": "Clicks",
+      "aliases": [
+        "click"
+      ],
+      "supports_currency": false
+    },
+    {
+      "id": "video_views",
+      "name": "Video Views",
+      "aliases": [
+        "views",
+        "video views"
+      ],
+      "supports_currency": false
+    }
   ],
   "standard_fields": [
-    { "id": "date", "label": "Date", "type": "date", "mandatory": true },
-    { "id": "market", "label": "Market", "type": "dimension", "mandatory": true },
-    { "id": "category", "label": "Category", "type": "dimension", "mandatory": true },
-    { "id": "brand", "label": "Brand", "type": "dimension", "mandatory": true },
-    { "id": "advertiser", "label": "Advertiser", "type": "dimension", "mandatory": false },
-    { "id": "business_unit", "label": "Business Unit", "type": "dimension", "mandatory": false },
-    { "id": "region", "label": "Region", "type": "dimension", "mandatory": false },
-    { "id": "sub_category_1", "label": "Sub Category 1", "type": "dimension", "mandatory": false },
-    { "id": "sub_category_2", "label": "Sub Category 2", "type": "dimension", "mandatory": false },
-    { "id": "sub_brand", "label": "Sub Brand", "type": "dimension", "mandatory": false },
-    { "id": "publisher", "label": "Publisher", "type": "hierarchy", "mandatory": true },
-    { "id": "campaign", "label": "Campaign", "type": "hierarchy", "mandatory": true },
-    { "id": "ad_group", "label": "Ad Group", "type": "hierarchy", "mandatory": false },
-    { "id": "ad", "label": "Ad", "type": "hierarchy", "mandatory": false },
-    { "id": "creative", "label": "Creative", "type": "hierarchy", "mandatory": false },
-    { "id": "campaign_objective", "label": "Campaign Objective", "type": "dimension", "mandatory": false },
-    { "id": "campaign_type", "label": "Campaign Type", "type": "dimension", "mandatory": false },
-    { "id": "channel", "label": "Channel", "type": "dimension", "mandatory": false },
-    { "id": "buying_model", "label": "Buying Model / Optimization Goal", "type": "dimension", "mandatory": false },
-    { "id": "audience", "label": "Audience", "type": "dimension", "mandatory": false },
-    { "id": "inventory", "label": "Inventory / Placement", "type": "dimension", "mandatory": false },
-    { "id": "device", "label": "Device Type", "type": "dimension", "mandatory": false },
-    { "id": "creative_format", "label": "Creative Format", "type": "dimension", "mandatory": false },
-    { "id": "creative_size", "label": "Creative Size / Duration", "type": "dimension", "mandatory": false },
-    { "id": "creative_variant", "label": "Creative Concept / Variant", "type": "dimension", "mandatory": false },
-    { "id": "country", "label": "Country", "type": "dimension", "mandatory": false },
-    { "id": "spends", "label": "Spend", "type": "metric", "mandatory": true },
-    { "id": "impressions", "label": "Impressions", "type": "metric", "mandatory": true },
-    { "id": "clicks", "label": "Clicks", "type": "metric", "mandatory": false },
-    { "id": "video_views", "label": "Video Views", "type": "metric", "mandatory": false },
-    { "id": "roas", "label": "ROAS (Campaign KPI)", "type": "metric", "mandatory": false }
+    {
+      "id": "date",
+      "label": "Date",
+      "mandatory": true,
+      "type": "date"
+    },
+    {
+      "id": "market",
+      "label": "Market",
+      "mandatory": true,
+      "type": "dimension"
+    },
+    {
+      "id": "category",
+      "label": "Category",
+      "mandatory": true,
+      "type": "dimension"
+    },
+    {
+      "id": "brand",
+      "label": "Brand",
+      "mandatory": true,
+      "type": "dimension"
+    },
+    {
+      "id": "advertiser",
+      "label": "Advertiser",
+      "mandatory": false,
+      "type": "dimension"
+    },
+    {
+      "id": "business_unit",
+      "label": "Business Unit",
+      "mandatory": false,
+      "type": "dimension"
+    },
+    {
+      "id": "region",
+      "label": "Region",
+      "mandatory": false,
+      "type": "dimension"
+    },
+    {
+      "id": "sub_category_1",
+      "label": "Sub Category 1",
+      "mandatory": false,
+      "type": "dimension"
+    },
+    {
+      "id": "sub_category_2",
+      "label": "Sub Category 2",
+      "mandatory": false,
+      "type": "dimension"
+    },
+    {
+      "id": "sub_brand",
+      "label": "Sub Brand",
+      "mandatory": false,
+      "type": "dimension"
+    },
+    {
+      "id": "publisher",
+      "label": "Publisher",
+      "mandatory": true,
+      "type": "hierarchy"
+    },
+    {
+      "id": "campaign",
+      "label": "Campaign",
+      "mandatory": true,
+      "type": "hierarchy"
+    },
+    {
+      "id": "ad_group",
+      "label": "Ad Group",
+      "mandatory": false,
+      "type": "hierarchy"
+    },
+    {
+      "id": "ad",
+      "label": "Ad",
+      "mandatory": false,
+      "type": "hierarchy"
+    },
+    {
+      "id": "creative",
+      "label": "Creative",
+      "mandatory": false,
+      "type": "hierarchy"
+    },
+    {
+      "id": "campaign_objective",
+      "label": "Campaign Objective",
+      "mandatory": false,
+      "type": "dimension"
+    },
+    {
+      "id": "campaign_type",
+      "label": "Campaign Type",
+      "mandatory": false,
+      "type": "dimension"
+    },
+    {
+      "id": "campaign_kpi",
+      "label": "Campaign KPI",
+      "mandatory": false,
+      "type": "dimension"
+    },
+    {
+      "id": "channel",
+      "label": "Channel",
+      "mandatory": false,
+      "type": "dimension"
+    },
+    {
+      "id": "buying_model",
+      "label": "Buying Model / Optimization Goal",
+      "mandatory": false,
+      "type": "dimension"
+    },
+    {
+      "id": "audience",
+      "label": "Audience",
+      "mandatory": false,
+      "type": "dimension"
+    },
+    {
+      "id": "inventory",
+      "label": "Inventory / Placement",
+      "mandatory": false,
+      "type": "dimension"
+    },
+    {
+      "id": "device",
+      "label": "Device Type",
+      "mandatory": false,
+      "type": "dimension"
+    },
+    {
+      "id": "creative_format",
+      "label": "Creative Format",
+      "mandatory": false,
+      "type": "dimension"
+    },
+    {
+      "id": "creative_size",
+      "label": "Creative Size / Duration",
+      "mandatory": false,
+      "type": "dimension"
+    },
+    {
+      "id": "creative_variant",
+      "label": "Creative Concept / Variant",
+      "mandatory": false,
+      "type": "dimension"
+    },
+    {
+      "id": "country",
+      "label": "Country",
+      "mandatory": false,
+      "type": "dimension"
+    },
+    {
+      "id": "spends",
+      "label": "Spend",
+      "type": "metric",
+      "mandatory": true
+    },
+    {
+      "id": "impressions",
+      "label": "Impressions",
+      "type": "metric",
+      "mandatory": true
+    },
+    {
+      "id": "clicks",
+      "label": "Clicks",
+      "type": "metric",
+      "mandatory": false
+    },
+    {
+      "id": "video_views",
+      "label": "Video Views",
+      "type": "metric",
+      "mandatory": false
+    }
   ],
   "mapping_dictionary": [
-    { "source": "cost", "target": "spends" },
-    { "source": "spend", "target": "spends" },
-    { "source": "spends", "target": "spends" },
-    { "source": "amount spent", "target": "spends" },
-    { "source": "amount_spent", "target": "spends" },
-    { "source": "media cost", "target": "spends" },
-    { "source": "media_cost", "target": "spends" },
-    { "source": "total_cost", "target": "spends" },
-    { "source": "total cost", "target": "spends" },
-    { "source": "ad spend", "target": "spends" },
-    { "source": "imps", "target": "impressions" },
-    { "source": "impression", "target": "impressions" },
-    { "source": "impressions", "target": "impressions" },
-    { "source": "clicks", "target": "clicks" },
-    { "source": "click", "target": "clicks" },
-    { "source": "roas", "target": "roas" },
-    { "source": "return on ad spend", "target": "roas" },
-    { "source": "campaign kpi", "target": "roas" },
-    { "source": "video views", "target": "video_views" },
-    { "source": "video_views", "target": "video_views" },
-    { "source": "campaign name", "target": "campaign" },
-    { "source": "campaign_name", "target": "campaign" },
-    { "source": "io name", "target": "campaign" },
-    { "source": "io", "target": "campaign" },
-    { "source": "insertion order", "target": "campaign" },
-    { "source": "insertion_order", "target": "campaign" },
-    { "source": "order", "target": "campaign" },
-    { "source": "order name", "target": "campaign" },
-    { "source": "order_name", "target": "campaign" },
-    { "source": "ad set", "target": "ad_group" },
-    { "source": "ad set name", "target": "ad_group" },
-    { "source": "adset name", "target": "ad_group" },
-    { "source": "ad group", "target": "ad_group" },
-    { "source": "ad group name", "target": "ad_group" },
-    { "source": "line item", "target": "ad_group" },
-    { "source": "line_item", "target": "ad_group" },
-    { "source": "line item name", "target": "ad_group" },
-    { "source": "ad name", "target": "ad" },
-    { "source": "creative name", "target": "creative" },
-    { "source": "device type", "target": "device" },
-    { "source": "device", "target": "device" },
-    { "source": "advertiser", "target": "advertiser" },
-    { "source": "advertiser name", "target": "advertiser" },
-    { "source": "advertiser_name", "target": "advertiser" },
-    { "source": "business unit", "target": "business_unit" },
-    { "source": "business_unit", "target": "business_unit" },
-    { "source": "bu", "target": "business_unit" }
+    {
+      "source": "date",
+      "target": "date"
+    },
+    {
+      "source": "report date",
+      "target": "date"
+    },
+    {
+      "source": "event date",
+      "target": "date"
+    },
+    {
+      "source": "campaign date",
+      "target": "date"
+    },
+    {
+      "source": "market",
+      "target": "market"
+    },
+    {
+      "source": "market name",
+      "target": "market"
+    },
+    {
+      "source": "country",
+      "target": "country"
+    },
+    {
+      "source": "country name",
+      "target": "country"
+    },
+    {
+      "source": "country code",
+      "target": "country"
+    },
+    {
+      "source": "category",
+      "target": "category"
+    },
+    {
+      "source": "product category",
+      "target": "category"
+    },
+    {
+      "source": "brand",
+      "target": "brand"
+    },
+    {
+      "source": "brand name",
+      "target": "brand"
+    },
+    {
+      "source": "publisher",
+      "target": "publisher"
+    },
+    {
+      "source": "publisher name",
+      "target": "publisher"
+    },
+    {
+      "source": "site",
+      "target": "publisher"
+    },
+    {
+      "source": "media owner",
+      "target": "publisher"
+    },
+    {
+      "source": "channel",
+      "target": "channel"
+    },
+    {
+      "source": "channel name",
+      "target": "channel"
+    },
+    {
+      "source": "media channel",
+      "target": "channel"
+    },
+    {
+      "source": "platform",
+      "target": "channel"
+    },
+    {
+      "source": "cost",
+      "target": "spends"
+    },
+    {
+      "source": "budget",
+      "target": "spends"
+    },
+    {
+      "source": "budget spent",
+      "target": "spends"
+    },
+    {
+      "source": "spend",
+      "target": "spends"
+    },
+    {
+      "source": "spends",
+      "target": "spends"
+    },
+    {
+      "source": "amount spent",
+      "target": "spends"
+    },
+    {
+      "source": "amount_spent",
+      "target": "spends"
+    },
+    {
+      "source": "media cost",
+      "target": "spends"
+    },
+    {
+      "source": "media_cost",
+      "target": "spends"
+    },
+    {
+      "source": "total_cost",
+      "target": "spends"
+    },
+    {
+      "source": "total cost",
+      "target": "spends"
+    },
+    {
+      "source": "ad spend",
+      "target": "spends"
+    },
+    {
+      "source": "imps",
+      "target": "impressions"
+    },
+    {
+      "source": "impression",
+      "target": "impressions"
+    },
+    {
+      "source": "impressions",
+      "target": "impressions"
+    },
+    {
+      "source": "clicks",
+      "target": "clicks"
+    },
+    {
+      "source": "click",
+      "target": "clicks"
+    },
+    {
+      "source": "roas",
+      "target": "campaign_kpi"
+    },
+    {
+      "source": "return on ad spend",
+      "target": "campaign_kpi"
+    },
+    {
+      "source": "video views",
+      "target": "video_views"
+    },
+    {
+      "source": "video_views",
+      "target": "video_views"
+    },
+    {
+      "source": "views",
+      "target": "video_views"
+    },
+    {
+      "source": "campaign name",
+      "target": "campaign"
+    },
+    {
+      "source": "campaign_name",
+      "target": "campaign"
+    },
+    {
+      "source": "io name",
+      "target": "campaign"
+    },
+    {
+      "source": "io",
+      "target": "campaign"
+    },
+    {
+      "source": "insertion order",
+      "target": "campaign"
+    },
+    {
+      "source": "insertion_order",
+      "target": "campaign"
+    },
+    {
+      "source": "order",
+      "target": "campaign"
+    },
+    {
+      "source": "order name",
+      "target": "campaign"
+    },
+    {
+      "source": "order_name",
+      "target": "campaign"
+    },
+    {
+      "source": "ad set",
+      "target": "ad_group"
+    },
+    {
+      "source": "ad set name",
+      "target": "ad_group"
+    },
+    {
+      "source": "adset name",
+      "target": "ad_group"
+    },
+    {
+      "source": "ad group",
+      "target": "ad_group"
+    },
+    {
+      "source": "ad group name",
+      "target": "ad_group"
+    },
+    {
+      "source": "line item",
+      "target": "ad_group"
+    },
+    {
+      "source": "line_item",
+      "target": "ad_group"
+    },
+    {
+      "source": "line item name",
+      "target": "ad_group"
+    },
+    {
+      "source": "ad name",
+      "target": "ad"
+    },
+    {
+      "source": "creative name",
+      "target": "creative"
+    },
+    {
+      "source": "campaign objective",
+      "target": "campaign_objective"
+    },
+    {
+      "source": "objective",
+      "target": "campaign_objective"
+    },
+    {
+      "source": "campaign type",
+      "target": "campaign_type"
+    },
+    {
+      "source": "buying model",
+      "target": "buying_model"
+    },
+    {
+      "source": "optimization goal",
+      "target": "buying_model"
+    },
+    {
+      "source": "campaign kpi",
+      "target": "campaign_kpi"
+    },
+    {
+      "source": "audience",
+      "target": "audience"
+    },
+    {
+      "source": "target audience",
+      "target": "audience"
+    },
+    {
+      "source": "inventory",
+      "target": "inventory"
+    },
+    {
+      "source": "placement",
+      "target": "inventory"
+    },
+    {
+      "source": "device type",
+      "target": "device"
+    },
+    {
+      "source": "device",
+      "target": "device"
+    },
+    {
+      "source": "creative format",
+      "target": "creative_format"
+    },
+    {
+      "source": "ad format",
+      "target": "creative_format"
+    },
+    {
+      "source": "creative size",
+      "target": "creative_size"
+    },
+    {
+      "source": "ad size",
+      "target": "creative_size"
+    },
+    {
+      "source": "creative variant",
+      "target": "creative_variant"
+    },
+    {
+      "source": "creative concept",
+      "target": "creative_variant"
+    },
+    {
+      "source": "advertiser",
+      "target": "advertiser"
+    },
+    {
+      "source": "advertiser name",
+      "target": "advertiser"
+    },
+    {
+      "source": "advertiser_name",
+      "target": "advertiser"
+    },
+    {
+      "source": "business unit",
+      "target": "business_unit"
+    },
+    {
+      "source": "business_unit",
+      "target": "business_unit"
+    },
+    {
+      "source": "bu",
+      "target": "business_unit"
+    },
+    {
+      "source": "region",
+      "target": "region"
+    },
+    {
+      "source": "region name",
+      "target": "region"
+    },
+    {
+      "source": "territory",
+      "target": "region"
+    },
+    {
+      "source": "sub category 1",
+      "target": "sub_category_1"
+    },
+    {
+      "source": "subcategory 1",
+      "target": "sub_category_1"
+    },
+    {
+      "source": "sub category 2",
+      "target": "sub_category_2"
+    },
+    {
+      "source": "subcategory 2",
+      "target": "sub_category_2"
+    },
+    {
+      "source": "sub brand",
+      "target": "sub_brand"
+    },
+    {
+      "source": "subbrand",
+      "target": "sub_brand"
+    }
   ],
   "publishers": {
     "amazon_dsp": {
       "id": "amazon_dsp",
       "name": "Amazon DSP",
-      "aliases": ["Amazon DSP", "AmazonDSP", "Amazon"]
+      "aliases": [
+        "Amazon DSP",
+        "AmazonDSP",
+        "Amazon"
+      ]
     },
     "google_ads": {
       "id": "google_ads",
       "name": "Google Ads",
-      "aliases": ["Google Ads", "GoogleAds", "AdWords"]
+      "aliases": [
+        "Google Ads",
+        "GoogleAds",
+        "AdWords"
+      ]
     },
     "dv360": {
       "id": "dv360",
       "name": "DV360",
-      "aliases": ["DV360", "Display & Video 360", "DBM"]
+      "aliases": [
+        "DV360",
+        "Display & Video 360",
+        "DBM"
+      ]
     },
     "cm360": {
       "id": "cm360",
       "name": "CM360",
-      "aliases": ["CM360", "Campaign Manager", "DCM"]
+      "aliases": [
+        "CM360",
+        "Campaign Manager",
+        "DCM"
+      ]
     },
     "facebook": {
       "id": "facebook",
       "name": "Facebook / Meta",
-      "aliases": ["Facebook", "Meta", "FB", "Instagram"]
+      "aliases": [
+        "Facebook",
+        "Meta",
+        "FB",
+        "Instagram"
+      ]
     },
     "tiktok": {
       "id": "tiktok",
       "name": "TikTok",
-      "aliases": ["TikTok", "Tik Tok"]
+      "aliases": [
+        "TikTok",
+        "Tik Tok"
+      ]
     },
     "pinterest": {
       "id": "pinterest",
       "name": "Pinterest",
-      "aliases": ["Pinterest"]
+      "aliases": [
+        "Pinterest"
+      ]
     },
     "linkedin": {
       "id": "linkedin",
       "name": "LinkedIn",
-      "aliases": ["LinkedIn"]
+      "aliases": [
+        "LinkedIn"
+      ]
     },
     "retail_media": {
       "id": "retail_media",
       "name": "Retail Media",
-      "aliases": ["Retail Media", "RetailMedia"]
+      "aliases": [
+        "Retail Media",
+        "RetailMedia"
+      ]
     }
   },
-  "combined_field_delimiters": ["_", " | ", "|", " - ", " / ", "/", " > ", ">"],
-  "value_token_hints": {},
   "detection_order": [
     "amazon_dsp",
     "retail_media",
@@ -314,5 +1491,58 @@
     "tiktok",
     "linkedin",
     "pinterest"
-  ]
+  ],
+  "publisher_aliases": {
+    "amazon_dsp": [
+      "Amazon DSP",
+      "AmazonDSP",
+      "Amazon"
+    ],
+    "google_ads": [
+      "Google Ads",
+      "GoogleAds",
+      "AdWords"
+    ],
+    "dv360": [
+      "DV360",
+      "Display & Video 360",
+      "DBM"
+    ],
+    "cm360": [
+      "CM360",
+      "Campaign Manager",
+      "DCM"
+    ],
+    "facebook": [
+      "Facebook",
+      "Meta",
+      "FB",
+      "Instagram"
+    ],
+    "tiktok": [
+      "TikTok",
+      "Tik Tok"
+    ],
+    "pinterest": [
+      "Pinterest"
+    ],
+    "linkedin": [
+      "LinkedIn"
+    ],
+    "retail_media": [
+      "Retail Media",
+      "RetailMedia"
+    ]
+  },
+  "combined_field_delimiters": [
+    "_",
+    " | ",
+    "|",
+    " - ",
+    " / ",
+    "/",
+    " > ",
+    ">"
+  ],
+  "value_token_hints": {}
 }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, fields
+import logging
 from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -17,6 +18,8 @@ from .target_template_utils import (
     template_union_grain_columns,
     validate_template_shape,
 )
+
+logger = logging.getLogger(__name__)
 
 
 KEEP_DECISIONS = {"keep", "metadata", "context", "use as context"}
@@ -1603,6 +1606,70 @@ def apply_context_to_dataframe(
     if rename_map:
         result = result.rename(columns=rename_map)
         applied_actions.append(f"applied {len(rename_map)} approved column mappings")
+
+    # Configured finite vocabularies are deterministic mappings, not an LLM task.
+    # Apply them after columns have their standard ids so, for example, a source
+    # value "UK" in the mapped country column becomes "United Kingdom".
+    try:
+        from sia.agent.field_mapping_policy import build_value_harmonization_map
+        from sia.agent.hierarchy_register import load_catalog
+
+        catalog = load_catalog()
+        harmonized_cells = 0
+        harmonized_columns = 0
+        for column in result.columns:
+            value_map = build_value_harmonization_map(str(column), catalog)
+            if not value_map:
+                continue
+            series = result[column]
+
+            def harmonize(value: Any) -> Any:
+                nonlocal harmonized_cells
+                if pd.isna(value):
+                    return value
+                standard = value_map.get(str(value).strip().casefold())
+                if standard is None or standard == value:
+                    return value
+                harmonized_cells += 1
+                return standard
+
+            before = harmonized_cells
+            result[column] = series.map(harmonize)
+            if harmonized_cells > before:
+                harmonized_columns += 1
+        if harmonized_cells:
+            applied_actions.append(
+                f"harmonized {harmonized_cells} values across {harmonized_columns} finite-list columns"
+            )
+    except Exception as exc:
+        logger.warning("Could not apply configured finite value mappings: %s", exc)
+
+    # Learn from what this source actually contained, now that columns carry
+    # standard ids and known values have been harmonised away. Open fields keep a
+    # rolling queue so their columns stay recognisable; closed fields collect the
+    # leftovers as a review list for Config.
+    try:
+        from sia.agent.field_mapping_policy import FIELD_VALUE_CAP, field_value_mode
+        from sia.agent.learned_mappings import batch, record_field_values
+
+        learned_values = 0
+        with batch():
+            for column in result.columns:
+                field_id = str(column)
+                mode = field_value_mode(field_id)
+                if mode == "none":
+                    continue
+                series = result[field_id]
+                if isinstance(series, pd.DataFrame):
+                    continue
+                uniques = [v for v in pd.Series(series).dropna().unique().tolist()][:FIELD_VALUE_CAP]
+                if not uniques:
+                    continue
+                learned_values += record_field_values(field_id, uniques, mode=mode, source="ingest")
+        if learned_values:
+            applied_actions.append(f"learned {learned_values} new field values for Config review")
+    except Exception as exc:
+        logger.warning("Could not record learned field values: %s", exc)
 
     for rule in sorted(business_rules or [], key=lambda item: item.get("priority", 100)):
         target_column = rule.get("target_column")

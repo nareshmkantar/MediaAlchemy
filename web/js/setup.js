@@ -4338,6 +4338,7 @@ function normalizeColumnStdSplit(cf) {
                 combine_with_previous: false,
                 target: t && t !== COLSTD_CUSTOM ? t : '',
                 custom_name: '',
+                user_set: false,
             });
         }
     } else {
@@ -4349,6 +4350,7 @@ function normalizeColumnStdSplit(cf) {
                 combine_with_previous: false,
                 target: dims[i] || '',
                 custom_name: '',
+                user_set: false,
             });
         }
         parts = parts.slice(0, n).map((p, i) => ({
@@ -4357,6 +4359,7 @@ function normalizeColumnStdSplit(cf) {
             combine_with_previous: i > 0 && Boolean(p.combine_with_previous),
             target: p.target === COLSTD_CUSTOM ? COLSTD_CUSTOM : (p.target || ''),
             custom_name: p.custom_name || '',
+            user_set: Boolean(p.user_set),
         }));
     }
     cf.part_count = n;
@@ -4611,14 +4614,19 @@ function onColumnStdChange(e) {
             part.target = el.value;
             part.custom_name = '';
         }
+        // Flag the analyst's own choice so re-detection keeps it and refreshes
+        // the parts nobody touched.
+        part.user_set = true;
         syncSplitDerivedFields(split);
         renderColumnStdWorkspace(columnStdState);
     } else if (action === 'part-custom' && split?.parts?.[pi]) {
         split.parts[pi].custom_name = el.value;
         split.parts[pi].target = COLSTD_CUSTOM;
+        split.parts[pi].user_set = true;
         syncSplitDerivedFields(split);
     } else if (action === 'combine-prev' && split?.parts?.[pi]) {
         split.parts[pi].combine_with_previous = Boolean(el.checked);
+        split.parts[pi].user_set = true;
         syncSplitDerivedFields(split);
         renderColumnStdWorkspace(columnStdState);
     } else if (action === 'single-target' && split) {
@@ -4875,7 +4883,7 @@ function switchStep(step) {
     } else if (showStd) {
         loadStandardize(false);
     } else if (showColStd) {
-        loadColumnStd(false);
+        loadColumnStd(true);
     } else if (showMap) {
         mappingProposal = null;
         mappingBlocks = null;
