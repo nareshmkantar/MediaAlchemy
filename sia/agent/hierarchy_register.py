@@ -19,6 +19,17 @@ logger = logging.getLogger(__name__)
 
 _CATALOG_CACHE: Optional[Dict[str, Any]] = None
 _SAMPLE_ROWS = 80
+_PREVIEW_ROWS = 6
+_PREVIEW_MAX_COLS = 18
+
+# Native platform headers that still fold onto the shared Config spine.
+# Mapping dictionary is the source of truth; this is a last-resort remap if a
+# leftover id (insertion_order, line_item) reaches grain inference.
+_SPINE_ALIASES = {
+    "insertion_order": "campaign",
+    "io": "campaign",
+    "line_item": "ad_group",
+}
 
 _PUBLISHER_DETECT_ORDER_FALLBACK = [
     "amazon_dsp",
@@ -87,15 +98,52 @@ def save_catalog(data: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+# Schema Mapping Primary Column targets. IDs and other attributes stay Supporting Meta.
+_MAPPING_PRIMARY_METRICS = ("spends", "impressions", "clicks")
+_MAPPING_PRIMARY_ALWAYS = ("date", "country", "category", "brand")
+
+
+def mapping_primary_targets(catalog: Optional[Dict[str, Any]] = None) -> List[str]:
+    """Targets that default to Primary Column in Schema Mapping.
+
+    Built from Config, not the target template: enterprise fields that exist
+    (Country / Category / Brand and any other required enterprise info), the
+    media-hierarchy spine, Date, and Spends / Impressions / Clicks. Everything
+    else — including identifier columns — defaults to Supporting Meta.
+    """
+    cat = catalog or load_catalog()
+    out: List[str] = []
+    seen = set()
+
+    def add(field_id: Any) -> None:
+        fid = str(field_id or "").strip()
+        if not fid or fid in seen:
+            return
+        seen.add(fid)
+        out.append(fid)
+
+    ei = cat.get("enterprise_info") or {}
+    for field in ei.get("mandatory_fields") or []:
+        if isinstance(field, dict):
+            add(field.get("id"))
+    for fid in _MAPPING_PRIMARY_ALWAYS:
+        add(fid)
+    for level in media_hierarchy_levels(cat):
+        add(level.get("id"))
+    for fid in _MAPPING_PRIMARY_METRICS:
+        add(fid)
+    return out
+
+
 def media_hierarchy_levels(catalog: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    """Simplified delivery spine: Publisher → Campaign → Ad Group → Ad → Creative."""
+    """Shared grain spine from Config — the same list for every publisher."""
     cat = catalog or load_catalog()
     levels = list(cat.get("media_hierarchy") or [])
     if levels:
         return [
             {
                 "level": int(lv.get("level") or i + 1),
-                "id": lv.get("id") or normalize_key(lv.get("name")).replace(" ", "_"),
+                "id": lv.get("id") or _name_slug(lv.get("name")),
                 "name": lv.get("name") or lv.get("id"),
                 "mandatory": bool(lv.get("mandatory", False)),
             }
@@ -283,71 +331,130 @@ def catalog_for_api() -> Dict[str, Any]:
     }
 
 
+_KEY_SEPARATORS = re.compile(r"[\s_\-/|>.,;:()\[\]{}]+")
+_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+
+
 def normalize_key(value: Any) -> str:
-    return (
-        str(value or "")
-        .lower()
-        .replace("_", " ")
-        .replace("-", " ")
-        .replace("/", " ")
-        .replace("|", " ")
-        .replace(">", " ")
-        .replace("  ", " ")
-        .strip()
-    )
+    """Whole-name key for alias lookup.
+
+    ``orderName``, ``order_name`` and ``order name`` are the same name because
+    separators and case are ignored — not because camelCase is split into
+    tokens. Splitting ``intervalStart`` into ``interval`` + ``Start`` would
+    invent words that are not in the header.
+    """
+    return _NON_ALNUM.sub("", str(value or "").lower())
+
+
+def _name_slug(value: Any) -> str:
+    """Separator-based id fallback (``Ad Group`` → ``ad_group``)."""
+    return "_".join(_KEY_SEPARATORS.sub(" ", str(value or "").lower()).split())
+
+
+def _date_role_from_visible_words(name: Any) -> str:
+    """Date role from words already separated in *name* — never camelCase pieces."""
+    tokens = [t for t in _KEY_SEPARATORS.split(str(name or "").lower()) if t]
+    if any(t in {"start", "from", "begin"} for t in tokens):
+        return "range_start"
+    if any(t in {"end", "to", "until", "finish"} for t in tokens):
+        return "range_end"
+    if "year" in tokens:
+        return "part_year"
+    if "month" in tokens:
+        return "part_month"
+    if "day" in tokens:
+        return "part_day"
+    if "quarter" in tokens or any(t in {"q1", "q2", "q3", "q4"} for t in tokens):
+        return "part_quarter"
+    return ""
+
+
+def suggest_date_semantic(source_col: str, catalog: Optional[Dict[str, Any]] = None) -> str:
+    """Date role for a header, using the whole name only.
+
+    ``intervalStart`` is Range start because Config has the alias
+    ``interval start`` (same compact name). The letters ``Start`` inside the
+    camelCase header are not read as their own word.
+    """
+    cat = catalog or load_catalog()
+    key = normalize_key(source_col)
+    if not key:
+        return ""
+    for entry in cat.get("mapping_dictionary") or []:
+        if not isinstance(entry, dict):
+            continue
+        source = str(entry.get("source") or "")
+        if normalize_key(source) != key:
+            continue
+        role = _date_role_from_visible_words(source)
+        if role:
+            return role
+    return _date_role_from_visible_words(source_col)
+
+
+def _column_alias_index(catalog: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Normalized column name → target. First writer wins, most specific first."""
+    index: Dict[str, Dict[str, Any]] = {}
+
+    def add(name: Any, target: Any, confidence: int, reason: str) -> None:
+        key = normalize_key(name)
+        target_id = str(target or "").strip()
+        if key and target_id and key not in index:
+            index[key] = {"target": target_id, "confidence": confidence, "reason": reason}
+
+    for entry in catalog.get("mapping_dictionary") or []:
+        if isinstance(entry, dict):
+            add(entry.get("source"), entry.get("target"), 98, "Column alias")
+
+    for field in catalog.get("standard_fields") or []:
+        if isinstance(field, dict):
+            add(field.get("label"), field.get("id"), 94, "Standard column name")
+            add(field.get("id"), field.get("id"), 94, "Standard column name")
+
+    for level in media_hierarchy_levels(catalog):
+        add(level.get("name"), level.get("id"), 92, "Hierarchy level name")
+        add(level.get("id"), level.get("id"), 92, "Hierarchy level name")
+
+    for attr in catalog.get("common_attributes") or []:
+        if isinstance(attr, dict):
+            add(attr.get("name"), attr.get("id"), 90, "Attribute name")
+            add(attr.get("id"), attr.get("id"), 90, "Attribute name")
+
+    for metric in catalog.get("metrics") or []:
+        if isinstance(metric, dict):
+            add(metric.get("name"), metric.get("id"), 94, "Metric name")
+            add(metric.get("id"), metric.get("id"), 94, "Metric name")
+            for alias in metric.get("aliases") or []:
+                add(alias, metric.get("id"), 92, "Metric alias")
+
+    # Headers an analyst already confirmed count the same as configured aliases.
+    try:
+        from .learned_mappings import learned_column_aliases
+
+        for target, aliases in learned_column_aliases().items():
+            for alias in aliases:
+                add(alias, target, 90, "Learned from a confirmed mapping")
+    except Exception as exc:
+        logger.warning("Could not load learned column aliases: %s", exc)
+
+    return index
 
 
 def suggest_column_target(source_col: str, catalog: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Map a source column name to a standard field via dictionary / labels."""
+    """Map a source column to a standard field by whole-name alias match.
+
+    Deliberately exact: a header counts only when its full name matches an alias
+    (separators and case ignored). Substring matching used to read
+    ``orderCurrency`` as Campaign (via ``order``) and
+    ``actions.onsite_conversion`` as Publisher (via ``site``). Unmatched
+    columns are left for the analyst rather than guessed at.
+    """
     cat = catalog or load_catalog()
     key = normalize_key(source_col)
-    dictionary = cat.get("mapping_dictionary") or []
-    for entry in dictionary:
-        if normalize_key(entry.get("source")) == key:
-            return {"target": entry.get("target"), "confidence": 98, "reason": "Dictionary exact match"}
-    for entry in dictionary:
-        src = normalize_key(entry.get("source"))
-        if src and len(src) >= 3 and (src in key or key in src):
-            return {"target": entry.get("target"), "confidence": 86, "reason": "Dictionary partial match"}
-    fields = cat.get("standard_fields") or []
-    for field in fields:
-        if normalize_key(field.get("label")) == key or str(field.get("id") or "") == key.replace(" ", "_"):
-            return {"target": field.get("id"), "confidence": 94, "reason": "Standard field name"}
-    # Shared media hierarchy levels
-    for level in media_hierarchy_levels(cat):
-        if normalize_key(level.get("name")) == key or str(level.get("id") or "") == key.replace(" ", "_"):
-            return {"target": level.get("id"), "confidence": 92, "reason": "Media hierarchy level"}
-    for attr in cat.get("common_attributes") or []:
-        if isinstance(attr, dict) and (
-            normalize_key(attr.get("name")) == key or str(attr.get("id") or "") == key.replace(" ", "_")
-        ):
-            return {"target": attr.get("id"), "confidence": 90, "reason": "Common attribute"}
-    # Hierarchy level name match (canonical name or native_alias) — legacy per-publisher trees
-    publishers = cat.get("publishers") or {}
-    for pub in publishers.values():
-        if not isinstance(pub, dict):
-            continue
-        for level in pub.get("hierarchy") or []:
-            if not isinstance(level, dict):
-                continue
-            names = [level.get("name"), level.get("native_alias")]
-            if any(normalize_key(n) == key for n in names if n):
-                return {
-                    "target": level.get("id") or normalize_key(level.get("name")).replace(" ", "_"),
-                    "confidence": 90,
-                    "reason": f"Hierarchy level ({pub.get('name')})",
-                }
-    # Enterprise delivery/planning labels (legacy)
-    ent = cat.get("enterprise_hierarchy") or {}
-    for layer_key in ("planning", "delivery", "creative_detail"):
-        for level in ent.get(layer_key) or []:
-            if isinstance(level, dict) and normalize_key(level.get("name")) == key:
-                return {
-                    "target": level.get("id"),
-                    "confidence": 92,
-                    "reason": f"Enterprise {layer_key} level",
-                }
-    return {"target": None, "confidence": 42, "reason": "No dictionary match"}
+    hit = _column_alias_index(cat).get(key)
+    if hit:
+        return dict(hit)
+    return {"target": None, "confidence": 0, "reason": "No alias match — map it in Schema Mapping"}
 
 
 def detect_publisher(
@@ -431,73 +538,70 @@ def detect_publisher(
     }
 
 
-def _hierarchy_field_ids(publisher: Dict[str, Any]) -> List[Dict[str, Any]]:
-    levels = []
-    for level in publisher.get("hierarchy") or []:
-        if not isinstance(level, dict):
-            continue
-        lid = level.get("id") or normalize_key(level.get("name")).replace(" ", "_")
-        row = {
-            "level": int(level.get("level") or len(levels) + 1),
-            "id": lid,
-            "name": level.get("name") or lid,
-            "mandatory": bool(level.get("mandatory", True)),
-        }
-        if level.get("native_alias"):
-            row["native_alias"] = str(level.get("native_alias"))
-        levels.append(row)
-    return levels
-
-
 def infer_grain(
-    publisher_id: Optional[str],
-    columns: Sequence[str],
+    publisher_id: Optional[str] = None,
+    columns: Sequence[str] = (),
     catalog: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """
-    Infer deepest media-hierarchy level present in column headers.
-    Spine: Publisher → Campaign → Ad Group → Ad → Creative.
+    """Infer the deepest Config spine level present in *this file's* headers.
+
+    Publisher is not an input. Every source uses the same ``media_hierarchy``
+    list from Config; grain is whichever of those levels the columns actually
+    contain. If none of Campaign / Ad Group / Ad / Creative (or their aliases)
+    are present, grain defaults to Publisher. ``publisher_id`` is accepted only
+    so older callers keep working.
     """
     cat = catalog or load_catalog()
     levels = media_hierarchy_levels(cat)
+    level_by_id = {lv["id"]: (idx, lv) for idx, lv in enumerate(levels)}
     matched: List[Dict[str, Any]] = []
     deepest_idx = -1
     deepest_level = None
 
     for col in columns:
         sug = suggest_column_target(col, cat)
-        target = sug.get("target")
-        if target in ("insertion_order",):
-            target = "campaign"
-        if target in ("line_item",):
-            target = "ad_group"
-        if target == "advertiser":
+        target = str(sug.get("target") or "")
+        target = _SPINE_ALIASES.get(target, target)
+        hit = level_by_id.get(target)
+        if hit is None:
             continue
-        for idx, level in enumerate(levels):
-            if level["id"] == target or normalize_key(level["name"]) == normalize_key(col):
-                matched.append({
-                    "source_column": col,
-                    "target": level["id"],
-                    "level": level["level"],
-                    "level_name": level["name"],
-                    "confidence": sug.get("confidence"),
-                    "reason": sug.get("reason"),
-                })
-                if idx > deepest_idx:
-                    deepest_idx = idx
-                    deepest_level = level
-                break
+        idx, level = hit
+        matched.append({
+            "source_column": col,
+            "target": level["id"],
+            "level": level["level"],
+            "level_name": level["name"],
+            "confidence": sug.get("confidence"),
+            "reason": sug.get("reason"),
+        })
+        if idx > deepest_idx:
+            deepest_idx = idx
+            deepest_level = level
 
     if deepest_level is None:
-        default = next((lv for lv in levels if lv["id"] == "campaign"), levels[0] if levels else None)
+        fallback_idx, fallback = next(
+            ((idx, lv) for idx, lv in enumerate(levels) if lv.get("id") == "publisher"),
+            (0, levels[0] if levels else None),
+        )
+        if fallback is None:
+            return {
+                "grain_level": None,
+                "grain_level_index": None,
+                "grain_level_id": None,
+                "grain_level_name": None,
+                "detected_hierarchy_columns": matched,
+                "confidence": 0,
+                "reason": "No hierarchy columns found — pick the grain from the preview",
+                "hierarchy": levels,
+            }
         return {
-            "grain_level": default["level"] if default and publisher_id else None,
-            "grain_level_index": (levels.index(default) if default and publisher_id else None),
-            "grain_level_id": default["id"] if default and publisher_id else None,
-            "grain_level_name": default["name"] if default and publisher_id else None,
+            "grain_level": fallback["level"],
+            "grain_level_index": fallback_idx,
+            "grain_level_id": fallback["id"],
+            "grain_level_name": fallback["name"],
             "detected_hierarchy_columns": matched,
-            "confidence": 40 if publisher_id else 0,
-            "reason": "Default to Campaign — confirm grain level" if publisher_id else "Select publisher and grain level",
+            "confidence": 40,
+            "reason": "No Campaign / Ad Group / Ad / Creative column found — defaulting to Publisher",
             "hierarchy": levels,
         }
 
@@ -513,42 +617,85 @@ def infer_grain(
     }
 
 
+def _cell_preview(value: Any) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    if text.lower() in ("nan", "none", "nat"):
+        return ""
+    if len(text) > 80:
+        return text[:77] + "…"
+    return text
+
+
+def sample_preview(
+    columns: Sequence[str],
+    sample_df: Optional[pd.DataFrame],
+    detected_hierarchy_columns: Optional[Sequence[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Compact header + row sample for the Upload grain picker."""
+    roles = {
+        str(row.get("source_column")): str(row.get("target") or "")
+        for row in (detected_hierarchy_columns or [])
+        if isinstance(row, dict) and row.get("source_column")
+    }
+    headers = [str(c) for c in (columns or [])]
+    total_columns = len(headers)
+    if len(headers) > _PREVIEW_MAX_COLS:
+        keep: List[str] = []
+        seen = set()
+        for h in headers:
+            if h in roles and h not in seen:
+                keep.append(h)
+                seen.add(h)
+        for h in headers:
+            if len(keep) >= _PREVIEW_MAX_COLS:
+                break
+            if h not in seen:
+                keep.append(h)
+                seen.add(h)
+        order = {h: i for i, h in enumerate(headers)}
+        headers = sorted(keep, key=lambda h: order.get(h, 10_000))
+
+    rows: List[List[str]] = []
+    sampled = 0
+    if sample_df is not None and not sample_df.empty:
+        sampled = int(len(sample_df))
+        present = [h for h in headers if h in sample_df.columns]
+        subset = sample_df.loc[:, present]
+        for _, row in subset.head(_PREVIEW_ROWS).iterrows():
+            rows.append([_cell_preview(row[h]) if h in subset.columns else "" for h in headers])
+
+    return {
+        "headers": headers,
+        "rows": rows,
+        "column_roles": {h: roles[h] for h in headers if h in roles},
+        "truncated": total_columns > len(headers),
+        "total_columns": total_columns,
+        "sampled_rows": sampled,
+        "shown_rows": len(rows),
+    }
+
+
 def _load_value_token_map(catalog: Dict[str, Any]) -> Dict[str, str]:
-    """Build token → dimension-id map from catalog hints + synonyms.json."""
-    token_map: Dict[str, str] = {}
+    """Token → field id from closed value lists, then field labels as fallback."""
+    from sia.agent.field_mapping_policy import build_value_token_map
+
+    token_map = build_value_token_map(catalog)
     hints = catalog.get("value_token_hints") or {}
     for dim, tokens in hints.items():
         for tok in tokens or []:
-            token_map[str(tok).strip().lower()] = dim
-
-    syn_path = Path(__file__).resolve().parent.parent.parent / "config" / "synonyms.json"
-    try:
-        with open(syn_path, encoding="utf-8") as fh:
-            syn = json.load(fh)
-    except Exception:
-        syn = {}
-
-    # Map common synonym groups to dimension ids when present
-    dim_aliases = {
-        "country": "country",
-        "brand": "brand",
-        "publisher": "publisher",
-        "channel": "channel",
-        "category": "category",
-    }
-    # Workbench-style libraries may appear under synonymLibraries; column_synonyms is different
-    for key, dim_id in dim_aliases.items():
-        # From value-level libraries if embedded later; also scan any top-level lists
-        pass
-
-    # Known short country/brand tokens from synonyms column values are less useful;
-    # rely on value_token_hints + standard field labels for packed tokens.
+            token_map.setdefault(str(tok).strip().lower(), str(dim))
     for field in catalog.get("standard_fields") or []:
         fid = str(field.get("id") or "")
         if field.get("type") in ("dimension", "hierarchy") and fid:
-            token_map[fid.replace("_", " ").lower()] = fid
-            token_map[str(field.get("label") or "").lower()] = fid
-
+            token_map.setdefault(fid.replace("_", " ").lower(), fid)
+            token_map.setdefault(str(field.get("label") or "").lower(), fid)
     return token_map
 
 
@@ -587,12 +734,20 @@ def _classify_tokens(
     n_parts: int,
     token_map: Dict[str, str],
     standard_fields: Sequence[Dict[str, Any]],
-) -> List[Optional[str]]:
-    """Propose a target dimension per split position from token evidence."""
+    extra_field_ids: Optional[Sequence[str]] = None,
+) -> List[str]:
+    """Propose a target dimension per split position from value aliases only.
+
+    A part is labelled only when its token is in ``token_map``. Unused Master
+    List dimensions are never poured into leftover slots — a duplicate ALPRO
+    after Brand stays blank, not Region.
+    """
     dim_fields = [
         f for f in standard_fields
         if f.get("type") in ("dimension", "hierarchy") and f.get("id")
     ]
+    field_ids = {str(f.get("id")) for f in dim_fields}
+    field_ids.update(str(x).strip() for x in (extra_field_ids or []) if str(x).strip())
     position_votes: List[Dict[str, int]] = [dict() for _ in range(n_parts)]
 
     for raw in sample_values:
@@ -604,40 +759,29 @@ def _classify_tokens(
             parts.append("")
         for i, part in enumerate(parts[:n_parts]):
             key = part.lower()
-            if not key:
+            if not key or key not in token_map:
                 continue
-            if key in token_map:
-                dim = token_map[key]
-                position_votes[i][dim] = position_votes[i].get(dim, 0) + 2
-            # Heuristic: 2–3 letter uppercase → country
-            if re.fullmatch(r"[A-Za-z]{2,3}", part) and i == 0:
-                position_votes[i]["country"] = position_votes[i].get("country", 0) + 1
-            # Longer title-like middle tokens → brand / campaign
-            if len(part) > 3 and i == 1:
-                position_votes[i]["brand"] = position_votes[i].get("brand", 0) + 1
-            if len(part) > 3 and i >= 2:
-                position_votes[i]["campaign"] = position_votes[i].get("campaign", 0) + 1
-                position_votes[i]["campaign_objective"] = position_votes[i].get("campaign_objective", 0) + 1
+            dim = token_map[key]
+            if dim in field_ids:
+                position_votes[i][dim] = position_votes[i].get(dim, 0) + 1
 
-    defaults = ["country", "brand", "campaign", "campaign_objective", "audience"]
-    field_ids = {str(f.get("id")) for f in dim_fields}
-    targets: List[Optional[str]] = []
-    used = set()
+    # One label per position: the top alias vote there. If that dimension is
+    # already taken, leave the part blank. Do not fall through to a weaker
+    # leftover (ALPRO + ALL at the same slot must not become Region).
+    best: List[tuple] = []
     for i, votes in enumerate(position_votes):
-        ranked = sorted(votes.items(), key=lambda kv: (-kv[1], kv[0]))
-        chosen = None
-        for dim, _score in ranked:
-            if dim in field_ids and dim not in used:
-                chosen = dim
-                break
-        if chosen is None:
-            for d in defaults[i:] + defaults[:i]:
-                if d in field_ids and d not in used:
-                    chosen = d
-                    break
-        if chosen:
-            used.add(chosen)
-        targets.append(chosen)
+        if not votes:
+            continue
+        dim, score = max(votes.items(), key=lambda kv: (kv[1], kv[0]))
+        best.append((score, i, dim))
+    best.sort(key=lambda c: (-c[0], c[1], c[2]))
+
+    targets: List[str] = [""] * n_parts
+    used = set()
+    for _score, i, dim in best:
+        if dim not in used:
+            targets[i] = dim
+            used.add(dim)
     return targets
 
 
@@ -687,7 +831,18 @@ def detect_combined_fields(
         if not picked:
             continue
         delim, stability, n_parts = picked
-        targets = _classify_tokens(samples, delim, n_parts, token_map, standard_fields)
+        targets = _classify_tokens(
+            samples,
+            delim,
+            n_parts,
+            token_map,
+            standard_fields,
+            extra_field_ids=[
+                str(a.get("id") or "")
+                for a in (cat.get("common_attributes") or [])
+                if isinstance(a, dict)
+            ],
+        )
         # Require at least 2 distinct proposed dimensions
         distinct = [t for t in targets if t]
         if len(set(distinct)) < 2:
@@ -711,7 +866,7 @@ def detect_combined_fields(
                 "index": i,
                 "sample": part_samples[i],
                 "combine_with_previous": False,
-                "target": targets[i] if i < len(targets) else "",
+                "target": (targets[i] if i < len(targets) else "") or "",
                 "custom_name": "",
             })
         results.append({
@@ -742,7 +897,6 @@ def compare_hierarchies(
     Soft warnings only — analyst may acknowledge mixed grain.
     """
     cat = catalog or load_catalog()
-    pubs = cat.get("publishers") or {}
     grains: List[Dict[str, Any]] = []
     for reg in registrations:
         if not isinstance(reg, dict):
@@ -790,12 +944,9 @@ def compare_hierarchies(
             "sources": [g.get("source_id") for g in grains],
         })
 
-    # Missing mandatory levels above declared grain
+    # Missing mandatory levels above declared grain, from the shared Config spine
+    levels = media_hierarchy_levels(cat)
     for g in grains:
-        pub = pubs.get(g.get("publisher_id") or "")
-        if not isinstance(pub, dict):
-            continue
-        levels = _hierarchy_field_ids(pub)
         idx = g.get("grain_level_index")
         if idx is None:
             continue
@@ -803,7 +954,6 @@ def compare_hierarchies(
             idx_i = int(idx)
         except (TypeError, ValueError):
             continue
-        # Only flag if we know detected columns and mandatory ancestors absent from registry
         detected = {
             str(c.get("target"))
             for c in (next((r.get("detected_hierarchy_columns") or [] for r in registrations if r.get("source_id") == g["source_id"]), []))
@@ -979,6 +1129,7 @@ def propose_for_source(
     combined = detect_combined_fields(sample_df, columns, cat)
     # Combined fields are proposed for Column Standardization (post-layout), not Upload registration
     hierarchy = list(grain.get("hierarchy") or media_hierarchy_levels(cat))
+    preview = sample_preview(columns, sample_df, grain.get("detected_hierarchy_columns") or [])
 
     registered = bool(
         publisher_id
@@ -1005,6 +1156,7 @@ def propose_for_source(
         "grain_confidence": grain.get("confidence"),
         "grain_reason": grain.get("reason"),
         "detected_hierarchy_columns": grain.get("detected_hierarchy_columns") or [],
+        "preview": preview,
         "combined_field_proposals": combined,
         "registered": registered,
         "analyst_notes": (existing or {}).get("analyst_notes") or "",

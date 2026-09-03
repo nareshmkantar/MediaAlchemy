@@ -23,12 +23,12 @@
     "metrics": [
       "spends",
       "impressions",
-      "clicks",
-      "roas"
+      "clicks"
     ],
 
     "supporting_columns": [
-      "region"
+      "region",
+      "campaign_kpi"
     ],
 
     "date_granularity": "daily"
@@ -55,8 +55,7 @@
     "metric_rules": {
       "impressions": "sum",
       "spends": "sum",
-      "clicks": "sum",
-      "roas": "weighted_avg"
+      "clicks": "sum"
     },
     "pmi_safe_rules": [
       "When multiple rows exist for the same UID, sum impressions.",
@@ -107,10 +106,19 @@
       "description": "Total clicks."
     },
 
-    "roas": {
-      "type": "number",
-      "minimum": 0,
-      "description": "Return on ad spend (Campaign KPI)."
+    "campaign_kpi": {
+      "type": "string",
+      "description": "Primary campaign key performance indicator.",
+      "enum": [
+        "ROAS",
+        "CTR",
+        "CPI",
+        "CPA",
+        "CPC",
+        "CPM",
+        "VTR",
+        "CPV"
+      ]
     }
   }
 }

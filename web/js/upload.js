@@ -406,14 +406,12 @@ function publisherOptions(selectedId) {
 
 function mediaHierarchyLevels() {
     const levels = (hierarchyCatalog && hierarchyCatalog.media_hierarchy) || [];
-    if (levels.length) return levels;
-    return [
-        { level: 1, id: 'publisher', name: 'Publisher', mandatory: true },
-        { level: 2, id: 'campaign', name: 'Campaign', mandatory: true },
-        { level: 3, id: 'ad_group', name: 'Ad Group', mandatory: false },
-        { level: 4, id: 'ad', name: 'Ad', mandatory: false },
-        { level: 5, id: 'creative', name: 'Creative', mandatory: false },
-    ];
+    return Array.isArray(levels) ? levels.filter((lv) => lv && lv.id) : [];
+}
+
+function grainSpineLabel() {
+    const names = mediaHierarchyLevels().map((lv) => lv.name || lv.id).filter(Boolean);
+    return names.length ? names.join(' → ') : 'Data grain';
 }
 
 function hierarchyLevelsForSource(src) {
@@ -673,12 +671,23 @@ function renderHierarchyPanel() {
     const levels = mediaHierarchyLevels();
     cards.innerHTML = sources.map((src, idx) => {
         const grainId = src.grain_level_id || '';
+        const detectedByLevel = {};
+        (src.detected_hierarchy_columns || []).forEach((hit) => {
+            const id = hit.target || '';
+            if (!id) return;
+            if (!detectedByLevel[id]) detectedByLevel[id] = [];
+            if (hit.source_column) detectedByLevel[id].push(hit.source_column);
+        });
         const tree = levels.map((lv) => {
             const checked = (lv.id === grainId) || (String(lv.level) === String(src.grain_level));
-            return `<label class="hierarchy-tree-item ${checked ? 'is-grain' : ''}">
+            const found = detectedByLevel[lv.id] || [];
+            const foundHint = found.length
+                ? `<span class="hierarchy-tree-found" title="${escapeAttr(found.join(', '))}">in file: ${escapeHtml(found[0])}${found.length > 1 ? ` +${found.length - 1}` : ''}</span>`
+                : '';
+            return `<label class="hierarchy-tree-item ${checked ? 'is-grain' : ''} ${found.length ? 'is-detected' : ''}">
                 <input type="radio" name="grain-${escapeAttr(src.source_id)}" data-hier-action="grain"
                     data-source-idx="${idx}" value="${escapeAttr(lv.id)}" ${checked ? 'checked' : ''}>
-                <span>${escapeHtml(lv.name)}${lv.mandatory ? '' : ' <span class="hierarchy-pill muted">optional</span>'}</span>
+                <span>${escapeHtml(lv.name)}${lv.mandatory ? '' : ' <span class="hierarchy-pill muted">optional</span>'}${foundHint}</span>
             </label>`;
         }).join('');
 
@@ -691,7 +700,7 @@ function renderHierarchyPanel() {
                 </div>
                 ${confPill(src.publisher_confidence, src.registered)}
             </div>
-            <div class="hierarchy-card-grid hierarchy-card-grid--single">
+            <div class="hierarchy-card-grid">
                 <div>
                     <div class="hierarchy-field">
                         <label>Publisher</label>
@@ -700,13 +709,54 @@ function renderHierarchyPanel() {
                         </select>
                     </div>
                     <div class="hierarchy-tree">
-                        <div class="hierarchy-tree-title">Data grain (Publisher → Campaign → Ad Group → Ad → Creative)</div>
+                        <div class="hierarchy-tree-title">Data grain — ${escapeHtml(grainSpineLabel())}</div>
+                        <p class="hierarchy-tree-hint">Same ladder for every publisher (from Config). Pick the deepest level this file actually reports at.</p>
                         ${tree}
                     </div>
                 </div>
+                ${renderHierarchyPreview(src, levels)}
             </div>
         </article>`;
     }).join('');
+}
+
+function renderHierarchyPreview(src, levels) {
+    const preview = src.preview || {};
+    const headers = Array.isArray(preview.headers) ? preview.headers : (src.columns || []);
+    const rows = Array.isArray(preview.rows) ? preview.rows : [];
+    const roles = preview.column_roles || {};
+    const nameById = Object.fromEntries((levels || []).map((lv) => [lv.id, lv.name || lv.id]));
+    if (!headers.length) {
+        return `<div class="hierarchy-preview"><p class="hierarchy-preview-empty">No sample rows could be read from this file.</p></div>`;
+    }
+    const meta = preview.truncated
+        ? `Showing ${headers.length} of ${preview.total_columns} columns`
+        : `${headers.length} columns`;
+    const thead = headers.map((h) => {
+        const role = roles[h];
+        const label = role ? nameById[role] || role : '';
+        return `<th class="${role ? 'is-hierarchy' : ''}" title="${escapeAttr(h)}">
+            ${escapeHtml(h)}${label ? `<span class="hierarchy-preview-role">${escapeHtml(label)}</span>` : ''}
+        </th>`;
+    }).join('');
+    const tbody = rows.length
+        ? rows.map((row) => `<tr>${headers.map((h, i) => {
+            const role = roles[h];
+            return `<td class="${role ? 'is-hierarchy' : ''}">${escapeHtml(row[i] == null ? '' : String(row[i]))}</td>`;
+        }).join('')}</tr>`).join('')
+        : `<tr><td colspan="${headers.length}" class="hierarchy-preview-empty">Headers only — no data rows in the sample.</td></tr>`;
+    return `<div class="hierarchy-preview">
+        <div class="hierarchy-preview-head">
+            <strong>Sample from this file</strong>
+            <span>${escapeHtml(meta)} · ${rows.length} row${rows.length === 1 ? '' : 's'}</span>
+        </div>
+        <div class="hierarchy-preview-scroll">
+            <table class="hierarchy-preview-table">
+                <thead><tr>${thead}</tr></thead>
+                <tbody>${tbody}</tbody>
+            </table>
+        </div>
+    </div>`;
 }
 
 function onHierarchyCardChange(e) {
@@ -721,9 +771,6 @@ function onHierarchyCardChange(e) {
         src.publisher_id = el.value || null;
         if (!src.publisher_id) {
             src.publisher_name = null;
-            src.grain_level_id = null;
-            src.grain_level = null;
-            src.grain_level_name = null;
             src.registered = false;
         } else if (src.publisher_id === 'custom') {
             src.publisher_name = 'Custom';
@@ -733,13 +780,6 @@ function onHierarchyCardChange(e) {
             src.publisher_name = pub ? pub.name : src.publisher_id;
         }
         src.hierarchy = mediaHierarchyLevels();
-        if (!src.grain_level_id && src.hierarchy.length) {
-            const mid = src.hierarchy.find((l) => l.id === 'campaign') || src.hierarchy[0];
-            src.grain_level_id = mid.id;
-            src.grain_level = mid.level;
-            src.grain_level_index = src.hierarchy.indexOf(mid);
-            src.grain_level_name = mid.name;
-        }
         src.publisher_confidence = 99;
         src.publisher_reason = 'Analyst override';
         src.registered = Boolean(src.publisher_id && (src.grain_level_id || src.grain_level != null));

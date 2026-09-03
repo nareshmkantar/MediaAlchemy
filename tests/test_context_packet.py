@@ -272,6 +272,36 @@ def test_apply_context_to_dataframe_renames_formats_and_fills_values():
     assert "formatted date_paid_media" in actions
 
 
+def test_apply_context_harmonizes_configured_country_values_after_column_mapping():
+    df = pd.DataFrame({"Geo": ["UK", "DEU", "United States", "Unknown"]})
+    result, actions = apply_context_to_dataframe(
+        df,
+        approved_mappings=[
+            {"source_column": "Geo", "target_column": "country", "decision": "Keep"},
+        ],
+    )
+
+    assert result["country"].tolist() == [
+        "United Kingdom",
+        "Germany",
+        "United States",
+        "Unknown",
+    ]
+    assert any("harmonized 2 values" in action for action in actions)
+
+
+def test_apply_context_harmonizes_campaign_kpi_values():
+    df = pd.DataFrame({"KPI Type": ["Return on ad spend", "CTR", "Cost per install"]})
+    result, _actions = apply_context_to_dataframe(
+        df,
+        approved_mappings=[
+            {"source_column": "KPI Type", "target_column": "campaign_kpi", "decision": "Keep"},
+        ],
+    )
+
+    assert result["campaign_kpi"].tolist() == ["ROAS", "CTR", "CPI"]
+
+
 def test_apply_context_keeps_renamed_date_when_raw_date_was_excluded():
     """Amazon DSP: exclude unused ``date``, keep ``orderStartDate`` mapped to ``date``."""
     df = pd.DataFrame(

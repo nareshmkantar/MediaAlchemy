@@ -16,9 +16,13 @@ from sia.agent.hierarchy_register import (
     media_hierarchy_levels,
     normalize_enterprise_info,
     normalize_registration_payload,
+    propose_for_source,
     propose_for_job,
     registration_is_complete,
+    sample_preview,
     suggest_column_target,
+    suggest_date_semantic,
+    normalize_key,
 )
 from sia.agent.job_manager import JobManager
 
@@ -70,6 +74,9 @@ def test_suggest_column_target_and_infer_grain(catalog):
     assert suggest_column_target("IO Name", catalog)["target"] == "campaign"
     assert suggest_column_target("Order", catalog)["target"] == "campaign"
     assert suggest_column_target("Device Type", catalog)["target"] == "device"
+    assert suggest_column_target("Budget", catalog)["target"] == "spends"
+    assert suggest_column_target("Cost", catalog)["target"] == "spends"
+    assert suggest_column_target("Spend", catalog)["target"] == "spends"
 
     grain = infer_grain(
         "facebook",
@@ -79,6 +86,69 @@ def test_suggest_column_target_and_infer_grain(catalog):
     assert grain["grain_level_id"] in ("ad_group", "ad", "creative")
     assert grain["grain_level_name"] in ("Ad Group", "Ad", "Creative")
     assert grain["detected_hierarchy_columns"]
+
+
+def test_column_matches_an_alias_only_as_a_whole_name(catalog):
+    """Substring matching read qualifiers as their entity; whole names only now."""
+    # "order" no longer leaks into every order* header.
+    assert suggest_column_target("orderCurrency", catalog)["target"] is None
+    assert suggest_column_target("orderBudget", catalog)["target"] is None
+    # Whole-name Date alias, not a Campaign leak from the letters "order".
+    assert suggest_column_target("orderStartDate", catalog)["target"] == "date"
+    # "site" (a Publisher alias) no longer hides inside "onsite".
+    assert suggest_column_target("actions.onsite_conversion.post_save.7d_click", catalog)["target"] is None
+    # Same whole name after separators/case are ignored — not camelCase tokens.
+    assert suggest_column_target("orderName", catalog)["target"] == "campaign"
+    assert suggest_column_target("order_name", catalog)["target"] == "campaign"
+    assert suggest_column_target("adset_name", catalog)["target"] == "ad_group"
+
+
+def test_normalize_key_is_whole_name_not_camelcase_tokens():
+    """orderName equals 'order name' by compact letters, not by inventing tokens."""
+    assert normalize_key("orderName") == normalize_key("order name")
+    assert normalize_key("intervalStart") == normalize_key("interval start")
+    assert normalize_key("intervalStart") != normalize_key("start")
+
+
+def test_date_role_uses_whole_alias_not_camelcase_piece(catalog):
+    """intervalStart is Range start because Config has 'interval start'."""
+    assert suggest_date_semantic("intervalStart", catalog) == "range_start"
+    assert suggest_date_semantic("intervalEnd", catalog) == "range_end"
+    assert suggest_date_semantic("Start Date", catalog) == "range_start"
+    assert suggest_date_semantic("interval_start", catalog) == "range_start"
+    # reportDate matches the Date alias 'report date', which has no start/end word.
+    assert suggest_date_semantic("reportDate", catalog) == ""
+
+
+def test_grain_ignores_qualifier_columns(catalog):
+    """The Amazon file that read as Campaign off orderCurrency and friends."""
+    grain = infer_grain(
+        columns=[
+            "orderName", "orderId", "orderCurrency", "orderBudget", "orderStartDate", "totalCost",
+        ],
+        catalog=catalog,
+    )
+    assert grain["grain_level_id"] == "campaign"
+    # orderId is an identifier, not the Campaign name column, so it is not evidence.
+    evidence = {row["source_column"] for row in grain["detected_hierarchy_columns"]}
+    assert evidence == {"orderName"}
+
+
+def test_id_columns_are_not_grain_evidence(catalog):
+    """An id column matches no alias, so it makes no claim about grain.
+
+    DV360 ships Line Item ID but no Line Item name; without an alias for it the
+    file falls back to Publisher and the analyst picks from the preview.
+    """
+    assert suggest_column_target("orderId", catalog)["target"] is None
+    assert suggest_column_target("Line Item ID", catalog)["target"] is None
+
+    grain = infer_grain(
+        columns=["Date", "Insertion Order ID", "Line Item ID", "Impressions"],
+        catalog=catalog,
+    )
+    assert grain["grain_level_id"] == "publisher"
+    assert grain["detected_hierarchy_columns"] == []
 
 
 def test_shared_media_hierarchy_spine(catalog):
@@ -97,6 +167,87 @@ def test_shared_media_hierarchy_spine(catalog):
     # Order → campaign, Line Item → ad_group
     assert grain["grain_level_id"] == "ad_group"
     assert grain["grain_level_name"] == "Ad Group"
+
+
+def test_mapping_primary_targets_come_from_config_not_template(catalog):
+    from sia.agent.hierarchy_register import mapping_primary_targets
+
+    primary = set(mapping_primary_targets(catalog))
+    assert {"date", "country", "category", "brand", "market"}.issubset(primary)
+    assert {"publisher", "campaign", "ad_group", "ad", "creative"}.issubset(primary)
+    assert {"spends", "impressions", "clicks"}.issubset(primary)
+    assert "advertiser" not in primary
+    assert "region" not in primary
+
+
+def test_infer_grain_uses_columns_not_publisher(catalog):
+    """Grain is the deepest Config spine level in the headers, even with no publisher."""
+    grain = infer_grain(
+        None,
+        ["Date", "Campaign name", "Ad set name", "Spend"],
+        catalog,
+    )
+    assert grain["grain_level_id"] == "ad_group"
+    found = {row["target"] for row in grain["detected_hierarchy_columns"]}
+    assert "campaign" in found
+    assert "ad_group" in found
+
+
+def test_infer_grain_defaults_to_publisher_when_no_lower_level_columns(catalog):
+    grain = infer_grain("amazon_dsp", ["Date", "Spend", "Impressions"], catalog)
+    assert grain["grain_level_id"] == "publisher"
+    assert grain["grain_level_name"] == "Publisher"
+    assert grain["detected_hierarchy_columns"] == []
+    assert "defaulting to Publisher" in grain["reason"]
+
+
+def test_facebook_conversion_headers_do_not_count_as_publisher_grain(catalog):
+    """site inside onsite must not become a Publisher hierarchy hit."""
+    grain = infer_grain(
+        columns=[
+            "Date",
+            "spend",
+            "impressions",
+            "actions.onsite_conversion.post_save.7d_click",
+            "actions.onsite_conversion.post_net_like",
+        ],
+        catalog=catalog,
+    )
+    assert grain["grain_level_id"] == "publisher"
+    assert grain["detected_hierarchy_columns"] == []
+
+
+def test_propose_for_source_includes_preview(catalog, tmp_path):
+    path = tmp_path / "facebook_ads.csv"
+    path.write_text(
+        "Date,Campaign name,Ad set name,Spend\n"
+        "2024-01-01,Spring,Retarget,10\n"
+        "2024-01-02,Spring,Prospect,12\n",
+        encoding="utf-8",
+    )
+    proposal = propose_for_source(
+        {"source_id": "s1", "file_path": str(path), "file_name": "facebook_ads.csv"},
+        catalog=catalog,
+    )
+    preview = proposal["preview"]
+    assert "Campaign name" in preview["headers"]
+    assert preview["column_roles"]["Campaign name"] == "campaign"
+    assert preview["column_roles"]["Ad set name"] == "ad_group"
+    assert preview["rows"][0][preview["headers"].index("Campaign name")] == "Spring"
+    assert proposal["grain_level_id"] == "ad_group"
+
+
+def test_sample_preview_keeps_hierarchy_columns_when_wide():
+    headers = [f"Col_{i}" for i in range(30)] + ["Campaign name"]
+    df = pd.DataFrame({h: [f"{h}-v"] for h in headers})
+    preview = sample_preview(
+        headers,
+        df,
+        [{"source_column": "Campaign name", "target": "campaign"}],
+    )
+    assert "Campaign name" in preview["headers"]
+    assert preview["truncated"] is True
+    assert preview["column_roles"]["Campaign name"] == "campaign"
 
 
 def test_enterprise_info_defaults(catalog):
@@ -131,9 +282,9 @@ def test_enterprise_info_defaults(catalog):
     assert "spends" in metric_ids
     assert "impressions" in metric_ids
     assert "clicks" in metric_ids
-    assert "roas" in metric_ids
+    assert "roas" not in metric_ids
     opts = mapping_target_option_catalog(catalog)
-    assert any(o["id"] == "roas" and o["kind"] == "metric" for o in opts)
+    assert any(o["id"] == "campaign_kpi" and o["kind"] == "dimension" for o in opts)
     assert any(o["id"] == "spends" and o.get("supports_currency") for o in opts)
 
 
@@ -157,6 +308,56 @@ def test_detect_combined_fields_packed_campaign(catalog, tmp_path):
     assert packed.get("part_count", 0) >= 2
     assert len(packed.get("parts") or []) >= 2
     assert len(packed.get("part_samples") or []) >= 2
+
+
+def test_detect_combined_fields_leaves_unrecognised_parts_unassigned(catalog):
+    """A repeated or unknown token must not borrow a dimension it has no evidence for."""
+    df = pd.DataFrame({
+        "Campaign Name": [
+            "DEU_EDP_ALPRO_ALPRO_Amazon002026_Conver_ROAS",
+            "DEU_EDP_ALPRO_ALPRO_Amazon002026_Conver_ROAS",
+            "GBR_EDP_ACTIVIA_ACTIVIA_Amazon002026_Conver_CPC",
+        ],
+        "Spend": [10, 20, 30],
+    })
+    packed = next(
+        f for f in detect_combined_fields(df, catalog=catalog)
+        if f["source_column"] == "Campaign Name"
+    )
+    targets = packed["target_dimensions"]
+
+    assert targets[0] == "country"
+    assert targets[2] == "brand"
+    # Duplicate brand token and the opaque id are not leftover-filled.
+    assert targets[3] in (None, "")
+    assert targets[4] in (None, "")
+    assert targets[3] != "region"
+    assert packed["parts"][3]["target"] in (None, "")
+    # A later part with a real alias keeps its own dimension.
+    assert targets[5] == "campaign_objective"
+    assert targets[6] == "campaign_kpi"
+
+
+def test_mixed_part_does_not_take_leftover_region_from_one_row(catalog):
+    """Part 4 is ALPRO / EDP / ALL — ALL is a Region alias, but that is not the slot's best match."""
+    df = pd.DataFrame({
+        "orderName": [
+            "DEU_EDP_ALPRO_ALPRO_Amazon002026_Conver_ROAS_NA_YES_BonusQ2",
+            "DEU_EDP_ALPRO_EDP_MTG-022026_Consid_CPC_NA_YES_Display",
+            "DEU_EDP_ALPRO_EDP_MTG-022026_Aware_CTR_NA_YES_FireTVBonusQ2",
+            "DEU_EDP_ALPRO_ALL_AlmondPBAY-012026_Consid_CPC_NA_YES_Display",
+        ],
+    })
+    packed = next(
+        f for f in detect_combined_fields(df, catalog=catalog)
+        if f["source_column"] == "orderName"
+    )
+    targets = packed["target_dimensions"]
+    assert targets[0] == "country"
+    assert targets[1] == "advertiser"
+    assert targets[2] == "brand"
+    assert targets[3] != "region"
+    assert not targets[3]
 
 
 def test_compare_hierarchies_mixed_grain(catalog):

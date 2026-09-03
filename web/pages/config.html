@@ -18,8 +18,8 @@
     <main class="page-container config-page">
         <header class="config-topbar">
             <div>
-                <h1>Config</h1>
-                <p class="config-lead">Defaults, option lists, hierarchy, and mapping synonyms used during registration and schema mapping.</p>
+                <h1>Config <span id="configDirtyBadge" class="cfg-dirty-badge hidden">Unsaved</span></h1>
+                <p class="config-lead">Maintain the destination columns, source-column aliases, and finite value mappings used throughout the pipeline.</p>
             </div>
             <div class="config-topbar-actions">
                 <button type="button" class="btn-secondary" id="configReloadBtn">Discard changes</button>
@@ -29,12 +29,15 @@
 
         <div class="config-shell">
             <aside class="config-side" aria-label="Config sections">
-                <button type="button" class="config-side-link active" data-config-tab="enterprise">Enterprise info</button>
-                <button type="button" class="config-side-link" data-config-tab="additional">Additional columns</button>
-                <button type="button" class="config-side-link" data-config-tab="hierarchy">Media hierarchy</button>
-                <button type="button" class="config-side-link" data-config-tab="attributes">Common attributes</button>
-                <button type="button" class="config-side-link" data-config-tab="mapping">Mapping dictionary</button>
-                <button type="button" class="config-side-link" data-config-tab="publishers">Publishers</button>
+                <button type="button" class="config-side-link active" data-config-tab="overview">
+                    1. Master List <span class="config-side-count" data-count-for="overview"></span>
+                </button>
+                <button type="button" class="config-side-link" data-config-tab="mapping">
+                    2. Column Mapping <span class="config-side-count" data-count-for="mapping"></span>
+                </button>
+                <button type="button" class="config-side-link" data-config-tab="values">
+                    3. Value Mapping <span class="config-side-count" data-count-for="values"></span>
+                </button>
             </aside>
             <div id="configBody" class="config-panel" role="main">
                 <p class="help-text">Loading…</p>

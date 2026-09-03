@@ -31,7 +31,7 @@ def _dataframe_for_column_profile(df: pd.DataFrame) -> pd.DataFrame:
 
 
 @lru_cache(maxsize=1)
-def _load_column_synonyms_from_config() -> Dict[str, List[str]]:
+def _load_legacy_column_synonyms() -> Dict[str, List[str]]:
     path = Path(__file__).resolve().parent.parent.parent / "config" / "synonyms.json"
     if not path.is_file():
         return {}
@@ -42,6 +42,61 @@ def _load_column_synonyms_from_config() -> Dict[str, List[str]]:
     except Exception as e:
         logger.warning("Could not load synonyms.json for column matching: %s", e)
         return {}
+
+
+def _load_column_synonyms_from_config() -> Dict[str, List[str]]:
+    """Merge legacy aliases with the editable Config mapping dictionary."""
+    merged = {target: list(aliases) for target, aliases in _load_legacy_column_synonyms().items()}
+    try:
+        from .hierarchy_register import load_catalog
+
+        catalog = load_catalog()
+        for entry in catalog.get("mapping_dictionary") or []:
+            if not isinstance(entry, dict):
+                continue
+            source = str(entry.get("source") or "").strip()
+            target = str(entry.get("target") or "").strip()
+            if source and target:
+                merged.setdefault(target, []).append(source)
+        for metric in catalog.get("metrics") or []:
+            if not isinstance(metric, dict):
+                continue
+            target = str(metric.get("id") or "").strip()
+            if target:
+                merged.setdefault(target, []).extend(
+                    str(alias).strip()
+                    for alias in metric.get("aliases") or []
+                    if str(alias).strip()
+                )
+    except Exception as exc:
+        logger.warning("Could not load editable column aliases: %s", exc)
+
+    # Headers an analyst already mapped are as good as configured aliases, so a
+    # source only has to be confirmed once.
+    try:
+        from .learned_mappings import learned_column_aliases
+
+        for target, aliases in learned_column_aliases().items():
+            merged.setdefault(target, []).extend(aliases)
+    except Exception as exc:
+        logger.warning("Could not load learned column aliases: %s", exc)
+
+    for target, aliases in merged.items():
+        seen = set()
+        unique = []
+        for alias in aliases:
+            key = SchemaMapper._normalize_name(alias)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            unique.append(alias)
+        merged[target] = unique
+    return merged
+
+
+def invalidate_column_synonym_cache() -> None:
+    """Drop memoised alias lists after Config or the learned store changes."""
+    _load_legacy_column_synonyms.cache_clear()
 
 
 class SchemaMapper:
@@ -226,6 +281,7 @@ class SchemaMapper:
                         primary_targets=primary_targets_set,
                     ),
                     **target_suggestion,
+                    "date_semantic": self._date_semantic_for(str(col)),
                     "unique_values": meta.get("unique_values", []),
                     "stats": meta.get("stats", {})
                 }))
@@ -650,6 +706,7 @@ class SchemaMapper:
                     primary_targets=primary_targets,
                 ),
                 **target_suggestion,
+                "date_semantic": self._date_semantic_for(col_name),
                 "unique_values": samples,
                 "stats": meta.get("stats", {})
             }))
@@ -737,10 +794,10 @@ class SchemaMapper:
 
         Contract:
           * **exclude** - source column is blank, derived noise, or already decided as ``Discard``.
-          * **primary** - matched ``target_column`` is a date key, a ``uid_hierarchy`` member,
-            or a template metric in ``primary_targets``.
+          * **primary** - matched ``target_column`` is in ``primary_targets``
+            (Config enterprise fields, media hierarchy, date, spends / impressions / clicks).
           * **exclude** - metric-like columns that do not map to one of those primary targets.
-          * **supporting** - useful non-metric context that is neither excluded nor primary.
+          * **supporting** - IDs and other attributes that are neither excluded nor primary.
 
         Does not replace ``decision`` / ``target_column``; UI keeps those in sync via
         ``applyRoleRule`` on the frontend.
@@ -768,6 +825,15 @@ class SchemaMapper:
             return "exclude"
 
         return "supporting"
+
+    @staticmethod
+    def _date_semantic_for(column_name: str) -> str:
+        try:
+            from .hierarchy_register import suggest_date_semantic
+
+            return suggest_date_semantic(column_name) or ""
+        except Exception:
+            return ""
 
     @staticmethod
     def _normalize_name(name: str) -> str:
@@ -859,6 +925,38 @@ class SchemaMapper:
     ) -> Optional[Dict[str, Any]]:
         if not target_columns:
             return None
+        samples = [
+            str(value).strip().lower()
+            for value in (meta or {}).get("unique_values", [])
+            if str(value).strip()
+        ][:12]
+        if samples:
+            try:
+                from .field_mapping_policy import build_value_token_map
+                from .hierarchy_register import load_catalog
+
+                token_map = build_value_token_map(load_catalog())
+                votes: Dict[str, int] = {}
+                for sample in samples:
+                    field_id = token_map.get(sample)
+                    if field_id:
+                        votes[field_id] = votes.get(field_id, 0) + 1
+                available = {
+                    self._normalize_name(str(target)): str(target)
+                    for target in target_columns
+                }
+                minimum_hits = max(1, min(2, len(samples)))
+                for field_id, hits in sorted(votes.items(), key=lambda item: item[1], reverse=True):
+                    target = available.get(self._normalize_name(field_id))
+                    if target and hits >= minimum_hits:
+                        return {
+                            "target_column": target,
+                            "target_match_confidence": round(min(0.98, 0.84 + (hits / len(samples)) * 0.14), 4),
+                            "target_match_method": "value_synonyms",
+                        }
+            except Exception as exc:
+                logger.warning("Could not use finite field-value aliases: %s", exc)
+
         profile = self._sample_profile(meta)
         source_norm = self._normalize_name(source_column)
         best_target = None
@@ -877,6 +975,8 @@ class SchemaMapper:
 
             score = 0.78
             target_norm = self._normalize_name(str(raw_target))
+            if bucket == "geo_like" and target_norm == "country":
+                score += 0.08
             if bucket in {"geo_like", "channel_like", "publisher_like"} and source_norm:
                 if any(token in source_norm for token in target_norm.split("_") if len(token) >= 3):
                     score += 0.07
@@ -915,12 +1015,18 @@ class SchemaMapper:
                 "target_match_method": "exact",
             }
 
+        # A maintained finite vocabulary is stronger evidence than a generic
+        # header alias such as "Location" or "Type".
+        sample_based_match = self._suggest_target_from_values(source_column, target_columns, meta=meta)
+        if sample_based_match and sample_based_match.get("target_match_method") == "value_synonyms":
+            return sample_based_match
+
         file_syns = _load_column_synonyms_from_config()
         if file_syns:
             sn_compact = source_norm.replace("_", "")
-            # Pass 1: exact matches on template field names and synonym list entries only.
-            # Pass 2 (below): substring / partial matches — must run after pass 1 so e.g. "Market"
-            # maps to region's explicit alias "market" before channel's partial "marketing_channel".
+            # A header matches an alias only as a whole name. Substring matching
+            # used to read "actions.onsite_conversion" as Publisher (via "site")
+            # and every order* header as Campaign (via "order").
             for tgt in target_columns:
                 tgt_key = tgt if tgt in file_syns else None
                 if not tgt_key:
@@ -942,20 +1048,6 @@ class SchemaMapper:
                             "target_match_confidence": 0.88,
                             "target_match_method": "synonyms_json",
                         }
-            for tgt in target_columns:
-                tgt_key = tgt if tgt in file_syns else None
-                if not tgt_key:
-                    continue
-                tgt_norm = self._normalize_name(tgt)
-                for alias in file_syns[tgt_key]:
-                    al = self._normalize_name(str(alias))
-                    if len(al) >= 4 and (al in source_norm or source_norm in al):
-                        return {
-                            "target_column": target_lookup.get(tgt_norm, tgt),
-                            "target_match_confidence": 0.82,
-                            "target_match_method": "synonyms_json_partial",
-                        }
-
         # Business-critical override: spend-like columns map to spends when present in template.
         if any(k in source_norm for k in ["spend", "media_cost", "cost", "total_cost"]) and "spends" in target_lookup:
             return {
@@ -984,7 +1076,11 @@ class SchemaMapper:
                 "target_match_method": "synonym",
             }
 
-        sample_based_match = self._suggest_target_from_values(source_column, target_columns, meta=meta)
+        sample_based_match = sample_based_match or self._suggest_target_from_values(
+            source_column,
+            target_columns,
+            meta=meta,
+        )
         if sample_based_match:
             return sample_based_match
 

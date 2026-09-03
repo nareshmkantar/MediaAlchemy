@@ -106,7 +106,6 @@ from sia.agent.target_template_utils import (
     is_no_match_target,
     mapping_target_columns_for_ui,
     normalize_target_template,
-    primary_target_columns,
     validate_template_shape,
 )
 from sia.agent.planner import finalize_extraction_plan
@@ -8254,9 +8253,8 @@ def propose_mapping(job_id):
         )
         target_columns = load_target_columns_for_job(job)
         target_template = load_target_template_for_job(job)
-        primary_targets = primary_target_columns(target_template)
-        from sia.agent.hierarchy_register import mapping_metric_targets as _metric_tgts
-        primary_targets = set(primary_targets) | {m["id"] for m in _metric_tgts()}
+        from sia.agent.hierarchy_register import mapping_primary_targets as _mapping_primary
+        primary_targets = set(_mapping_primary())
         target_column_options = list(job.get("_mapping_target_options") or [])
         # Ensure every target_columns entry has a labeled option
         have = {str(o.get("id")) for o in target_column_options if isinstance(o, dict)}
@@ -8836,6 +8834,17 @@ def submit_mapping(job_id):
         
     job_manager.pending_schema_mappings[job_id] = mapping
     job_manager.save_mapping_registry(job_id, mapping, sheet_name=current_sheet, source_id=current_source_id)
+
+    # A confirmed mapping is the strongest signal we get about a header, so keep
+    # it in Config rather than only in this job. Unvalidated until reviewed.
+    learned_aliases = 0
+    try:
+        from sia.agent.learned_mappings import record_confirmed_mapping
+
+        learned_aliases = record_confirmed_mapping(mapping)
+    except Exception as exc:
+        logger.warning("Could not record learned column aliases: %s", exc)
+
     job = job_manager.get_job(job_id)
     if job is not None:
         job["mapping_sheet"] = current_sheet or job.get("mapping_sheet") or job.get("scoped_source", {}).get("sheet_name")
@@ -8860,10 +8869,14 @@ def submit_mapping(job_id):
             module="mapping",
             operation="submit",
             status="success",
-            summary=f"Saved {len(mapping)} column mapping(s); unresolved: {unresolved}",
+            summary=(
+                f"Saved {len(mapping)} column mapping(s); unresolved: {unresolved}; "
+                f"learned aliases: {learned_aliases}"
+            ),
             metadata={
                 "mapping_rows": len(mapping),
                 "unresolved_targets": unresolved,
+                "learned_column_aliases": learned_aliases,
                 "source_id": resolved_sid or current_source_id,
             },
         )
@@ -8872,6 +8885,49 @@ def submit_mapping(job_id):
         "success": True,
         "message": "Mapping saved. The shared pipeline will use these rules during the native mapping stage."
     })
+
+
+@app.route('/api/learned-mappings', methods=['GET'])
+def learned_mappings_get():
+    """Aliases and values captured from analyst confirmations and ingests."""
+    from sia.agent.learned_mappings import learned_summary
+
+    return jsonify({"success": True, **learned_summary()})
+
+
+@app.route('/api/learned-mappings', methods=['POST'])
+def learned_mappings_update():
+    """Review a learned entry: validate it, retarget it, or drop it."""
+    from sia.agent import learned_mappings as lm
+
+    data = request.get_json(silent=True) or {}
+    action = str(data.get("action") or "").strip()
+    target_id = str(data.get("target_id") or "").strip()
+    field_id = str(data.get("field_id") or "").strip()
+    alias = str(data.get("alias") or "")
+    value = str(data.get("value") or "")
+    validated = bool(data.get("validated", True))
+
+    try:
+        if action == "validate_alias":
+            ok = lm.set_alias_validated(target_id, alias, validated)
+        elif action == "remove_alias":
+            ok = lm.remove_alias(target_id, alias)
+        elif action == "validate_value":
+            ok = lm.set_value_validated(field_id, value, validated)
+        elif action == "set_value_standard":
+            ok = lm.set_value_standard(field_id, value, str(data.get("standard") or ""))
+        elif action == "remove_value":
+            ok = lm.remove_value(field_id, value)
+        else:
+            return jsonify({"error": f"Unknown action: {action or '(none)'}"}), 400
+    except Exception as exc:
+        logger.warning("Learned mapping update failed (%s): %s", action, exc)
+        return jsonify({"error": str(exc)}), 500
+
+    if not ok:
+        return jsonify({"error": "Entry not found"}), 404
+    return jsonify({"success": True, **lm.learned_summary()})
 
 
 @app.route('/api/hierarchy/catalog', methods=['GET'])
@@ -9016,6 +9072,84 @@ def hierarchy_register(job_id):
     })
 
 
+COLSTD_CUSTOM_TARGET = "__custom__"
+
+
+def _merge_column_split(proposal: dict, saved: dict) -> dict:
+    """Keep the analyst's own part choices; take the rest from fresh detection.
+
+    A saved split holds parts the detector merely guessed as well as parts an
+    analyst chose, because leaving the step autosaves a draft. Replaying it
+    wholesale would pin those guesses forever and hide later detection fixes, so
+    only parts carrying ``user_set`` survive.
+    """
+    merged = dict(proposal)
+    for key in ("accepted", "single_dimension", "single_target", "single_custom_name"):
+        if key in saved:
+            merged[key] = saved[key]
+
+    fresh_dims = list(proposal.get("target_dimensions") or [])
+    samples = list(proposal.get("part_samples") or [])
+    count = max(int(proposal.get("part_count") or 0), len(fresh_dims), len(samples))
+    if count <= 0:
+        return merged
+
+    saved_parts = {}
+    for i, part in enumerate(saved.get("parts") or []):
+        if isinstance(part, dict):
+            try:
+                saved_parts[int(part.get("index", i))] = part
+            except (TypeError, ValueError):
+                saved_parts[i] = part
+
+    parts = []
+    for i in range(count):
+        sample = str(samples[i]) if i < len(samples) else ""
+        prev = saved_parts.get(i)
+        prev_sample = str((prev or {}).get("sample") or "")
+        # A changed sample means the split itself moved, so an old choice no
+        # longer describes this part.
+        keep = bool(
+            prev
+            and prev.get("user_set")
+            and (not sample or not prev_sample or prev_sample == sample)
+        )
+        if keep:
+            parts.append({
+                "index": i,
+                "sample": sample or prev_sample,
+                "combine_with_previous": i > 0 and bool(prev.get("combine_with_previous")),
+                "target": str(prev.get("target") or ""),
+                "custom_name": str(prev.get("custom_name") or ""),
+                "user_set": True,
+            })
+        else:
+            parts.append({
+                "index": i,
+                "sample": sample,
+                "combine_with_previous": False,
+                "target": str(fresh_dims[i] or "") if i < len(fresh_dims) else "",
+                "custom_name": "",
+                "user_set": False,
+            })
+
+    # Combined parts report the dimension of the part they were folded into.
+    dims = []
+    current = ""
+    for part in parts:
+        target = "" if part["target"] == COLSTD_CUSTOM_TARGET else part["target"]
+        if part["combine_with_previous"] and dims:
+            dims.append(current)
+            continue
+        current = target
+        dims.append(target)
+
+    merged["parts"] = parts
+    merged["part_count"] = len(parts)
+    merged["target_dimensions"] = dims
+    return merged
+
+
 @app.route('/api/column-standardize/propose/<job_id>', methods=['GET'])
 def column_standardize_propose(job_id):
     """Propose multipart column split/combine for the Column shaping step."""
@@ -9051,11 +9185,12 @@ def column_standardize_propose(job_id):
     )
     if existing and isinstance(existing.get("splits"), list) and existing["splits"]:
         by_col = {str(s.get("source_column")): s for s in existing["splits"] if isinstance(s, dict)}
-        merged = []
-        for prop in splits:
-            prev = by_col.get(str(prop.get("source_column")))
-            merged.append({**prop, **(prev or {})} if prev else prop)
-        splits = merged
+        splits = [
+            _merge_column_split(prop, by_col[str(prop.get("source_column"))])
+            if str(prop.get("source_column")) in by_col
+            else prop
+            for prop in splits
+        ]
 
     attr_targets = mapping_attribute_targets(cat)
     attr_options = mapping_attribute_target_options(cat)

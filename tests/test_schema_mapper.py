@@ -84,6 +84,39 @@ def test_suggest_target_column_market_prefers_region_over_channel_partial():
     assert r["target_match_method"] == "synonyms_json"
 
 
+def test_suggest_target_column_uses_editable_column_aliases():
+    mapper = SchemaMapper(llm_client=None, prompts_dir="does-not-exist")
+    target_columns = ["date", "spends", "impressions"]
+
+    for source in ("Budget", "Cost", "Spend"):
+        result = mapper._suggest_target_column(source, target_columns)
+        assert result["target_column"] == "spends"
+
+
+def test_suggest_target_column_country_codes_prefer_country_value_list():
+    mapper = SchemaMapper(llm_client=None, prompts_dir="does-not-exist")
+    result = mapper._suggest_target_column(
+        "Location",
+        ["market", "country", "region"],
+        meta={"unique_values": ["UK", "USA", "DE"], "inferred_type": "Dimension"},
+    )
+
+    assert result["target_column"] == "country"
+    assert result["target_match_method"] == "value_synonyms"
+
+
+def test_suggest_target_column_kpi_values_map_to_campaign_kpi_dimension():
+    mapper = SchemaMapper(llm_client=None, prompts_dir="does-not-exist")
+    result = mapper._suggest_target_column(
+        "Performance Type",
+        ["campaign_kpi", "campaign_objective", "spends"],
+        meta={"unique_values": ["ROAS", "CTR", "CPI"], "inferred_type": "Dimension"},
+    )
+
+    assert result["target_column"] == "campaign_kpi"
+    assert result["target_match_method"] == "value_synonyms"
+
+
 def test_suggest_target_column_uses_sample_values_for_geo_mapping():
     mapper = SchemaMapper(llm_client=None, prompts_dir="does-not-exist")
     target_columns = ["date", "channel", "publisher", "market", "spends"]
