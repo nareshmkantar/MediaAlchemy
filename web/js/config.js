@@ -505,7 +505,7 @@ function renderOverviewTab() {
             <span class="cfg-toolbar-meta">${visible.length} of ${rows.length}</span>
         </div>
         <div class="cfg-table-wrap">
-            <table class="cfg-table">
+            <table class="cfg-table cfg-table--master">
                 <thead>
                     <tr>
                         <th>Name</th>
@@ -567,11 +567,11 @@ function renderFieldBlock(field, listKey, idx, { allowDelete = true, optionQuery
         </div>
         <p class="cfg-hint">Many source values → one standard name. Upload shows the standard name; aliases are used when matching source data.</p>
         <div class="cfg-table-wrap">
-            <table class="cfg-table">
+            <table class="cfg-table cfg-table--values">
                 <thead>
                     <tr>
-                        <th style="width:28%">Standard name</th>
-                        <th>Known values / aliases (comma-separated)</th>
+                        <th>Standard name</th>
+                        <th>Known values / aliases</th>
                         <th></th>
                     </tr>
                 </thead>
@@ -746,7 +746,7 @@ function renderMappingTab() {
             ${unreviewed ? `<strong>${unreviewed}</strong> of them have not been reviewed yet — keep or drop each one below.` : 'Nothing is waiting for review.'}
         </div>
         <div class="cfg-table-wrap">
-            <table class="cfg-table">
+                <table class="cfg-table cfg-table--map">
                 <thead><tr><th>Standard column</th><th>Id</th><th>Source column aliases</th><th>Learned from uploads</th></tr></thead>
                 <tbody>${rows}</tbody>
             </table>
@@ -955,7 +955,7 @@ function renderPublisherValueBlock(query) {
                 </div>
             </div>
             <div class="cfg-table-wrap">
-                <table class="cfg-table">
+                <table class="cfg-table cfg-table--map">
                     <thead><tr><th>Standard publisher</th><th>Id</th><th>Known values / aliases</th><th></th></tr></thead>
                     <tbody>${publisherRows || '<tr><td colspan="4" class="cfg-empty">No matching publishers</td></tr>'}</tbody>
                 </table>
