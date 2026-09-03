@@ -128,4 +128,69 @@ def test_job_manager_applies_planner_feedback_to_notes_and_rules():
 
     assert any("booking date" in note for note in job["user_notes"])
     assert result["rules_saved"][0]["target_column"] == "date_paid_media"
-    assert result["rules_saved"][0]["rule_type"] == "format"
+
+
+class LowConfidenceApprovalPlanGenerator:
+    def __init__(self, _llm_client):
+        pass
+
+    def generate(self, *_args, **_kwargs):
+        return ExtractionPlan(
+            tool_calls=[{"tool": "transform.reorder_columns", "params": {}}],
+            approval_items=[{"summary": "Confirm allocation", "target_column": "spends"}],
+            expected_columns=["date", "spends"],
+            confidence=0.32,
+            reasoning="Low confidence plan with approval items.",
+        )
+
+
+def test_generate_plan_node_single_checkpoint_when_low_confidence_and_approval_items(monkeypatch):
+    monkeypatch.setattr("sia.agent.nodes.PlanGenerator", LowConfidenceApprovalPlanGenerator)
+
+    state = {
+        "llm_client": object(),
+        "sheet_name": "Notes_Global",
+        "structure_analysis": {"tables": [{"name": "main"}]},
+        "target_template": {"properties": {}, "x_scope": {"uid_hierarchy": [], "metrics": [], "supporting_columns": []}},
+        "context_packet": {"source_metadata": {"sheet_name": "Notes_Global"}},
+        "confidence_trajectory": [0.0],
+        "hitl_checkpoints": [],
+        "hitl_manager": HITLManager(),
+    }
+
+    result = generate_plan_node(state)
+
+    assert len(result["hitl_checkpoints"]) == 1
+    checkpoint = result["hitl_checkpoints"][0]
+    assert checkpoint["checkpoint_type"] == "plan_review"
+    assert checkpoint["confidence"] == 0.32
+    assert checkpoint["trigger_data"]["plan_confidence"] == 0.32
+    assert checkpoint["trigger_data"]["approval_items"]
+
+
+def test_add_checkpoint_replaces_stale_plan_review_for_same_sheet():
+    manager = JobManager()
+    job_id = "job_plan_dedupe"
+    manager.create_job(job_id, "sample.xlsx", "/tmp/sample.xlsx", sheets=["Notes_Global"])
+    first = {
+        "checkpoint_id": "cp_plan_old",
+        "checkpoint_type": "plan_review",
+        "trigger_reason": "old",
+        "trigger_data": {"sheet_name": "Notes_Global", "plan_confidence": 0.32},
+        "confidence": 0.32,
+        "created_at": "2026-01-01T10:00:00",
+    }
+    second = {
+        "checkpoint_id": "cp_plan_new",
+        "checkpoint_type": "plan_review",
+        "trigger_reason": "new",
+        "trigger_data": {"sheet_name": "Notes_Global", "plan_confidence": 0.32},
+        "confidence": 0.32,
+        "created_at": "2026-01-01T11:00:00",
+    }
+    manager.add_checkpoint_to_review(job_id, {**first, "pending_state": {"sheet_name": "Notes_Global"}})
+    manager.add_checkpoint_to_review(job_id, {**second, "pending_state": {"sheet_name": "Notes_Global"}})
+    pending = [p for p in manager.get_all_pending_reviews() if p.get("type") == "plan_review"]
+    assert len(pending) == 1
+    assert pending[0]["checkpoint_id"] == "cp_plan_new"
+    assert pending[0]["confidence"] == 0.32

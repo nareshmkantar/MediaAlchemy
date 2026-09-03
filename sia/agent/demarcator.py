@@ -67,8 +67,13 @@ class StructureDemarcator:
         """
         try:
             normalized_df = self._normalize_dataframe(grid_df)
-            candidate_blocks = self.extract_candidate_blocks(normalized_df)
-            gating_counts = self._tag_confidence_bands(candidate_blocks)
+            layout_report: Dict[str, Any] = {}
+            candidate_blocks = self.run_python_demarcation_phases(
+                normalized_df,
+                visual_patterns=visual_patterns,
+                layout_report_out=layout_report,
+            )
+            gating_counts = self._gating_counts_from_blocks(candidate_blocks)
 
             classified_blocks, llm_error, gating_meta = self._classify_blocks(
                 candidate_blocks,
@@ -114,6 +119,7 @@ class StructureDemarcator:
                 "llm_status": llm_status,
                 "llm_error": llm_error,
                 "confidence_gating": confidence_gating,
+                "layout_complexity": layout_report or None,
             }
         except Exception as e:
             logger.exception("Demarcation proposal failed: %s", e)
@@ -124,10 +130,34 @@ class StructureDemarcator:
                 "llm_status": "failed",
             }
 
-    def run_python_demarcation_phases(self, grid_df: pd.DataFrame) -> List[Dict[str, Any]]:
-        """Extract blocks, tag confidence bands, absorb header metadata — no LLM."""
+    def run_python_demarcation_phases(
+        self,
+        grid_df: pd.DataFrame,
+        visual_patterns: Optional[Dict[str, Any]] = None,
+        layout_report_out: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Extract blocks, tag confidence bands, absorb header metadata — no LLM.
+
+        Crosstab / planning-matrix sheets use a layout adapter (one Main Data bbox)
+        instead of 4-connected islands.
+        """
+        from sia.agent.sheet_layout_class import (
+            adapter_blocks_from_report,
+            detect_layout_complexity,
+            should_use_layout_adapter,
+        )
+
         normalized_df = self._normalize_dataframe(grid_df)
-        candidate_blocks = self.extract_candidate_blocks(normalized_df)
+        report = detect_layout_complexity(normalized_df, visual_patterns)
+        if layout_report_out is not None:
+            layout_report_out.clear()
+            layout_report_out.update(report)
+        if should_use_layout_adapter(report):
+            candidate_blocks = adapter_blocks_from_report(self, normalized_df, report)
+            if layout_report_out is not None:
+                layout_report_out.update(report)
+        else:
+            candidate_blocks = self.extract_candidate_blocks(normalized_df)
         self._tag_confidence_bands(candidate_blocks)
         merged = self._absorb_header_metadata_into_main(candidate_blocks)
         self._strip_headers_for_non_main(merged)
@@ -156,6 +186,7 @@ class StructureDemarcator:
         use_ai_classification: bool,
         llm_error: Optional[str],
         gating_meta: Dict[str, Any],
+        layout_complexity: Optional[Dict[str, Any]] = None,
         batch_note: str = "",
     ) -> Dict[str, Any]:
         gating_counts = self._gating_counts_from_blocks(blocks)
@@ -203,6 +234,7 @@ class StructureDemarcator:
             "filename": filename,
             "sheet_name": sheet_name,
             "source_id": source_id,
+            "layout_complexity": layout_complexity,
         }
 
     async def batch_propose_demarcation(
@@ -226,8 +258,13 @@ class StructureDemarcator:
         working: List[Dict[str, Any]] = []
         for row in sheets:
             idx = int(row["registry_index"])
+            layout_report: Dict[str, Any] = {}
             try:
-                blocks = self.run_python_demarcation_phases(row["grid_df"])
+                blocks = self.run_python_demarcation_phases(
+                    row["grid_df"],
+                    visual_patterns=row.get("visual_patterns") or {},
+                    layout_report_out=layout_report,
+                )
             except Exception as exc:
                 logger.warning("Python demarcation failed for source %s: %s", row.get("source_id"), exc)
                 blocks = []
@@ -239,6 +276,7 @@ class StructureDemarcator:
                     "filename": row.get("filename"),
                     "blocks": blocks,
                     "visual_patterns": row.get("visual_patterns") or {},
+                    "layout_complexity": dict(layout_report) if layout_report else None,
                 }
             )
 
@@ -374,6 +412,7 @@ class StructureDemarcator:
                 use_ai_classification=use_ai_classification,
                 llm_error=shared_llm_error,
                 gating_meta=gating_meta,
+                layout_complexity=row.get("layout_complexity"),
                 batch_note=batch_note,
             )
 

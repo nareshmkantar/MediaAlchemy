@@ -221,6 +221,48 @@ def compact_context_packet(context_packet: Any) -> Dict[str, Any]:
             for k, v in list(ledger.items())[:12]
         }
 
+    lineage = cp.get("lineage") if isinstance(cp.get("lineage"), dict) else {}
+    if lineage:
+        out["lineage"] = {
+            k: _safe_scalar(v)
+            for k, v in lineage.items()
+            if k in ("job_id", "source_id", "sheet_name", "file_name")
+        }
+
+    ic = cp.get("interpreted_context") if isinstance(cp.get("interpreted_context"), dict) else {}
+    if ic:
+        fields = dict(ic.get("fields") or {})
+        evidence = list(ic.get("evidence") or [])[:MAX_LIST_ITEMS]
+        scoped = dict(ic.get("scoped_fields") or {})
+        if fields or evidence or scoped:
+            out["interpreted_context"] = {
+                "fields": fields,
+                "evidence": evidence,
+                "scoped_fields": {
+                    str(k): v for k, v in list(scoped.items())[:MAX_LIST_ITEMS] if isinstance(v, dict)
+                },
+            }
+        try:
+            from sia.integrity.context_isolation import local_context_fields
+
+            local = local_context_fields(cp)
+            if local:
+                out["local_context_fields"] = local
+        except Exception:
+            pass
+
+    snippets = cp.get("context_block_snippets") or []
+    if isinstance(snippets, list) and snippets:
+        out["context_block_snippets"] = [
+            {
+                "block_label": s.get("block_label"),
+                "block_id": s.get("block_id"),
+                "summary": (str(s.get("summary") or "")[:120] or None),
+            }
+            for s in snippets[:MAX_LIST_ITEMS]
+            if isinstance(s, dict)
+        ]
+
     return out
 
 

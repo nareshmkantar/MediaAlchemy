@@ -8,8 +8,9 @@ including:
 - Required/optional parameter enforcement
 - Handling of common LLM hallucinations
 """
+import json
 import logging
-from typing import Dict, List, Any, Tuple, Optional, Union
+from typing import Dict, List, Any, Set, Tuple, Optional, Union
 from dataclasses import dataclass, field
 import difflib
 
@@ -642,6 +643,19 @@ TOOL_SCHEMAS: Dict[str, ToolSchema] = {
             ParamSchema("expression", str, required=True, aliases=["formula", "calc"]),
             ParamSchema("source_columns", list, required=False, default=None, aliases=["input_columns"]),
         ]
+    ),
+
+    "transform.scale_values": ToolSchema(
+        name="transform.scale_values",
+        description=(
+            "Multiply numeric columns by unit factors when headers indicate denomination "
+            "(e.g. Spends in '000 → scales spends by 1000). Run after rename/type_cast."
+        ),
+        aliases=["scale_columns", "scale_values", "apply_value_scale", "xls.data.scale_values"],
+        destructive=False,
+        params=[
+            ParamSchema("scales", dict, required=True, aliases=["columns", "scale_map", "factors"]),
+        ],
     ),
 
     "transform.format": ToolSchema(
@@ -1316,6 +1330,80 @@ def _plan_uses_block_metric_tools(tool_calls: List[Dict[str, Any]]) -> bool:
     return False
 
 
+# Re-running these with identical params is a no-op, so a repeat is planner noise.
+# Excludes tools whose repeats are meaningful (calculate, map_values, add_column with
+# different targets are already distinguished by their params).
+_IDEMPOTENT_ON_REPEAT = frozenset(
+    {
+        "layout.extract",
+        "layout.stack",
+        "transform.rename",
+        "transform.type_cast",
+        "transform.format",
+        "transform.add_column",
+        "transform.apply_column_rules",
+        "transform.reorder_columns",
+        "transform.sort_rows",
+        "transform.drop_columns",
+        "transform.fill_merged",
+        "transform.filter_summaries",
+        "transform.filter_empty",
+        "transform.deduplicate",
+        "transform.aggregate_weekly",
+        "transform.expand_period_to_daily",
+        "transform.infer_granularity_expand_to_daily",
+        "transform.date_range_to_weekly",
+        "verify.schema",
+    }
+)
+
+
+def _params_fingerprint(params: Any) -> str:
+    try:
+        return json.dumps(params, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return repr(params)
+
+
+def dedupe_redundant_tool_calls(
+    tool_calls: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Drop repeat calls of idempotent tools with identical params.
+
+    The replanner regenerates a whole plan from the grid, so it commonly restates
+    steps that the previous plan (or the verifier's suggestions) already contain.
+    Executing them again is wasted work and produces confusing "already exists;
+    no change" outcomes in the trace.
+
+    Returns ``(kept_calls, notes)``.
+    """
+    if not tool_calls:
+        return list(tool_calls or []), []
+
+    seen: Set[Tuple[str, str]] = set()
+    kept: List[Dict[str, Any]] = []
+    notes: List[str] = []
+
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            kept.append(tc)
+            continue
+        normalized, _ = normalize_tool_name(str(tc.get("tool") or "").strip())
+        if not normalized or normalized not in _IDEMPOTENT_ON_REPEAT:
+            kept.append(tc)
+            continue
+        key = (normalized, _params_fingerprint(tc.get("params")))
+        if key in seen:
+            notes.append(f"{normalized} (identical params)")
+            continue
+        seen.add(key)
+        kept.append(tc)
+
+    if notes:
+        logger.info("Dropped %s redundant tool call(s): %s", len(notes), "; ".join(notes[:8]))
+    return kept, notes
+
+
 def sort_tool_calls_by_pipeline_stage(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Stable-sort tool calls by nominal pipeline stage (pipeline_catalog.stage_sort_key).
@@ -1422,7 +1510,7 @@ def _validate_tool_dependencies(tool_calls: List[Dict]) -> List[str]:
         "transform.densify",
     }
     enrichment_tools = {"transform.map_values", "transform.type_cast", "transform.format",
-                        "transform.calculate",
+                        "transform.calculate", "transform.scale_values",
                         "transform.date_range_to_weekly", "transform.expand_date_range_to_daily",
                         "transform.expand_date_range_to_weekly", "transform.aggregate_weekly",
                         "transform.build_date_from_parts", "transform.expand_period_to_daily",

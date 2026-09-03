@@ -173,6 +173,7 @@ def enumerate_duplicate_key_groups_for_review(
     *,
     union_break_before_row: Sequence[int],
     source_labels: Sequence[str],
+    source_meta: Optional[Sequence[Dict[str, Any]]] = None,
     max_each: int = 25,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Split duplicate-key groups into full-row matches vs partial (measure mismatch) for HITL UI."""
@@ -181,14 +182,30 @@ def enumerate_duplicate_key_groups_for_review(
         return [], []
     breaks_sorted = sorted(int(x) for x in (union_break_before_row or []) if int(x) > 0)
     labels = [str(x) for x in (source_labels or [])]
+    meta_rows = [dict(m) for m in (source_meta or []) if isinstance(m, dict)]
 
-    def source_label_for_pos(pos: int) -> str:
+    def source_info_for_pos(pos: int) -> Dict[str, str]:
         bi = bisect.bisect_right(breaks_sorted, int(pos))
+        info: Dict[str, str] = {
+            "file_name": "",
+            "sheet_name": "",
+            "source_id": "",
+            "source_label": f"Source {bi + 1}",
+        }
+        if meta_rows and 0 <= bi < len(meta_rows):
+            meta = meta_rows[bi]
+            info["file_name"] = str(meta.get("file_name") or "").strip()
+            info["sheet_name"] = str(meta.get("sheet_name") or "").strip()
+            info["source_id"] = str(meta.get("source_id") or "").strip()
         if labels and 0 <= bi < len(labels):
-            return labels[bi]
-        if labels:
-            return labels[min(bi, len(labels) - 1)]
-        return f"Source {bi + 1}"
+            info["source_label"] = labels[bi]
+        elif labels:
+            info["source_label"] = labels[min(bi, len(labels) - 1)]
+        if not info["file_name"] and not info["sheet_name"] and info["source_label"]:
+            parts = [p.strip() for p in str(info["source_label"]).split("·", 1)]
+            if len(parts) == 2:
+                info["file_name"], info["sheet_name"] = parts[0], parts[1]
+        return info
 
     exact: List[Dict[str, Any]] = []
     partial: List[Dict[str, Any]] = []
@@ -203,9 +220,13 @@ def enumerate_duplicate_key_groups_for_review(
             pos = int(sub_sorted.index[j])
             sr = sub_sorted.iloc[j]
             row_d = {str(c): sr[c] for c in stacked.columns}
+            src = source_info_for_pos(pos)
+            row_d["file_name"] = src["file_name"]
+            row_d["sheet_name"] = src["sheet_name"]
             row_d["_stack_position"] = pos
             row_d["_source_index"] = int(bisect.bisect_right(breaks_sorted, pos)) + 1
-            row_d["_source_label"] = source_label_for_pos(pos)
+            row_d["_source_id"] = src["source_id"]
+            row_d["_source_label"] = src["source_label"]
             rows_payload.append(row_d)
         key_disp = " | ".join(f"{k}={sub_sorted.iloc[0][k]}" for k in use)
         entry: Dict[str, Any] = {"group_id": gid, "key_display": key_disp, "rows": rows_payload}

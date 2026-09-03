@@ -19,7 +19,8 @@ from sia.agent.llm_handler import (
     LLMCallWrapper,
     RetryConfig,
     robust_json_parse,
-    JSONParseError
+    JSONParseError,
+    run_with_timeout,
 )
 from sia.utils.errors import LLMError
 
@@ -247,6 +248,21 @@ class TestLLMUtilsIntegration:
         data = robust_json_parse(response.text)
         assert data["result"] == "success"
         assert data["confidence"] == 0.95
+
+
+def test_run_with_timeout_does_not_wait_for_hung_worker():
+    """Timeout must return immediately; executor shutdown must not re-block."""
+    started = time.monotonic()
+
+    def _hang():
+        time.sleep(3)
+        return "late"
+
+    with pytest.raises(TimeoutError, match="LLM call timed out"):
+        run_with_timeout(_hang, 0.2, label="LLM call")
+
+    elapsed = time.monotonic() - started
+    assert elapsed < 1.0, f"timeout waited on hung worker ({elapsed:.2f}s)"
 
 
 if __name__ == "__main__":

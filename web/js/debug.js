@@ -7,8 +7,13 @@ let eventMap = {};
 let jobDebugEventMap = {};
 
 document.addEventListener('DOMContentLoaded', () => {
+    const params = new URLSearchParams(window.location.search);
+    const urlJobId = params.get('job_id');
+    if (urlJobId) {
+        setCurrentJob(urlJobId);
+    }
     const currentJob = getCurrentJob();
-    const jobId = currentJob && currentJob.jobId;
+    const jobId = (currentJob && currentJob.jobId) || urlJobId;
 
     if (!jobId) {
         showToast('No job selected', 'warning');
@@ -22,6 +27,14 @@ document.addEventListener('DOMContentLoaded', () => {
     initDebugScrollLayout();
     initTabs();
     loadJobData(jobId);
+
+    const tab = params.get('tab');
+    if (tab === 'pipeline-evals') {
+        const pipelineTab = document.querySelector('.debug-tab[data-step="5"]');
+        if (pipelineTab) {
+            setTimeout(() => pipelineTab.click(), 50);
+        }
+    }
 });
 
 function downloadJobExcel(jobId) {
@@ -69,6 +82,8 @@ function initResultsExportControls(jobId) {
     document.getElementById('downloadPreTransformBtn')?.addEventListener('click', () => go('pre-transform'));
     document.getElementById('downloadPostTransformBtn')?.addEventListener('click', () => go('post-transform'));
     document.getElementById('downloadArtifactsZipBtn')?.addEventListener('click', () => go('artifacts'));
+    document.getElementById('downloadDebugJsonBtn')?.addEventListener('click', () => go('debug-json'));
+    document.getElementById('downloadProcessingLogBtn')?.addEventListener('click', () => go('processing-log'));
 }
 
 function toggleResultsPreviewPanel(jobId) {
@@ -168,6 +183,8 @@ async function loadJobData(jobId) {
             }
         }
         renderStateSnapshots(jobData.state_snapshots || []);
+        renderPipelineEvalsPanel(jobData);
+        renderContextTrailPanel(jobData);
 
         renderLifecycleTimeline(jobData);
 
@@ -198,6 +215,272 @@ function downloadSnapshot(filename) {
 }
 
 window.downloadSnapshot = downloadSnapshot;
+
+const EVAL_STAGE_SNAPSHOT_TARGETS = {
+    structure: [
+        { label: 'state.analyze_structure', phase: 'node_after' },
+        { label: 'state.analyze_structure', phase: 'node_before' },
+    ],
+    plan: [{ label: 'state.generate_plan', phase: 'node_after' }],
+    plan_review: [{ label: 'state.generate_plan', phase: 'node_after' }],
+    execution: [{ label: 'state.execute_tools.deferral', phase: 'deferral_decision' }],
+    context_isolation: [{ label: 'job.multi_source.source_done', phase: 'after_process_file' }],
+    collation: [
+        { label: 'job.multi_source.collation', phase: 'after_duplicate_check_before_deferred', sourceId: '__collation__' },
+        { label: 'job.multi_source.collation', phase: 'after_deferred_transforms', sourceId: '__collation__' },
+    ],
+};
+
+function resolveSnapshotForEvalIssue(snapshots, issue) {
+    const rows = Array.isArray(snapshots) ? snapshots : [];
+    if (!rows.length || !issue) return null;
+    const hint = issue.snapshot_hint && typeof issue.snapshot_hint === 'object' ? issue.snapshot_hint : null;
+    const stage = String(issue.stage || '');
+    const sourceId = String(issue.source_id || hint?.source_id || '');
+    const candidates = hint
+        ? [{ label: hint.label, phase: hint.phase, sourceId: hint.source_id || sourceId }]
+        : (EVAL_STAGE_SNAPSHOT_TARGETS[stage] || []);
+    for (const target of candidates) {
+        const wantSid = target.sourceId != null ? String(target.sourceId) : sourceId;
+        const hit = rows.find((s) => {
+            if (!s) return false;
+            const sid = String(s.source_id || '');
+            if (wantSid && sid && sid !== wantSid) return false;
+            const labelOk = !target.label || String(s.label || '') === target.label;
+            const phaseOk = !target.phase || String(s.phase || '') === target.phase;
+            return labelOk && phaseOk;
+        });
+        if (hit) return hit;
+    }
+    if (sourceId) {
+        const bySrc = rows.filter((s) => String(s.source_id || '') === sourceId);
+        if (bySrc.length) return bySrc[bySrc.length - 1];
+    }
+    return null;
+}
+
+function focusStateSnapshot(snapshot) {
+    if (!snapshot) return;
+    document.querySelector('.debug-tab[data-step="4"]')?.click();
+    const sid = String(snapshot.source_id || 'job');
+    const label = String(snapshot.label || '');
+    setTimeout(() => {
+        const host = document.getElementById('stateSnapshotContent');
+        if (!host) return;
+        const sections = host.querySelectorAll('.debug-source-section');
+        for (const section of sections) {
+            const code = section.querySelector('.debug-source-heading code');
+            if (!code || code.textContent.trim() !== sid) continue;
+            section.scrollIntoView({ block: 'nearest' });
+            const detailsList = section.querySelectorAll('details.planner-review-card');
+            for (const details of detailsList) {
+                const summaryLabel = details.querySelector('summary code')?.textContent?.trim() || '';
+                if (label && summaryLabel !== label) continue;
+                details.open = true;
+                details.scrollIntoView({ block: 'nearest' });
+                const firstPair = details.querySelector('.snapshot-pair-item, .snapshot-list-item');
+                if (firstPair) firstPair.click();
+                return;
+            }
+            return;
+        }
+    }, 120);
+}
+
+window.focusStateSnapshot = focusStateSnapshot;
+
+function focusContextTrail({ sourceId, field } = {}) {
+    document.querySelector('.debug-tab[data-step="5"]')?.click();
+    setTimeout(() => {
+        const sourceSel = document.getElementById('contextTrailSourceFilter');
+        const fieldInput = document.getElementById('contextTrailFieldFilter');
+        const panel = document.getElementById('contextTrailPanel');
+        if (sourceId && sourceSel) sourceSel.value = String(sourceId);
+        if (field != null && fieldInput) fieldInput.value = String(field);
+        if (jobData) renderContextTrailPanel(jobData);
+        panel?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }, 120);
+}
+
+window.focusContextTrail = focusContextTrail;
+
+function buildContextDrillFn(snapshots) {
+    const snapFn = buildSnapshotLinkFn(snapshots);
+    return function contextDrillFn(issue, field) {
+        const sid = escapeJsString(String(issue?.source_id || ''));
+        const col = escapeJsString(String(field || issue?.column || issue?.evidence?.column || 'market'));
+        const parts = [];
+        if (sid) {
+            parts.push(
+                `<a href="#" class="btn-link pe-drill-link" onclick="event.preventDefault(); focusContextTrail({sourceId:'${sid}',field:'${col}'});">Trail</a>`
+            );
+        }
+        const snap = snapFn(issue);
+        if (snap) parts.push(snap.replace('View state snapshot', 'Snapshot'));
+        return parts.join(' · ') || '—';
+    };
+}
+
+function buildSnapshotLinkFn(snapshots) {
+    return function snapshotLinkFn(issue) {
+        const row = typeof issue === 'object' && issue ? issue : { stage: String(issue || '') };
+        const hit = resolveSnapshotForEvalIssue(snapshots, row);
+        if (!hit) return '';
+        const sid = escapeJsString(String(hit.source_id || ''));
+        const lbl = escapeJsString(String(hit.label || ''));
+        const ph = escapeJsString(String(hit.phase || ''));
+        return `<a href="#" class="btn-link" onclick="event.preventDefault(); focusStateSnapshot({source_id:'${sid}',label:'${lbl}',phase:'${ph}'});">View state snapshot</a>`;
+    };
+}
+
+function appendContextTrailShell(host) {
+    if (!host || host.querySelector('#contextTrailPanel')) return;
+    const shell = window.PipelineEvalsRender?.renderContextTrailShell;
+    if (shell) {
+        host.insertAdjacentHTML('beforeend', shell());
+    }
+}
+
+function renderPipelineEvalsPanel(data) {
+    const host = document.getElementById('pipelineEvalsContent');
+    if (!host) return;
+    const pe = data?.pipeline_evals;
+    if (!pe || typeof pe !== 'object') {
+        host.innerHTML = '<div class="empty-state">No pipeline evals recorded for this job yet.</div>';
+        appendContextTrailShell(host);
+        return;
+    }
+    const R = window.PipelineEvalsRender;
+    if (!R) {
+        host.innerHTML = '<div class="empty-state">Pipeline evals UI failed to load.</div>';
+        return;
+    }
+
+    const snapshots = Array.isArray(data.state_snapshots) ? data.state_snapshots : [];
+    const snapshotLinkFn = buildSnapshotLinkFn(snapshots);
+    const contextDrillFn = buildContextDrillFn(snapshots);
+
+    host.innerHTML = R.renderPipelineEvalsPanel(pe, {
+        evalDisplay: data.eval_display,
+        sourceRegistry: data.source_registry,
+        snapshotLinkFn,
+        contextDrillFn,
+        jobId: data.job_id,
+    });
+    if (R.wireContextProvenanceButtons) {
+        R.wireContextProvenanceButtons(host);
+    }
+}
+
+function formatDiffValue(val) {
+    if (val == null || val === '') return '—';
+    if (Array.isArray(val)) return `[${val.map((v) => JSON.stringify(v)).join(', ')}]`;
+    return String(val);
+}
+
+function renderContextTrailPanel(data) {
+    const wrap = document.getElementById('contextTrailPanel');
+    const host = document.getElementById('contextTrailContent');
+    const sourceSel = document.getElementById('contextTrailSourceFilter');
+    const fieldInput = document.getElementById('contextTrailFieldFilter');
+    if (!wrap || !host || !sourceSel || !fieldInput) return;
+
+    const log = Array.isArray(data?.context_diff_log) ? data.context_diff_log : [];
+    wrap.hidden = false;
+
+    if (!log.length) {
+        sourceSel.innerHTML = '<option value="">All sources</option>';
+        fieldInput.value = '';
+        host.innerHTML = `
+            <div class="empty-state context-trail-empty">
+                <p><strong>No context trail recorded for this job.</strong></p>
+                <p class="muted">The trail is filled during processing (packet build → plan rebind → stamp → assess).
+                Re-run processing on a build with context diff logging enabled, or expand a source above and use
+                <strong>View context provenance</strong> for scoped fields and evidence.</p>
+                <p class="muted">Review may still show &ldquo;likely context bleed&rdquo; from union duplicate keys even when
+                per-source evals pass — check <strong>Radio_DE</strong> and other non-UK sheets.</p>
+            </div>`;
+        if (!sourceSel.dataset.wired) {
+            sourceSel.dataset.wired = '1';
+            sourceSel.addEventListener('change', () => renderContextTrailPanel(data));
+            fieldInput.addEventListener('input', () => renderContextTrailPanel(data));
+            document.getElementById('contextTrailClearBtn')?.addEventListener('click', () => {
+                fieldInput.value = '';
+                sourceSel.value = '';
+                renderContextTrailPanel(data);
+            });
+        }
+        return;
+    }
+
+    const sources = [...new Set(log.map((r) => String(r.source_id || '').trim()).filter(Boolean))];
+    const currentSource = sourceSel.value || '';
+    sourceSel.innerHTML = [
+        '<option value="">All sources</option>',
+        ...sources.map((sid) => `<option value="${escapeHtml(sid)}"${sid === currentSource ? ' selected' : ''}>${escapeHtml(sid)}</option>`),
+    ].join('');
+
+    const fieldFilter = String(fieldInput.value || '').trim().toLowerCase();
+    const sourceFilter = String(sourceSel.value || '').trim();
+    const filtered = log.filter((row) => {
+        if (sourceFilter && String(row.source_id || '') !== sourceFilter) return false;
+        if (fieldFilter && !String(row.field || '').toLowerCase().includes(fieldFilter)) return false;
+        return true;
+    });
+
+    if (!filtered.length) {
+        host.innerHTML = '<div class="empty-state">No trail entries match filters.</div>';
+        return;
+    }
+
+    host.innerHTML = filtered.map((row) => {
+        const field = escapeHtml(row.field || '—');
+        const stage = escapeHtml(row.stage || '');
+        const before = escapeHtml(formatDiffValue(row.before));
+        const after = escapeHtml(formatDiffValue(row.after));
+        const reason = escapeHtml(row.reason || '');
+        const sid = escapeHtml(row.source_id || '');
+        const ts = escapeHtml(row.ts || '');
+        return `
+            <article class="context-trail-item" data-field="${field}">
+                <div class="context-trail-item-head">
+                    <button type="button" class="btn-link context-trail-field-btn" data-field="${field}">${field}</button>
+                    <span class="context-trail-stage">${stage}</span>
+                    <span class="context-trail-ts muted">${ts}</span>
+                </div>
+                <div class="context-trail-change"><code>${before}</code> → <code>${after}</code></div>
+                <div class="context-trail-meta muted">${sid}${reason ? ` · ${reason}` : ''}</div>
+            </article>
+        `;
+    }).join('');
+
+    const rerender = () => renderContextTrailPanel(data);
+    if (!sourceSel.dataset.wired) {
+        sourceSel.dataset.wired = '1';
+        sourceSel.addEventListener('change', rerender);
+        fieldInput.addEventListener('input', rerender);
+        document.getElementById('contextTrailClearBtn')?.addEventListener('click', () => {
+            fieldInput.value = '';
+            sourceSel.value = '';
+            rerender();
+        });
+    }
+
+    host.querySelectorAll('.context-trail-field-btn').forEach((btn) => {
+        btn.addEventListener('click', () => {
+            const fname = btn.getAttribute('data-field') || '';
+            fieldInput.value = fname;
+            rerender();
+        });
+    });
+}
+
+function focusSnapshotIndex(idx) {
+    const items = document.querySelectorAll('.snapshot-pair-item, .snapshot-list-item');
+    if (items[idx]) items[idx].click();
+}
+
+window.focusSnapshotIndex = focusSnapshotIndex;
 
 function buildMiniTableFromSnapshotPreview(columns, rows) {
     const cols = Array.isArray(columns) ? columns.map((c) => String(c)) : [];
@@ -297,7 +580,7 @@ const SNAPSHOT_PANEL_KEYS = [
         label: 'Context',
         pick: (s) => s?.context,
         kind: 'context_diff',
-        singleHint: 'Planner context: deferrals, setup counts, planning alignment.',
+        singleHint: 'Curated LLM briefing (Prompt / Tools / Docs / Memory) when available; otherwise compact packet diff.',
     },
     {
         id: 'memory',
@@ -320,6 +603,8 @@ const snapshotInspectorUi = {
     view: 'table',
     pairLabel: null,
     showChangedOnly: true,
+    anchorEvent: null,
+    contextBriefingMode: 'curated',
 };
 
 function snapshotPairIsPaired(pair) {
@@ -761,6 +1046,29 @@ function openSnapshotOutputModal(modalId, title) {
 }
 window.openSnapshotOutputModal = openSnapshotOutputModal;
 
+function wireContextBriefingPanels(host, event) {
+    if (!host || !window.ContextBriefingUI) return;
+    const briefing =
+        event?.input_context?.context_briefing ||
+        ContextBriefingUI.findContextBriefingForEvent(event?.event_id, eventMap);
+    if (!briefing) return;
+    host.querySelectorAll('.ctx-briefing-panel').forEach((panel) => {
+        ContextBriefingUI.wireContextBriefingPanel(panel, briefing, (mode) => {
+            snapshotInspectorUi.contextBriefingMode = mode;
+            const body = host.querySelector('.snapshot-inspector-body') || host;
+            const wrap = body.querySelector('.ctx-briefing-panel')?.parentElement || body;
+            const html = ContextBriefingUI.renderContextBriefingPanel(briefing, { mode });
+            if (body.classList.contains('snapshot-inspector-body')) {
+                body.innerHTML = html;
+                wireContextBriefingPanels(body.closest('[data-snapshot-inspector]') || body, event);
+            } else {
+                panel.outerHTML = html;
+                wireContextBriefingPanels(host, event);
+            }
+        });
+    });
+}
+
 function renderSnapshotInspectorBody(pair, ui) {
     const panelDef = SNAPSHOT_PANEL_KEYS.find((p) => p.id === ui.panel) || SNAPSHOT_PANEL_KEYS[0];
     const stats = snapshotPanelStats(pair, panelDef);
@@ -769,6 +1077,23 @@ function renderSnapshotInspectorBody(pair, ui) {
 
     if (panelDef.kind === 'node_output') {
         return renderNodeOutputPanel(single, pair);
+    }
+
+    if (panelDef.id === 'context' && window.ContextBriefingUI) {
+        const briefing = ContextBriefingUI.findContextBriefingForEvent(
+            ui.anchorEvent?.event_id,
+            eventMap
+        );
+        if (briefing) {
+            return (
+                ContextBriefingUI.renderContextBriefingPanel(briefing, {
+                    mode: ui.contextBriefingMode || 'curated',
+                }) +
+                (stats.mode === 'diff' && stats.changedCount > 0
+                    ? `<details class="ctx-archive-diff-fallback"><summary class="btn-link">Packet field diff (legacy compact view)</summary>${hint}${renderSnapshotCompareTable(buildSnapshotCompareRows(before, after), { showChangedOnly: ui.showChangedOnly !== false, panelDef })}</details>`
+                    : '')
+            );
+        }
     }
 
     const changedOnly = ui.showChangedOnly !== false;
@@ -863,7 +1188,10 @@ function wireSnapshotInspectorControls(host, pairs, event) {
 
     const rerenderBody = () => {
         const body = host.querySelector('.snapshot-inspector-body');
-        if (body) body.innerHTML = renderSnapshotInspectorBody(getPair(), snapshotInspectorUi);
+        if (body) {
+            body.innerHTML = renderSnapshotInspectorBody(getPair(), snapshotInspectorUi);
+            wireContextBriefingPanels(host, event);
+        }
     };
 
     host.querySelectorAll('.snapshot-panel-tab').forEach((btn) => {
@@ -916,6 +1244,7 @@ function wireSnapshotInspector(host, pairs, event) {
     if (initial && !snapshotInspectorUi.pairLabel) snapshotInspectorUi.pairLabel = initial.label;
 
     wireSnapshotInspectorControls(host, pairs, event);
+    wireContextBriefingPanels(host, event);
 }
 
 function renderSnapshotInspectorHtml(snapshots, event, opts = {}) {
@@ -2021,6 +2350,7 @@ function selectNode(eventId) {
     `;
 
     const linkedSnapshots = snapshotsForEvent(eventId);
+    snapshotInspectorUi.anchorEvent = event;
     if (linkedSnapshots.length) {
         snapshotInspectorUi.panel = 'agent_state';
         snapshotInspectorUi.view = 'table';
@@ -2063,6 +2393,19 @@ function selectNode(eventId) {
             : '';
 
         const hasRagContext = event.retrieved_examples && event.retrieved_examples.length > 0;
+        let contextBriefingSectionHtml = '';
+        if (event.module === 'plan_generator' && window.ContextBriefingUI) {
+            const briefing =
+                event.input_context?.context_briefing ||
+                ContextBriefingUI.findContextBriefingForEvent(eventId, eventMap);
+            if (briefing) {
+                contextBriefingSectionHtml =
+                    '<div class="prompt-section ctx-briefing-detail-section">' +
+                    '<h5>Context briefing <span class="trace-chip trace-chip--muted">curated → LLM</span></h5>' +
+                    ContextBriefingUI.renderContextBriefingPanel(briefing, { mode: 'curated' }) +
+                    '</div>';
+            }
+        }
         const ragContextHtml = hasRagContext ? `
             <div class="prompt-section">
                 <h5>
@@ -2107,6 +2450,7 @@ function selectNode(eventId) {
                         </h5>
                         <pre class="code-block scrollable" style="max-height: 200px;">${escapeHtml((event.user_prompt || 'N/A').substring(0, 600))}${(event.user_prompt || '').length > 600 ? '...' : ''}</pre>
                     </div>
+                    ${contextBriefingSectionHtml}
                 </div>
                 
                 <!-- BOTTOM: Output (Response) -->
@@ -2119,6 +2463,7 @@ function selectNode(eventId) {
                         <p class="block-inline-note" style="margin:0 0 8px">
                             This is what <code>execute_tools</code> runs after validation and post-processing.
                             The raw model JSON below may differ (e.g. <code>expand_grouped_block</code> vs <code>fill_merged</code>).
+                            ${(jobData?.source_traces || []).length > 1 ? '<br><strong>Multi-source:</strong> grain tools such as <code>transform.aggregate_weekly</code> appear in the plan but are <em>deferred</em> — they do not run per source; they run once after collation <code>duplicate_check</code>. See <code>execute_tools</code> trace for <code>deferred_post_collate_tools</code> or State → <code>state.execute_tools.deferral</code>.' : ''}
                         </p>
                         <pre class="code-block scrollable" style="max-height: 360px;">${safeJson(event.parsed_output.tool_calls)}</pre>
                     </div>
@@ -2421,6 +2766,7 @@ function selectNode(eventId) {
     detail.innerHTML = content;
     detail.scrollTop = 0;
     wireSnapshotActionButtons(detail);
+    wireContextBriefingPanels(detail, event);
     const inspector = detail.querySelector('[data-snapshot-inspector]');
     if (inspector && linkedSnapshots.length) {
         wireSnapshotInspector(inspector, groupSnapshotPairs(linkedSnapshots), event);

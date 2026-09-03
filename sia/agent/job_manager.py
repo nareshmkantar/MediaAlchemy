@@ -8,19 +8,24 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional
 
 from .context_packet import create_source_registry, make_source_id, normalize_business_rules, normalize_mapping_records
+from .job_persistence import _sanitize_pending_state
 
 logger = logging.getLogger(__name__)
 
 
 def _layout_row_is_kept_main_data(row: Dict[str, Any]) -> bool:
-    """Match web_server.layout_registry_row_is_main_data (avoid importing web_server)."""
-    cat_compact = str(row.get("block_category") or "").strip().lower().replace(" ", "").replace("_", "")
-    if cat_compact != "maindata":
-        return False
+    """Match web_server.layout_registry_row_is_main_data (avoid importing web_server).
+
+    Explicit user decision wins over the AI-proposed category so a block promoted
+    via "Treat as Data" counts as main data even if the AI labelled it Context/Noise.
+    """
     dec = str(row.get("decision") or "").strip().lower()
-    if dec in ("discard", "context"):
+    if dec in ("discard", "ignore", "noise", "context", "metadata", "use as context"):
         return False
-    return dec in ("keep", "approved") or dec == ""
+    if dec in ("keep", "approved"):
+        return True
+    cat_compact = str(row.get("block_category") or "").strip().lower().replace(" ", "").replace("_", "")
+    return cat_compact == "maindata"
 
 
 def _derived_layout_complete(job: Dict[str, Any], source_id: str, prog_entry: Dict[str, Any]) -> bool:
@@ -49,21 +54,100 @@ def _derived_mapping_complete(job: Dict[str, Any], source_id: str, prog_entry: D
 class JobManager:
     """
     Manages the lifecycle of processing jobs and their associated HITL states.
-    In-memory storage (can be extended to persistent storage later).
+
+    When ``SCHEMA_AGENT_METADATA_DB`` (or ``SCHEMA_AGENT_PERSIST_JOBS=true``) is set,
+    job metadata and pending HITL checkpoints are mirrored to SQLite and reloaded on
+    process start (Phase B/C persistence).
     """
-    
+
     def __init__(self):
-        # In-memory storage
+        # In-memory storage (authoritative at runtime; mirrored to SQLite when enabled)
         self.jobs = {}             # job_id -> job details
         self.review_queue = {}     # job_id -> low-confidence review details
         self.pending_deletions = {}  # job_id -> destructive operation details
         self.pending_checkpoints = {}  # checkpoint_id -> HITL checkpoint review details
         self.pending_schema_mappings = {} # job_id -> MCWT schema mapping state
         self.pending_demarcations = {}    # job_id -> proposed logical blocks
-        
+        from sia.agent.job_persistence import open_metadata_store, persistence_enabled
+
+        self._metadata_store = open_metadata_store()
+        self._persist_jobs = persistence_enabled() and self._metadata_store is not None
+        self._persist_context_artifacts = self._persist_jobs or bool(
+            __import__("os").environ.get("SCHEMA_AGENT_METADATA_DB")
+        )
+        if self._persist_jobs:
+            self._hydrate_from_store()
+
         # Thresholds
         self.STOP_AND_ASK_THRESHOLD = 0.6
         self.FLAG_FOR_REVIEW_THRESHOLD = 0.9
+
+    def _hydrate_from_store(self) -> None:
+        from sia.agent.job_persistence import (
+            apply_hitl_aux_to_manager,
+            load_all_jobs,
+            load_pending_checkpoints,
+        )
+
+        store = self._metadata_store
+        if store is None:
+            return
+        try:
+            for job in load_all_jobs(store):
+                job_id = str(job.get("id") or "")
+                if not job_id:
+                    continue
+                apply_hitl_aux_to_manager(self, job)
+                self.jobs[job_id] = job
+            self.pending_checkpoints.update(load_pending_checkpoints(store))
+            logger.info(
+                "[JobManager] Hydrated %s job(s) and %s pending checkpoint(s) from metadata store",
+                len(self.jobs),
+                len(self.pending_checkpoints),
+            )
+        except Exception as exc:
+            logger.warning("[JobManager] Metadata hydrate failed: %s", exc)
+
+    def sync_job(self, job_id: str) -> None:
+        """Persist current in-memory job + HITL aux state to SQLite (no-op if disabled)."""
+        if not self._persist_jobs or self._metadata_store is None:
+            return
+        job = self.jobs.get(job_id)
+        if not job:
+            return
+        from sia.agent.job_persistence import persist_job_snapshot
+
+        try:
+            persist_job_snapshot(
+                self._metadata_store,
+                job,
+                review_queue=self.review_queue,
+                pending_deletions=self.pending_deletions,
+                pending_demarcations=self.pending_demarcations,
+                pending_schema_mappings=self.pending_schema_mappings,
+            )
+        except Exception as exc:
+            logger.warning("[JobManager] sync_job %s failed: %s", job_id, exc)
+
+    def _sync_job(self, job_id: str) -> None:
+        self.sync_job(job_id)
+
+    def _sync_checkpoint(self, checkpoint_id: str) -> None:
+        if not self._persist_jobs or self._metadata_store is None:
+            return
+        cp = self.pending_checkpoints.get(checkpoint_id)
+        if not cp:
+            return
+        from sia.agent.job_persistence import persist_checkpoint
+
+        persist_checkpoint(self._metadata_store, checkpoint_id, cp)
+
+    def _delete_checkpoint_from_store(self, checkpoint_id: str) -> None:
+        if not self._persist_jobs or self._metadata_store is None:
+            return
+        from sia.agent.job_persistence import delete_checkpoint
+
+        delete_checkpoint(self._metadata_store, checkpoint_id)
 
     # --- Job Lifecycle ---
 
@@ -102,6 +186,8 @@ class JobManager:
             "output_files": {},
             "source_registry": initial_source_registry,
             "source_scope_registry": {},
+            "layout_complexity_by_source": {},
+            "layout_standardize_by_source": {},
             "layout_registry": [],
             "mapping_registry": [],
             "business_rules_registry": [],
@@ -113,8 +199,20 @@ class JobManager:
             "ux_source_progress": {},  # source_id -> { layout_complete, mapping_complete }
             "relationships_gate_complete": True,
             "processing_heartbeat_at": None,
+            "hierarchy_registry": [],
+            "hierarchy_register_complete": False,
+            "mixed_grain_acknowledged": False,
+            "enterprise_info": {},
+            "column_standardize_registry": [],
         }
         self.jobs[job_id] = job
+        try:
+            from sia.debug.processing_log import ensure_job_log
+
+            ensure_job_log(job_id, filename=filename)
+        except Exception:
+            pass
+        self._sync_job(job_id)
         return job
 
     def add_data_file(self, job_id: str, filename: str, file_path: str, sheets: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
@@ -136,6 +234,9 @@ class JobManager:
         job["data_files"] = existing_files
         if len(existing_files) > 1:
             job["relationships_gate_complete"] = False
+        # New files require re-confirming hierarchy registration
+        job["hierarchy_register_complete"] = False
+        job["mixed_grain_acknowledged"] = False
         if len(existing_files) == 1:
             job["filename"] = filename
             job["file_path"] = file_path
@@ -160,6 +261,7 @@ class JobManager:
             )
         )
         job["source_registry"] = source_registry
+        self._sync_job(job_id)
         return file_record
 
     @staticmethod
@@ -301,9 +403,16 @@ class JobManager:
         job["mapping_matrix_draft"] = mm
 
         job["source_registry"] = [s for s in sr if str(s.get("source_id")) != str(source_id)]
+        job["hierarchy_registry"] = [
+            x for x in (job.get("hierarchy_registry") or [])
+            if str(x.get("source_id")) != str(source_id)
+        ]
+        job["hierarchy_register_complete"] = False
+        job["mixed_grain_acknowledged"] = False
         self._prune_relationships_for_source(job, str(source_id))
         self._sync_data_files_with_registry(job)
         self.pending_demarcations.pop(job_id, None)
+        self._sync_job(job_id)
         return True
 
     def remove_data_file(self, job_id: str, file_id: str) -> bool:
@@ -331,6 +440,7 @@ class JobManager:
         self._recompute_job_file_aggregates(job)
         if len(new_dfs) <= 1:
             job["relationships_gate_complete"] = True
+        self._sync_job(job_id)
         return True
 
     def get_job(self, job_id: str) -> Optional[Dict]:
@@ -338,6 +448,13 @@ class JobManager:
         job = self.jobs.get(job_id)
         if job:
             self._ensure_ux_fields(job)
+            if self._persist_context_artifacts and not job.get("context_artifact_cache"):
+                try:
+                    from sia.context.artifacts import restore_context_artifact_cache_from_store
+
+                    restore_context_artifact_cache_from_store(job)
+                except Exception:
+                    pass
         return job
 
     def remove_job(self, job_id: str) -> Optional[Dict]:
@@ -358,6 +475,19 @@ class JobManager:
         ]
         for checkpoint_id in checkpoint_ids:
             self.pending_checkpoints.pop(checkpoint_id, None)
+            self._delete_checkpoint_from_store(checkpoint_id)
+
+        if self._persist_jobs and self._metadata_store is not None:
+            from sia.agent.job_persistence import delete_job_from_store
+
+            delete_job_from_store(self._metadata_store, job_id)
+
+        try:
+            from sia.debug.processing_log import delete_job_logs
+
+            delete_job_logs(job_id)
+        except Exception:
+            pass
 
         return job
 
@@ -370,13 +500,41 @@ class JobManager:
         self.jobs[job_id]["processing_heartbeat_at"] = hb
 
         self.jobs[job_id]["status"] = status
+        if status == "completed":
+            self.jobs[job_id]["requires_review"] = False
+            self.jobs[job_id]["review_reason"] = ""
         if step_name and message:
-            self.jobs[job_id]["steps"].append({
-                "step": step_name,
-                "message": message,
-                "timestamp": datetime.now().isoformat()
-            })
-            
+            self.record_step(job_id, step_name, message)
+        self._sync_job(job_id)
+
+    def record_step(
+        self,
+        job_id: str,
+        step_name: str,
+        message: str,
+        **extra: Any,
+    ) -> Optional[Dict[str, Any]]:
+        """Append one Processing-log step in memory and on disk."""
+        job = self.jobs.get(job_id)
+        if not job:
+            return None
+        entry: Dict[str, Any] = {
+            "step": step_name,
+            "message": message,
+            "timestamp": datetime.now().isoformat(),
+        }
+        for key, value in extra.items():
+            if value is not None:
+                entry[key] = value
+        job.setdefault("steps", []).append(entry)
+        try:
+            from sia.debug.processing_log import append_processing_step
+
+            append_processing_step(job_id, entry)
+        except Exception:
+            pass
+        return entry
+
     def set_job_results(self, job_id: str, schema: Dict, df_preview: List[Dict], total_rows: int, trace: Dict):
         """Store final processing results in the job."""
         if job_id not in self.jobs:
@@ -388,6 +546,7 @@ class JobManager:
         job["total_rows"] = total_rows
         job["trace"] = trace
         job["overall_confidence"] = trace.get("overall_confidence", 0.0)
+        self._sync_job(job_id)
 
     def update_source_metadata(
         self,
@@ -428,6 +587,7 @@ class JobManager:
         source_registry[target_index].update(metadata or {})
         source_registry[target_index].setdefault("source_id", source_id or make_source_id(job_id, source_registry[target_index].get("file_id"), sheet_name, job.get("file_path")))
         job["source_registry"] = source_registry
+        self._sync_job(job_id)
         return source_registry[target_index]
 
     def save_layout_registry(self, job_id: str, layout_blocks: List[Dict[str, Any]], source_id: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -447,6 +607,7 @@ class JobManager:
         job["layout_registry"] = retained
         if scoped_source:
             job.setdefault("source_scope_registry", {})[source_id] = dict(scoped_source)
+        self._sync_job(job_id)
         return retained
 
     def save_mapping_registry(
@@ -482,6 +643,7 @@ class JobManager:
             ]
         retained.extend(normalized)
         job["mapping_registry"] = retained
+        self._sync_job(job_id)
         return normalized
 
     def save_business_rules(
@@ -504,6 +666,7 @@ class JobManager:
         ]
         retained.extend(normalized)
         job["business_rules_registry"] = retained
+        self._sync_job(job_id)
         return normalized
 
     def get_source(self, job_id: str, source_id: Optional[str] = None, sheet_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -556,6 +719,7 @@ class JobManager:
         job["approved_file_relationships"] = normalized
         if normalized:
             job["relationships_gate_complete"] = True
+        self._sync_job(job_id)
         return normalized
 
     # --- UX stages (0–4) ---
@@ -565,6 +729,11 @@ class JobManager:
         job.setdefault("current_ux_stage", 0)
         job.setdefault("ux_source_progress", {})
         job.setdefault("relationships_gate_complete", True)
+        job.setdefault("hierarchy_registry", [])
+        job.setdefault("hierarchy_register_complete", False)
+        job.setdefault("mixed_grain_acknowledged", False)
+        job.setdefault("enterprise_info", {})
+        job.setdefault("column_standardize_registry", [])
         data_files = job.get("data_files") or []
         if len(data_files) <= 1:
             job["relationships_gate_complete"] = True
@@ -578,6 +747,7 @@ class JobManager:
             str(source_id), {"layout_complete": False, "mapping_complete": False}
         )
         entry["layout_complete"] = bool(complete)
+        self._sync_job(job_id)
 
     def mark_ux_source_mapping(self, job_id: str, source_id: str, complete: bool = True) -> None:
         job = self.jobs.get(job_id)
@@ -588,6 +758,7 @@ class JobManager:
             str(source_id), {"layout_complete": False, "mapping_complete": False}
         )
         entry["mapping_complete"] = bool(complete)
+        self._sync_job(job_id)
 
     def patch_ux_state(self, job_id: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Merge client updates for UX stage tracking. Returns updated UX slice or None."""
@@ -615,13 +786,56 @@ class JobManager:
                     base["layout_complete"] = bool(rec["layout_complete"])
                 if "mapping_complete" in rec:
                     base["mapping_complete"] = bool(rec["mapping_complete"])
+        self._sync_job(job_id)
         return self.build_ux_stepper_summary(job)
+
+    def save_hierarchy_registry(
+        self,
+        job_id: str,
+        hierarchy_registry: List[Dict[str, Any]],
+        *,
+        mixed_grain_acknowledged: Optional[bool] = None,
+        mark_complete: Optional[bool] = None,
+        enterprise_info: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Persist hierarchy registration decisions and optional completion flag."""
+        job = self.jobs.get(job_id)
+        if not job:
+            return None
+        self._ensure_ux_fields(job)
+        job["hierarchy_registry"] = list(hierarchy_registry or [])
+        if enterprise_info is not None:
+            from sia.agent.hierarchy_register import normalize_enterprise_info
+
+            job["enterprise_info"] = normalize_enterprise_info(enterprise_info)
+        if mixed_grain_acknowledged is not None:
+            job["mixed_grain_acknowledged"] = bool(mixed_grain_acknowledged)
+        if mark_complete is not None:
+            job["hierarchy_register_complete"] = bool(mark_complete)
+        else:
+            from sia.agent.hierarchy_register import registration_is_complete
+
+            complete, _reasons = registration_is_complete(
+                job["hierarchy_registry"],
+                job.get("source_registry") or [],
+                mixed_grain_acknowledged=bool(job.get("mixed_grain_acknowledged")),
+                enterprise_info=job.get("enterprise_info"),
+            )
+            job["hierarchy_register_complete"] = complete
+        self._sync_job(job_id)
+        return {
+            "hierarchy_registry": job["hierarchy_registry"],
+            "enterprise_info": job.get("enterprise_info"),
+            "hierarchy_register_complete": bool(job.get("hierarchy_register_complete")),
+            "mixed_grain_acknowledged": bool(job.get("mixed_grain_acknowledged")),
+        }
 
     def build_ux_stepper_summary(self, job: Dict[str, Any]) -> Dict[str, Any]:
         """Derived flags for the 0–4 horizontal stepper (see docs/UX_STAGES.md)."""
         self._ensure_ux_fields(job)
         data_files = job.get("data_files") or []
-        stage0_complete = len(data_files) > 0
+        hierarchy_ok = bool(job.get("hierarchy_register_complete"))
+        stage0_complete = len(data_files) > 0 and hierarchy_ok
         sr = job.get("source_registry") or []
         sids = [str(s.get("source_id")) for s in sr if s.get("source_id")]
         prog = job.get("ux_source_progress") or {}
@@ -645,6 +859,8 @@ class JobManager:
             "stage1_complete": stage1_complete,
             "ux_source_progress": effective_prog,
             "relationships_gate_complete": bool(job.get("relationships_gate_complete")),
+            "hierarchy_register_complete": hierarchy_ok,
+            "mixed_grain_acknowledged": bool(job.get("mixed_grain_acknowledged")),
             "multi_file": multi_file,
         }
 
@@ -677,8 +893,10 @@ class JobManager:
         
         if job_id in self.jobs:
             self.jobs[job_id]["requires_review"] = True
+            self.jobs[job_id]["requires_review"] = True
             self.jobs[job_id]["review_reason"] = reason
-            
+
+        self._sync_job(job_id)
         logger.info(f"[JobManager] Job {job_id} added to review queue (decision: {decision})")
 
     @staticmethod
@@ -730,13 +948,108 @@ class JobManager:
             return str(sheet)
         return str(job.get("filename") or "Unknown")
 
+    @staticmethod
+    def _default_checkpoint_actions(cp_type: str, available_actions: Any) -> List[str]:
+        actions = [str(a) for a in (available_actions or []) if str(a).strip()]
+        if actions:
+            return actions
+        if cp_type == "verification_stall":
+            from sia.agent.hitl import HITLManager
+
+            return list(HITLManager.STALL_REVIEW_ACTIONS)
+        return ["approve", "reject"]
+
+    @staticmethod
+    def _ensure_checkpoint_actions(item: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(item, dict):
+            return item
+        cp_type = str(item.get("type") or item.get("checkpoint_type") or "")
+        actions = JobManager._default_checkpoint_actions(cp_type, item.get("available_actions"))
+        item["available_actions"] = actions
+        if cp_type == "verification_stall" and not item.get("recommended_action"):
+            item["recommended_action"] = "accept_as_is"
+        return item
+
     def add_checkpoint_to_review(self, job_id: str, checkpoint: Dict):
         """Bridge an HITL checkpoint into the review queue for analyst visibility."""
         cp_id = checkpoint.get("checkpoint_id", f"cp_{len(self.pending_checkpoints)}")
         cp_type = checkpoint.get("checkpoint_type", "unknown")
         job = self.jobs.get(job_id, {})
 
+        # Replace stale pending integrity reviews so Approve does not stack duplicates.
+        if cp_type == "checksum_failure":
+            stale_ids = [
+                cid
+                for cid, item in self.pending_checkpoints.items()
+                if item.get("job_id") == job_id
+                and item.get("type") == "checksum_failure"
+                and item.get("status") == "pending"
+            ]
+            for cid in stale_ids:
+                self.pending_checkpoints.pop(cid, None)
+                self._delete_checkpoint_from_store(cid)
+        elif cp_type == "schema_mismatch":
+            stale_ids = [
+                cid
+                for cid, item in self.pending_checkpoints.items()
+                if item.get("job_id") == job_id
+                and item.get("type") == "schema_mismatch"
+                and item.get("status") == "pending"
+            ]
+            for cid in stale_ids:
+                self.pending_checkpoints.pop(cid, None)
+                self._delete_checkpoint_from_store(cid)
+        elif cp_type == "file_relationship_review":
+            stale_ids = [
+                cid
+                for cid, item in self.pending_checkpoints.items()
+                if item.get("job_id") == job_id
+                and item.get("type") == "file_relationship_review"
+                and item.get("status") == "pending"
+            ]
+            for cid in stale_ids:
+                self.pending_checkpoints.pop(cid, None)
+                self._delete_checkpoint_from_store(cid)
+        elif cp_type == "plan_review":
+            sheet_key = str(
+                (checkpoint.get("trigger_data") or {}).get("sheet_name")
+                or (checkpoint.get("pending_state") or {}).get("sheet_name")
+                or (job.get("scoped_source") or {}).get("sheet_name")
+                or ""
+            ).strip()
+            stale_ids = [
+                cid
+                for cid, item in self.pending_checkpoints.items()
+                if item.get("job_id") == job_id
+                and item.get("type") == "plan_review"
+                and item.get("status") == "pending"
+                and (
+                    not sheet_key
+                    or sheet_key == str((item.get("trigger_data") or {}).get("sheet_name") or "").strip()
+                    or sheet_key == str((item.get("pending_state") or {}).get("sheet_name") or "").strip()
+                    or (sheet_key and sheet_key in str(item.get("filename") or ""))
+                )
+            ]
+            for cid in stale_ids:
+                self.pending_checkpoints.pop(cid, None)
+                self._delete_checkpoint_from_store(cid)
+        elif cp_type == "column_decision":
+            stale_ids = [
+                cid
+                for cid, item in self.pending_checkpoints.items()
+                if item.get("job_id") == job_id
+                and item.get("type") == "column_decision"
+                and item.get("status") == "pending"
+            ]
+            for cid in stale_ids:
+                self.pending_checkpoints.pop(cid, None)
+                self._delete_checkpoint_from_store(cid)
+
         display_fn = JobManager._queue_filename_for_checkpoint(job, checkpoint)
+
+        actions = JobManager._default_checkpoint_actions(
+            cp_type, checkpoint.get("available_actions")
+        )
 
         self.pending_checkpoints[cp_id] = {
             "checkpoint_id": cp_id,
@@ -748,19 +1061,23 @@ class JobManager:
             "severity": checkpoint.get("severity", "medium"),
             "reason": checkpoint.get("trigger_reason", ""),
             "trigger_data": checkpoint.get("trigger_data", {}),
-            "available_actions": checkpoint.get("available_actions", ["approve", "reject"]),
-            "recommended_action": checkpoint.get("recommended_action", "approve"),
+            "available_actions": actions,
+            "recommended_action": checkpoint.get("recommended_action") or (
+                "accept_as_is" if cp_type == "verification_stall" else "approve"
+            ),
             "confidence": checkpoint.get("confidence", 0.5),
             "current_step": checkpoint.get("current_step", "Processing"),
             "created_at": checkpoint.get("created_at", datetime.now().isoformat()),
             "status": "pending",
             "resolved": False,
-            "pending_state": checkpoint.get("pending_state"),
+            "pending_state": _sanitize_pending_state(checkpoint.get("pending_state")),
         }
         
         if job_id in self.jobs:
             self.jobs[job_id]["requires_review"] = True
-        
+
+        self._sync_checkpoint(cp_id)
+        self._sync_job(job_id)
         logger.info(f"[JobManager] Checkpoint {cp_id} ({cp_type}) added to review for job {job_id}")
         return cp_id
 
@@ -775,6 +1092,10 @@ class JobManager:
         checkpoint["resolution_action"] = action
         checkpoint["resolution_data"] = resolution_data or {}
         checkpoint["resolved_at"] = datetime.now().isoformat()
+        self._sync_checkpoint(checkpoint_id)
+        job_id = str(checkpoint.get("job_id") or "")
+        if job_id:
+            self._sync_job(job_id)
         return True
 
     def apply_plan_feedback(
@@ -867,6 +1188,7 @@ class JobManager:
                 combined_rules = filtered_existing + translated_rules
                 rules_saved = self.save_business_rules(job_id, combined_rules, sheet_name=sheet_name)
 
+        self._sync_job(job_id)
         return {"notes_added": notes_added, "rules_saved": rules_saved}
 
     def approve_review(self, job_id: str):
@@ -877,6 +1199,7 @@ class JobManager:
         
         if job_id in self.jobs:
             self.jobs[job_id]["review_status"] = "approved"
+        self._sync_job(job_id)
 
     def reject_review(self, job_id: str, reason: str):
         """Reject a low-confidence review."""
@@ -889,6 +1212,7 @@ class JobManager:
         if job_id in self.jobs:
             self.jobs[job_id]["review_status"] = "rejected"
             self.jobs[job_id]["rejection_reason"] = reason
+        self._sync_job(job_id)
 
     def cancel_job(self, job_id: str, reason: str = "Cancelled by user") -> Optional[Dict[str, Any]]:
         """Mark a job as cancelled and clear any pending review state."""
@@ -901,11 +1225,7 @@ class JobManager:
         job["review_reason"] = ""
         job["review_status"] = "cancelled"
         job["cancellation_reason"] = reason
-        job["steps"].append({
-            "step": "Cancelled",
-            "message": reason,
-            "timestamp": datetime.now().isoformat()
-        })
+        self.record_step(job_id, "Cancelled", reason)
 
         self.review_queue.pop(job_id, None)
         self.pending_deletions.pop(job_id, None)
@@ -918,6 +1238,8 @@ class JobManager:
         ]
         for cid in stale_cp_ids:
             self.pending_checkpoints.pop(cid, None)
+            self._delete_checkpoint_from_store(cid)
+        self._sync_job(job_id)
         return job
 
     def apply_review_correction(self, job_id: str, corrections: Dict):
@@ -931,6 +1253,7 @@ class JobManager:
         if job_id in self.jobs:
             self.jobs[job_id]["review_status"] = "corrected"
             self.jobs[job_id]["corrections"] = corrections
+        self._sync_job(job_id)
 
     # --- HITL: Destructive Approvals (Pre-Execution Pause) ---
 
@@ -947,11 +1270,12 @@ class JobManager:
             "previews": previews,
             "pending_tools": [p.get("tool_name") for p in previews],
             "low_confidence_items": low_confidence_items or [], # NEW: Store for UI
-            "pending_state": pending_state,
+            "pending_state": _sanitize_pending_state(pending_state),
             "created_at": datetime.now().isoformat(),
             "approved": False
         }
-        
+        self._sync_job(job_id)
+
     def approve_deletions(self, job_id: str, approved_indices: Optional[List[int]] = None):
         """Approve destructive operations."""
         if job_id not in self.pending_deletions:
@@ -965,6 +1289,7 @@ class JobManager:
         if job_id in self.jobs:
             self.jobs[job_id]["destructive_approved"] = True
             self.jobs[job_id]["approved_tool_indices"] = approved_indices
+        self._sync_job(job_id)
 
     def reject_deletions(self, job_id: str):
         """Reject destructive operations and mark to skip them."""
@@ -978,6 +1303,7 @@ class JobManager:
         if job_id in self.jobs:
             self.jobs[job_id]["destructive_approved"] = True
             self.jobs[job_id]["approved_tool_indices"] = [] # Empty means skip all
+        self._sync_job(job_id)
 
     # --- Unified Review Status ---
 
@@ -1059,11 +1385,21 @@ class JobManager:
                 cp_type = item.get("type", "unknown")
                 if cp_type == "structural_review" and self._is_structural_checkpoint_redundant(job, item):
                     continue
+
+                display_confidence = item.get("confidence", 0.5)
+                if cp_type == "plan_review":
+                    plan_conf = (item.get("trigger_data") or {}).get("plan_confidence")
+                    if plan_conf is not None:
+                        try:
+                            display_confidence = float(plan_conf)
+                        except (TypeError, ValueError):
+                            pass
                 
                 # Map checkpoint type to display icon
                 type_labels = {
                     "structural_review": "📐 STRUCTURAL",
                     "checksum_failure": "📊 CHECKSUM",
+                    "schema_mismatch": "📏 CONSTRAINTS",
                     "plan_review": "📋 PLAN",
                     "file_relationship_review": "🧩 RELATIONSHIP",
                     "low_confidence": "🔍 CONF",
@@ -1075,7 +1411,7 @@ class JobManager:
                     "job_id": item.get("job_id"),
                     "checkpoint_id": cp_id,
                     "filename": item.get("filename", job.get("filename", "Unknown")),
-                    "confidence": item.get("confidence", 0.5),
+                    "confidence": display_confidence,
                     "decision": "stop_and_ask" if item.get("severity") in ["high", "critical"] else "flag_for_review",
                     "reason": item.get("reason", ""),
                     "created_at": item.get("created_at"),
@@ -1085,13 +1421,30 @@ class JobManager:
                     "description": item.get("description", ""),
                     "severity": item.get("severity", "medium"),
                     "trigger_data": item.get("trigger_data", {}),
-                    "available_actions": item.get("available_actions", []),
+                    "available_actions": JobManager._ensure_checkpoint_actions(item).get("available_actions", []),
                     "recommended_action": item.get("recommended_action", "approve"),
                     "current_step": item.get("current_step", "Processing"),
                     "pending_tools": []
                 })
         
-        return pending
+        return self._dedupe_pending_review_items(pending)
+
+    @staticmethod
+    def _dedupe_pending_review_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Keep one integrity review row per job (newest) to avoid approve loops cluttering the queue."""
+        latest_integrity: Dict[str, Dict[str, Any]] = {}
+        out: List[Dict[str, Any]] = []
+        for item in items:
+            if item.get("type") == "checksum_failure" and item.get("job_id"):
+                jid = str(item["job_id"])
+                prev = latest_integrity.get(jid)
+                if not prev or str(item.get("created_at") or "") >= str(prev.get("created_at") or ""):
+                    latest_integrity[jid] = item
+            else:
+                out.append(item)
+        out.extend(latest_integrity.values())
+        out.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+        return out
 
     @staticmethod
     def _is_structural_checkpoint_redundant(job: Dict[str, Any], checkpoint: Dict[str, Any]) -> bool:

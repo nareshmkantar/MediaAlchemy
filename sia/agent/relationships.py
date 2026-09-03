@@ -5,6 +5,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
+from sia.agent.target_template_utils import template_union_grain_columns
+
 
 PLATFORM_HINTS = {
     "meta": {"meta", "facebook", "instagram"},
@@ -14,9 +16,82 @@ PLATFORM_HINTS = {
     "reference": {"lookup", "reference", "dictionary", "mapping"},
 }
 
+_JOIN_KEY_FALLBACK_ORDER = (
+    "date",
+    "market",
+    "brand",
+    "channel",
+    "publisher_name",
+    "publisher",
+    "campaign_name",
+)
 
-def propose_file_relationships(source_summaries: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    summaries = [item for item in source_summaries if isinstance(item, dict) and item.get("source_id")]
+
+def enrich_source_summaries_for_relationships(
+    source_summaries: Sequence[Dict[str, Any]],
+    *,
+    target_template: Optional[Dict[str, Any]] = None,
+    frames_by_source: Optional[Dict[str, pd.DataFrame]] = None,
+) -> List[Dict[str, Any]]:
+    """Attach template grain + per-source output columns for join-key inference."""
+    grain = template_union_grain_columns(target_template) if target_template else []
+    enriched: List[Dict[str, Any]] = []
+    for summary in source_summaries or []:
+        if not isinstance(summary, dict):
+            continue
+        out = dict(summary)
+        if grain and not out.get("template_grain_columns"):
+            out["template_grain_columns"] = list(grain)
+        sid = str(out.get("source_id") or "").strip()
+        if frames_by_source and sid:
+            frame = frames_by_source.get(sid)
+            if frame is not None and hasattr(frame, "columns"):
+                out["output_columns"] = [str(c) for c in frame.columns]
+        enriched.append(out)
+    return enriched
+
+
+def refresh_union_join_keys_in_proposals(
+    proposals: Sequence[Dict[str, Any]],
+    source_summaries: Sequence[Dict[str, Any]],
+    *,
+    target_template: Optional[Dict[str, Any]] = None,
+    frames_by_source: Optional[Dict[str, pd.DataFrame]] = None,
+) -> List[Dict[str, Any]]:
+    """Recompute union ``join_keys`` when post-execution frames include derived columns."""
+    enriched = enrich_source_summaries_for_relationships(
+        source_summaries,
+        target_template=target_template,
+        frames_by_source=frames_by_source,
+    )
+    main_sources = [
+        item for item in enriched
+        if item.get("contains_main_data", True) and not item.get("contains_reference_data")
+    ]
+    fresh_keys = _common_join_keys(main_sources) if len(main_sources) > 1 else []
+    refreshed: List[Dict[str, Any]] = []
+    for proposal in proposals or []:
+        if not isinstance(proposal, dict):
+            continue
+        record = dict(proposal)
+        if str(record.get("relationship_kind") or "").lower() == "union" and fresh_keys:
+            record["join_keys"] = list(fresh_keys)
+        refreshed.append(record)
+    return refreshed
+
+
+def propose_file_relationships(
+    source_summaries: Sequence[Dict[str, Any]],
+    *,
+    target_template: Optional[Dict[str, Any]] = None,
+    frames_by_source: Optional[Dict[str, pd.DataFrame]] = None,
+) -> List[Dict[str, Any]]:
+    summaries = enrich_source_summaries_for_relationships(
+        source_summaries,
+        target_template=target_template,
+        frames_by_source=frames_by_source,
+    )
+    summaries = [item for item in summaries if isinstance(item, dict) and item.get("source_id")]
     if len(summaries) < 2:
         return []
 
@@ -153,12 +228,11 @@ def _union_stack_column_intersection(
     return sorted(inter)
 
 
-def _collate_frames_baseline(
+def _collate_relationship_groups(
     norm_frames: Dict[str, pd.DataFrame],
     relationships: Sequence[Dict[str, Any]],
-) -> pd.DataFrame:
-    if not norm_frames:
-        return pd.DataFrame()
+) -> Tuple[List[str], List[str], List[str], List[str]]:
+    """Partition source ids the same way as :func:`_collate_frames_baseline`."""
 
     def _sid_key(x: Any) -> str:
         return str(x).strip() if x is not None else ""
@@ -184,15 +258,28 @@ def _collate_frames_baseline(
     union_ids = list(dict.fromkeys(grouped.get("union", [])))
     join_ids = list(dict.fromkeys(grouped.get("join", [])))
     independent_ids = list(dict.fromkeys(independent))
-
     consumed = set(union_ids + join_ids + independent_ids)
     remaining_ids = [source_id for source_id in norm_frames if source_id not in consumed]
+    return union_ids, join_ids, independent_ids, remaining_ids
+
+
+def _collate_frames_baseline(
+    norm_frames: Dict[str, pd.DataFrame],
+    relationships: Sequence[Dict[str, Any]],
+) -> pd.DataFrame:
+    if not norm_frames:
+        return pd.DataFrame()
+
+    union_ids, join_ids, independent_ids, remaining_ids = _collate_relationship_groups(
+        norm_frames, relationships
+    )
 
     frames: List[pd.DataFrame] = []
     if union_ids:
         frames.append(_concat_frames([norm_frames[source_id] for source_id in union_ids]))
-    if join_ids:
-        frames.append(_join_frames([norm_frames[source_id] for source_id in join_ids]))
+    join_present = [source_id for source_id in join_ids if source_id in norm_frames]
+    if len(join_present) >= 2:
+        frames.append(_join_frames([norm_frames[source_id] for source_id in join_present]))
     frames.extend(norm_frames[source_id] for source_id in independent_ids)
     frames.extend(norm_frames[source_id] for source_id in remaining_ids)
 
@@ -201,6 +288,85 @@ def _collate_frames_baseline(
     if len(frames) == 1:
         return frames[0]
     return _concat_frames(frames)
+
+
+def baseline_collate_stack_layout(
+    frames_by_source: Dict[str, pd.DataFrame],
+    relationships: Sequence[Dict[str, Any]],
+) -> Tuple[List[int], List[Dict[str, Any]]]:
+    """Row breaks and per-segment metadata matching :func:`_collate_frames_baseline` order.
+
+    Each segment entry includes ``source_id``, ``segment_kind`` (``union_member``,
+    ``join``, ``independent``, ``remaining``), and optional ``label_suffix`` for UI.
+    """
+    norm_frames = _normalize_frames_keys(frames_by_source)
+    if not norm_frames:
+        return [], []
+
+    union_ids, join_ids, independent_ids, remaining_ids = _collate_relationship_groups(
+        norm_frames, relationships
+    )
+    segments: List[Tuple[str, int, str, str]] = []
+
+    for source_id in union_ids:
+        frame = norm_frames.get(source_id)
+        row_count = int(len(frame)) if frame is not None and not frame.empty else 0
+        if row_count > 0:
+            segments.append((source_id, row_count, "union_member", ""))
+
+    join_present = [source_id for source_id in join_ids if source_id in norm_frames]
+    if len(join_present) >= 2:
+        joined = _join_frames([norm_frames[source_id] for source_id in join_present])
+        row_count = int(len(joined)) if joined is not None and not joined.empty else 0
+        if row_count > 0:
+            segments.append((join_present[0], row_count, "join", " (join)"))
+
+    for source_id in independent_ids:
+        frame = norm_frames.get(source_id)
+        row_count = int(len(frame)) if frame is not None and not frame.empty else 0
+        if row_count > 0:
+            segments.append((source_id, row_count, "independent", ""))
+
+    for source_id in remaining_ids:
+        frame = norm_frames.get(source_id)
+        row_count = int(len(frame)) if frame is not None and not frame.empty else 0
+        if row_count > 0:
+            segments.append((source_id, row_count, "remaining", ""))
+
+    breaks: List[int] = []
+    meta: List[Dict[str, Any]] = []
+    offset = 0
+    for source_id, row_count, kind, suffix in segments:
+        meta.append(
+            {
+                "source_id": source_id,
+                "segment_kind": kind,
+                "label_suffix": suffix,
+            }
+        )
+        offset += row_count
+        if offset > 0:
+            breaks.append(offset)
+    if breaks:
+        breaks.pop()
+    return breaks, meta
+
+
+def relationships_applicable_to_frames(
+    relationships: Sequence[Dict[str, Any]],
+    norm_frames: Dict[str, pd.DataFrame],
+) -> List[Dict[str, Any]]:
+    """Drop relationship edges whose ``source_ids`` are not all present in ``norm_frames``."""
+    applicable: List[Dict[str, Any]] = []
+    for relationship in relationships or []:
+        if not isinstance(relationship, dict):
+            continue
+        source_ids = [str(sid).strip() for sid in (relationship.get("source_ids") or []) if str(sid).strip()]
+        if not source_ids:
+            continue
+        if all(sid in norm_frames for sid in source_ids):
+            applicable.append(relationship)
+    return applicable
 
 
 def collate_frames_detailed(
@@ -314,17 +480,90 @@ def _join_frames(frames: Sequence[pd.DataFrame]) -> pd.DataFrame:
     return result
 
 
-def _common_join_keys(source_group: Sequence[Dict[str, Any]]) -> List[str]:
-    candidate_sets = []
-    for source in source_group:
-        targets = set(source.get("mapped_targets") or [])
-        uid = set(source.get("uid") or [])
-        candidate_sets.append(targets.union(uid))
-    if not candidate_sets:
+def _resolve_column_on_frame(name: str, columns: Sequence[str]) -> Optional[str]:
+    token = str(name or "").strip()
+    if not token:
+        return None
+    cols = [str(c) for c in columns]
+    if token in cols:
+        return token
+    lower = {str(c).lower(): str(c) for c in cols}
+    return lower.get(token.lower())
+
+
+def _join_key_pool_for_source(source: Dict[str, Any]) -> set[str]:
+    pool: set[str] = set()
+    for item in source.get("mapped_targets") or []:
+        token = str(item or "").strip()
+        if token:
+            pool.add(token)
+    for item in source.get("uid") or []:
+        token = str(item or "").strip()
+        if token:
+            pool.add(token)
+
+    output_cols = [str(c) for c in (source.get("output_columns") or [])]
+    grain = [str(c) for c in (source.get("template_grain_columns") or [])]
+    for col in grain:
+        resolved = _resolve_column_on_frame(col, output_cols)
+        if resolved:
+            pool.add(resolved)
+    return pool
+
+
+def _ordered_join_keys(common_lower: set[str], source_group: Sequence[Dict[str, Any]]) -> List[str]:
+    if not common_lower:
         return []
-    common = set.intersection(*candidate_sets)
-    preferred_order = ["date", "market", "brand", "channel", "publisher_name", "publisher", "campaign_name"]
-    return [item for item in preferred_order if item in common]
+
+    grain: List[str] = []
+    for source in source_group:
+        cols = source.get("template_grain_columns")
+        if cols:
+            grain = [str(c) for c in cols]
+            break
+
+    order_tokens: List[str] = []
+    seen: set[str] = set()
+    for col in list(grain) + list(_JOIN_KEY_FALLBACK_ORDER):
+        key = str(col).lower()
+        if key in common_lower and key not in seen:
+            order_tokens.append(key)
+            seen.add(key)
+
+    reference_cols: List[str] = []
+    for source in source_group:
+        for col in source.get("output_columns") or source.get("mapped_targets") or []:
+            reference_cols.append(str(col))
+        if reference_cols:
+            break
+
+    canonical: List[str] = []
+    seen_names: set[str] = set()
+    for key in order_tokens:
+        resolved = _resolve_column_on_frame(key, reference_cols)
+        if not resolved:
+            continue
+        norm = resolved.lower()
+        if norm not in common_lower or norm in seen_names:
+            continue
+        canonical.append(resolved)
+        seen_names.add(norm)
+    return canonical
+
+
+def _common_join_keys(source_group: Sequence[Dict[str, Any]]) -> List[str]:
+    pools = [_join_key_pool_for_source(source) for source in source_group]
+    if not pools:
+        return []
+
+    common_lower: Optional[set[str]] = None
+    for pool in pools:
+        lower_set = {str(c).lower() for c in pool}
+        common_lower = lower_set if common_lower is None else common_lower & lower_set
+    if not common_lower:
+        return []
+
+    return _ordered_join_keys(common_lower, source_group)
 
 
 def _union_confidence(source_group: Sequence[Dict[str, Any]]) -> float:

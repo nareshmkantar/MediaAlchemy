@@ -230,6 +230,7 @@ TOOL_PRIMARY_STAGE: Dict[str, PipelineStage] = {
     "transform.fuzzy_standardize": PipelineStage.VALUE_STANDARDISATION,
     "transform.format": PipelineStage.VALUE_STANDARDISATION,
     "transform.calculate": PipelineStage.VALUE_STANDARDISATION,
+    "transform.scale_values": PipelineStage.VALUE_STANDARDISATION,
     "transform.expand_grouped_block": PipelineStage.VALUE_STANDARDISATION,
     "transform.classify_metric_level": PipelineStage.VALUE_STANDARDISATION,
     "transform.allocate_block_metric": PipelineStage.VALUE_STANDARDISATION,

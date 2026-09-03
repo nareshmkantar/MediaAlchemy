@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Config - Schema Agent</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="/styles.css">
+</head>
+
+<body>
+    <nav class="main-nav" id="mainNav" data-page="config"></nav>
+
+    <main class="page-container config-page">
+        <header class="config-topbar">
+            <div>
+                <h1>Config</h1>
+                <p class="config-lead">Defaults, option lists, hierarchy, and mapping synonyms used during registration and schema mapping.</p>
+            </div>
+            <div class="config-topbar-actions">
+                <button type="button" class="btn-secondary" id="configReloadBtn">Discard changes</button>
+                <button type="button" class="btn-primary" id="configSaveBtn">Save changes</button>
+            </div>
+        </header>
+
+        <div class="config-shell">
+            <aside class="config-side" aria-label="Config sections">
+                <button type="button" class="config-side-link active" data-config-tab="enterprise">Enterprise info</button>
+                <button type="button" class="config-side-link" data-config-tab="additional">Additional columns</button>
+                <button type="button" class="config-side-link" data-config-tab="hierarchy">Media hierarchy</button>
+                <button type="button" class="config-side-link" data-config-tab="attributes">Common attributes</button>
+                <button type="button" class="config-side-link" data-config-tab="mapping">Mapping dictionary</button>
+                <button type="button" class="config-side-link" data-config-tab="publishers">Publishers</button>
+            </aside>
+            <div id="configBody" class="config-panel" role="main">
+                <p class="help-text">Loading…</p>
+            </div>
+        </div>
+    </main>
+
+    <div class="toast-container" id="toastContainer"></div>
+
+    <script src="/js/common.js"></script>
+    <script src="/js/config.js"></script>
+</body>
+
+</html>

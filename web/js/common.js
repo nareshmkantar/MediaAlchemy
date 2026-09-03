@@ -96,7 +96,35 @@ async function saveConfig(config) {
 
 // ===== Navigation =====
 function navigateTo(page) {
-    window.location.href = `/pages/${page}.html`;
+    const job = getCurrentJob();
+    const params = new URLSearchParams();
+    if (job.jobId) params.set('job_id', job.jobId);
+    if (job.sheetName) params.set('sheet_name', job.sheetName);
+    if (job.sourceId) params.set('source_id', job.sourceId);
+    const qs = params.toString();
+    window.location.href = `/pages/${page}.html${qs ? `?${qs}` : ''}`;
+}
+
+function jobQueryForNav() {
+    const job = getCurrentJob();
+    // Prefer live URL params when already on a job page
+    try {
+        const url = new URLSearchParams(window.location.search || '');
+        const jid = url.get('job_id') || job.jobId;
+        const sheet = url.get('sheet_name') || job.sheetName;
+        const sid = url.get('source_id') || job.sourceId;
+        if (jid) {
+            setCurrentJob(jid, sheet || null, sid || null);
+        }
+        const params = new URLSearchParams();
+        if (jid) params.set('job_id', jid);
+        if (sheet) params.set('sheet_name', sheet);
+        if (sid) params.set('source_id', sid);
+        const qs = params.toString();
+        return qs ? `?${qs}` : '';
+    } catch (e) {
+        return job.jobId ? `?job_id=${encodeURIComponent(job.jobId)}` : '';
+    }
 }
 
 function routeJobByState(jobState = {}) {
@@ -104,9 +132,8 @@ function routeJobByState(jobState = {}) {
     if (jid) setCurrentJob(String(jid));
 
     const status = jobState.status || '';
-    const requiresReview = Boolean(jobState.requires_review);
 
-    if (status === 'awaiting_review' || status === 'awaiting_approval' || requiresReview) {
+    if (status === 'awaiting_review' || status === 'awaiting_approval') {
         const path = (typeof window !== 'undefined' && window.location && window.location.pathname) || '';
         if (!path.endsWith('review.html')) {
             navigateTo('review');
@@ -118,7 +145,7 @@ function routeJobByState(jobState = {}) {
         return;
     }
     if (status === 'completed') {
-        navigateTo('processing');
+        navigateTo('debug');
         return;
     }
     navigateTo('debug');
@@ -240,6 +267,15 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
+/** Escape for embedding in single-quoted JS string literals (onclick handlers). */
+function escapeJsString(value) {
+    return String(value ?? '')
+        .replace(/\\/g, '\\\\')
+        .replace(/'/g, "\\'")
+        .replace(/\r/g, '\\r')
+        .replace(/\n/g, '\\n');
+}
+
 /** Escape for HTML attribute values (title, data-*, etc.). */
 function escapeAttr(value) {
     return String(value ?? '')
@@ -254,15 +290,13 @@ function renderNavbar(activePage) {
     const nav = document.getElementById('mainNav');
     if (!nav) return;
 
+    const jobQs = jobQueryForNav();
     const pages = [
         { id: 'upload', icon: '📤', label: '1 · Upload' },
         { id: 'setup', icon: '🧭', label: '2 · Schema Mapping' },
-        { id: 'review', icon: '👁️', label: '3 · Review' },
-        { id: 'debug', icon: '📥', label: '4 · Results' },
-        { id: 'evals', icon: '⚖️', label: '5 · Evals' },
-        { id: 'tests', icon: '🧪', label: '6 · Tests' },
-        { id: 'processing', icon: '⏳', label: '7 · Console' },
+        { id: 'config', icon: '🗂️', label: '3 · Config' },
     ];
+    // Review / Results / Evals / Tests / Console hidden for this project scope.
 
     nav.innerHTML = `
         <div class="nav-brand">
@@ -271,7 +305,7 @@ function renderNavbar(activePage) {
         </div>
         <div class="nav-links">
             ${pages.map(p => `
-                <a href="/pages/${p.id}.html" class="nav-link ${activePage === p.id ? 'active' : ''}" id="nav-link-${p.id}">
+                <a href="/pages/${p.id}.html${jobQs}" class="nav-link ${activePage === p.id ? 'active' : ''}" id="nav-link-${p.id}">
                     <span class="nav-icon">${p.icon}</span>
                     <span>${p.label}</span>
                     ${p.id === 'review' ? '<span class="nav-badge hidden" id="reviewBadge">0</span>' : ''}
@@ -283,7 +317,7 @@ function renderNavbar(activePage) {
                 <span class="status-dot"></span>
                 <span class="status-text">Loading...</span>
             </div>
-            <a href="/pages/settings.html" class="nav-link nav-link--icon-only nav-link--settings-end ${activePage === 'settings' ? 'active' : ''}" id="nav-link-settings" aria-label="Settings" title="Settings">
+            <a href="/pages/settings.html${jobQs}" class="nav-link nav-link--icon-only nav-link--settings-end ${activePage === 'settings' ? 'active' : ''}" id="nav-link-settings" aria-label="Settings" title="Settings">
                 <span class="nav-icon" aria-hidden="true">⚙️</span>
             </a>
         </div>
@@ -309,10 +343,10 @@ async function updateNavStatus() {
             }
         }
 
-        // Update Review Badge
-        const reviewData = await fetchJson('/api/review/count');
+        // Review badge only when Review is in the nav
         const badge = document.getElementById('reviewBadge');
         if (badge) {
+            const reviewData = await fetchJson('/api/review/count');
             if (reviewData.pending_count > 0) {
                 badge.textContent = reviewData.pending_count;
                 badge.classList.remove('hidden');

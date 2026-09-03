@@ -26,7 +26,28 @@ function escapeJsString(value) {
         .replace(/'/g, "\\'");
 }
 
-/** After review, send analysts to Processing (not Debug). */
+/** Plan/checkpoint confidence for queue badges (plan_confidence beats stale trajectory min). */
+function reviewItemConfidence(item) {
+    const planConf = item?.trigger_data?.plan_confidence;
+    if (planConf != null && Number.isFinite(Number(planConf))) {
+        return Number(planConf);
+    }
+    const raw = Number(item?.confidence);
+    return Number.isFinite(raw) ? raw : 0.5;
+}
+
+function formatConfidencePct(confidence) {
+    return `${(confidence * 100).toFixed(0)}%`;
+}
+
+/** After review completes, open Results (downloads live on debug.html). */
+window.goToResultsForJob = function (jobId) {
+    const j = String(jobId || '').trim();
+    if (j) setCurrentJob(j);
+    navigateTo('debug');
+};
+
+/** While a run is still in flight, send analysts to Console. */
 window.goToProcessingForJob = function (jobId) {
     const j = String(jobId || '').trim();
     if (j) setCurrentJob(j);
@@ -116,6 +137,11 @@ function _sourcesFileTreeHtml(sources) {
 
 function _alignmentColumnsLine(hero, sources) {
     if (!hero) return '—';
+    const kind = String(hero.relationship_kind || '').toLowerCase();
+    const keys = _joinKeysDisplayFromProposal(hero);
+    if (kind.includes('union') || kind.includes('independent')) {
+        if (keys) return keys;
+    }
     const sids = Array.isArray(hero.source_ids) ? hero.source_ids.map(String) : [];
     const cols = new Set();
     const list = Array.isArray(sources) ? sources : [];
@@ -126,11 +152,9 @@ function _alignmentColumnsLine(hero, sources) {
             if (c) cols.add(String(c));
         });
     }
-    const keys = _joinKeysDisplayFromProposal(hero);
-    const kind = String(hero.relationship_kind || '').toLowerCase();
     if (kind.includes('union') || kind.includes('independent')) {
         const line = Array.from(cols).slice(0, 16).join(' | ');
-        return line || '—';
+        return line || keys || '—';
     }
     const line = Array.from(cols).slice(0, 16).join(' | ');
     if (keys) return `Join on: ${keys}${line ? ` | ${line}` : ''}`;
@@ -157,6 +181,7 @@ function _renderDuplicateVisualSample(sample) {
                     const t = String(v);
                     let cls = 'combine-dedupe-outcome';
                     if (t.includes('Removed')) cls += ' combine-dedupe-outcome--removed';
+                    else if (t.includes('Would remove')) cls += ' combine-dedupe-outcome--removed';
                     else if (t.includes('Kept')) cls += ' combine-dedupe-outcome--kept';
                     else if (t.includes('Combined')) cls += ' combine-dedupe-outcome--merged';
                     return `<td class="${cls}">${s}</td>`;
@@ -177,6 +202,24 @@ function _renderDuplicateVisualSample(sample) {
                 <table class="combine-mini-table combine-mini-table--dedupe-outcome">${thead}<tbody>${tbody}</tbody></table>
             </div>
         </div>`;
+}
+
+/** Build duplicate-check-style table payload from a deletion preview dict. */
+function _buildRemovalVisualSampleFromPreview(p) {
+    if (!p || typeof p !== 'object') return null;
+    if (p.visual_sample && typeof p.visual_sample === 'object') return p.visual_sample;
+    const sample = Array.isArray(p.sample_deleted_data) ? p.sample_deleted_data : [];
+    if (!sample.length) return null;
+    const removedRows = sample.map((row) => ({ ...row, Outcome: 'Would remove if you continue' }));
+    const cols = [...Object.keys(removedRows[0] || {})];
+    if (!cols.includes('Outcome')) cols.push('Outcome');
+    const title = p.step_title || p.tool_name || 'Destructive step';
+    return {
+        title: `${title} — rows that would be removed`,
+        subtitle: String(p.impact_summary || p.reason || '').trim(),
+        columns: cols,
+        rows: removedRows,
+    };
 }
 
 function _renderMiniPreviewTable(columns, rows, maxRows = 3) {
@@ -347,17 +390,55 @@ function _dupDecisionFromPayload(decisions, gid, category, fallbackAction) {
     return fallbackAction;
 }
 
+const DUP_SOURCE_COLUMNS = ['file_name', 'sheet_name'];
+const DUP_SOURCE_COLUMN_LABELS = { file_name: 'File', sheet_name: 'Sheet' };
+
 function _renderDupGroupTable(rows) {
     const raw = Array.isArray(rows) ? rows : [];
     if (!raw.length) return '<p class="muted">No rows</p>';
-    const cols = Object.keys(raw[0] || {}).filter((c) => !String(c).startsWith('_'));
+    const dataCols = Object.keys(raw[0] || {}).filter(
+        (c) => !String(c).startsWith('_') && !DUP_SOURCE_COLUMNS.includes(c),
+    );
+    const cols = [
+        ...DUP_SOURCE_COLUMNS.filter((c) => raw.some((r) => String(r[c] || '').trim())),
+        ...dataCols.sort(),
+    ];
     if (!cols.length) return '<p class="muted">No columns</p>';
-    return _renderMiniPreviewTable(cols, raw, raw.length);
+    const thead = `<thead><tr>${cols
+        .map((c) => `<th class="${DUP_SOURCE_COLUMNS.includes(c) ? 'dup-source-col' : ''}">${escapeHtml(DUP_SOURCE_COLUMN_LABELS[c] || c)}</th>`)
+        .join('')}</tr></thead>`;
+    const tbody = raw
+        .map(
+            (row) =>
+                `<tr>${cols
+                    .map(
+                        (c) =>
+                            `<td class="${DUP_SOURCE_COLUMNS.includes(c) ? 'dup-source-col' : ''}">${escapeHtml(String(row && row[c] != null ? row[c] : ''))}</td>`,
+                    )
+                    .join('')}</tr>`,
+        )
+        .join('');
+    return `<div class="combine-mini-table-wrap"><table class="combine-mini-table combine-mini-table--dup-sources">${thead}<tbody>${tbody}</tbody></table></div>`;
 }
 
 function _dupChoiceBtn(value, label, variant, selected) {
     const sel = selected ? ' is-selected' : '';
     return `<button type="button" class="dup-choice-btn dup-choice-btn--${variant}${sel}" data-dup-value="${escapeAttr(String(value))}" aria-pressed="${selected ? 'true' : 'false'}">${label}</button>`;
+}
+
+function _dupGroupLikelyContextBleed(rows) {
+    const raw = Array.isArray(rows) ? rows : [];
+    if (raw.length < 2) return false;
+    const sheets = [...new Set(raw.map((r) => String(r?.sheet_name || '').trim()).filter(Boolean))];
+    if (sheets.length < 2) return false;
+    const dimCols = ['market', 'channel', 'Market', 'Channel'];
+    for (const col of dimCols) {
+        const vals = raw
+            .map((r) => String(r?.[col] ?? '').trim())
+            .filter(Boolean);
+        if (vals.length >= 2 && new Set(vals).size === 1) return true;
+    }
+    return false;
 }
 
 function _renderDuplicateKeyGroupSections(dup) {
@@ -367,7 +448,20 @@ function _renderDuplicateKeyGroupSections(dup) {
     const s1 = escapeHtml(String(dup.source_1_label || 'Source 1'));
     const s2 = escapeHtml(String(dup.source_2_label || 'Source 2'));
     if (!exact.length && !partial.length) return '';
-    let html = '';
+    const stackHint = Array.isArray(dup.union_source_stack) && dup.union_source_stack.length
+        ? `<p class="dup-section__hint muted">Union stack order: ${dup.union_source_stack
+              .map((s) => escapeHtml([s.file_name, s.sheet_name].filter(Boolean).join(' · ') || s.source_id || ''))
+              .join(' → ')}. Each duplicate row shows its <strong>File</strong> and <strong>Sheet</strong> — same file + sheet means both rows came from that source&apos;s processed output; different sheets are separate regional tabs stacked together.</p>`
+        : `<p class="dup-section__hint muted">Each duplicate row shows which <strong>File</strong> and <strong>Sheet</strong> it came from after per-source processing.</p>`;
+    const allGroups = [...exact, ...partial];
+    const bleedGroups = allGroups.filter((g) => _dupGroupLikelyContextBleed(g.rows));
+    const bleedBanner = bleedGroups.length
+        ? `<div class="dup-bleed-banner" role="note">
+            <strong>Likely context bleed</strong> — ${bleedGroups.length} duplicate group(s) span different sheets but share the same market/channel.
+            Keys may match because context was copied across sources; check Debug → Pipeline Evals → context trail before treating as true duplicates.
+           </div>`
+        : '';
+    let html = stackHint + bleedBanner;
     if (exact.length) {
         html += `<section class="dup-section" aria-label="Exact duplicate key rows"><h4 class="dup-section__title">Exact duplicates <span class="muted">(same keys and same measures)</span></h4>
             <div class="dup-section__actions dup-section__actions--prominent">
@@ -378,6 +472,9 @@ function _renderDuplicateKeyGroupSections(dup) {
             const gid = escapeAttr(String(g.group_id || ''));
             const glab = escapeHtml(String(g.key_display || gid));
             const cur = _dupDecisionFromPayload(decisions, String(g.group_id), 'exact', 'treat_duplicate');
+            const bleedNote = _dupGroupLikelyContextBleed(g.rows)
+                ? '<p class="dup-bleed-hint muted">Different sheets, same market/channel — may be context bleed, not a true duplicate.</p>'
+                : '';
             html += `<div class="dup-group-card" data-dup-group-card="1" data-dup-gid="${gid}" data-dup-category="exact">
                 <div class="dup-group-card__head">
                     <code class="dup-group-card__keys">${glab}</code>
@@ -386,6 +483,7 @@ function _renderDuplicateKeyGroupSections(dup) {
                         ${_dupChoiceBtn('treat_separate', 'Treat as separate', 'exact-sep', cur === 'treat_separate')}
                     </div>
                 </div>
+                ${bleedNote}
                 <div class="dup-group-card__body">${_renderDupGroupTable(g.rows)}</div>
             </div>`;
         }
@@ -402,6 +500,9 @@ function _renderDuplicateKeyGroupSections(dup) {
             const gid = escapeAttr(String(g.group_id || ''));
             const glab = escapeHtml(String(g.key_display || gid));
             const cur = _dupDecisionFromPayload(decisions, String(g.group_id), 'partial', 'keep_both');
+            const bleedNote = _dupGroupLikelyContextBleed(g.rows)
+                ? '<p class="dup-bleed-hint muted">Different sheets, same market/channel — may be context bleed, not a true duplicate.</p>'
+                : '';
             html += `<div class="dup-group-card" data-dup-group-card="1" data-dup-gid="${gid}" data-dup-category="partial">
                 <div class="dup-group-card__head">
                     <code class="dup-group-card__keys">${glab}</code>
@@ -411,6 +512,7 @@ function _renderDuplicateKeyGroupSections(dup) {
                         ${_dupChoiceBtn('keep_both', 'Keep both (sum)', 'partial-sum', cur === 'keep_both')}
                     </div>
                 </div>
+                ${bleedNote}
                 <div class="dup-group-card__body">${_renderDupGroupTable(g.rows)}</div>
             </div>`;
         }
@@ -551,12 +653,26 @@ function reviewQueueTypeLabel(item) {
     if (item.type === 'destructive_approval') return 'Safety pause';
     if (item.type === 'structural_review') return 'Sheet layout';
     if (item.type === 'checksum_failure') return 'Checksum';
+    if (item.type === 'schema_mismatch') return 'Constraints';
     if (item.type === 'file_relationship_review') return 'File links';
     const td = item.trigger_data || {};
     const hasPlanArtifacts = Boolean(td.approval_items?.length || td.planned_rule_actions?.length);
     if (item.type === 'plan_review' || hasPlanArtifacts) return 'Planner review';
+    if (item.type === 'verification_stall') return 'Stall';
     if (item.checkpoint_id) return 'Checkpoint';
     return 'Confidence';
+}
+
+function pickLatestPendingCheckpointId(items, jobId) {
+    if (!jobId || !Array.isArray(items)) return null;
+    const candidates = items.filter((it) => it.job_id === jobId && it.checkpoint_id);
+    if (!candidates.length) return null;
+    candidates.sort((a, b) => {
+        const ta = new Date(a.created_at || 0).getTime();
+        const tb = new Date(b.created_at || 0).getTime();
+        return tb - ta;
+    });
+    return candidates[0].checkpoint_id;
 }
 
 function pickLatestPlanReviewCheckpointId(items, jobId) {
@@ -582,10 +698,10 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 // ===== API Calls =====
-async function fetchPendingReviews() {
+async function fetchPendingReviews(options = {}) {
     try {
         const data = await fetchJson('/api/review/pending');
-        renderReviewList(data.items || []);
+        await renderReviewList(data.items || [], options);
     } catch (e) {
         console.error('[Review] Error fetching pending reviews:', e);
         showToast('Failed to fetch review queue', 'error');
@@ -639,7 +755,7 @@ async function rejectReview(jobId) {
 }
 
 
-function renderReviewList(items) {
+async function renderReviewList(items, options = {}) {
     const listEl = document.getElementById('reviewQueueList');
     if (!listEl) return;
     reviewState.items = items;
@@ -662,16 +778,20 @@ function renderReviewList(items) {
                 </div>
             `;
         }
+        reviewState.selectedCheckpointId = null;
+        reviewState.selectedJobId = null;
         return;
     }
 
     listEl.innerHTML = items.map((item) => {
-        const confValue = (item.confidence * 100).toFixed(0);
-        const confClass = item.confidence > 0.9 ? 'confidence-high'
-            : (item.confidence > 0.6 ? 'confidence-medium' : 'confidence-low');
+        const confNum = reviewItemConfidence(item);
+        const confValue = formatConfidencePct(confNum);
+        const confClass = confNum > 0.9 ? 'confidence-high'
+            : (confNum > 0.6 ? 'confidence-medium' : 'confidence-low');
         const hasPlanArtifacts = Boolean(item.trigger_data?.approval_items?.length || item.trigger_data?.planned_rule_actions?.length);
         const isPlanReview = item.type === 'plan_review' || hasPlanArtifacts;
         const isCheckpoint = item.type === 'structural_review' || item.type === 'checksum_failure'
+            || item.type === 'schema_mismatch'
             || item.type === 'file_relationship_review' || item.checkpoint_id;
         const rowId = item.checkpoint_id || item.job_id;
         const rowClick = isCheckpoint
@@ -685,7 +805,7 @@ function renderReviewList(items) {
             <button type="button" class="review-item review-queue-card" id="review-item-${rowId}" onclick="${rowClick}">
                 <div class="review-queue-card-top">
                     <span class="review-queue-type">${typeLabel}</span>
-                    <span class="confidence-tag ${confClass}">${confValue}%</span>
+                    <span class="confidence-tag ${confClass}">${confValue}</span>
                 </div>
                 <div class="review-queue-title">${escapeHtml(item.filename || 'Untitled')}</div>
                 <div class="review-queue-snippet">${escapeHtml(truncateReviewSnippet(snippetSource))}</div>
@@ -694,15 +814,35 @@ function renderReviewList(items) {
         `;
     }).join('');
 
-    const selectedPlan = items.find(item => item.checkpoint_id && item.checkpoint_id === reviewState.selectedCheckpointId);
-    const selectedJob = items.find(item => item.job_id && item.job_id === reviewState.selectedJobId);
-    const nextSelection = selectedPlan || selectedJob || items[0];
-    if (nextSelection) {
-        if (nextSelection.checkpoint_id) {
-            showCheckpointDetail(nextSelection.checkpoint_id);
-        } else {
-            showReviewDetail(nextSelection.job_id);
+    if (options.skipAutoSelect) {
+        if (reviewState.selectedCheckpointId) {
+            setActiveReviewRow(reviewState.selectedCheckpointId);
+        } else if (reviewState.selectedJobId) {
+            setActiveReviewRow(reviewState.selectedJobId);
         }
+        return;
+    }
+
+    const stillSelectedCheckpoint = items.find(
+        (item) => item.checkpoint_id && item.checkpoint_id === reviewState.selectedCheckpointId
+    );
+    const stillSelectedJob = items.find(
+        (item) => !item.checkpoint_id && item.job_id === reviewState.selectedJobId
+    );
+    if (stillSelectedCheckpoint) {
+        await showCheckpointDetail(stillSelectedCheckpoint.checkpoint_id);
+        return;
+    }
+    if (stillSelectedJob) {
+        await showReviewDetail(stillSelectedJob.job_id);
+        return;
+    }
+
+    const nextSelection = items[0];
+    if (nextSelection.checkpoint_id) {
+        await showCheckpointDetail(nextSelection.checkpoint_id);
+    } else {
+        await showReviewDetail(nextSelection.job_id);
     }
 }
 
@@ -738,6 +878,10 @@ async function showCheckpointDetail(checkpointId, options = {}) {
         const data = await fetchCheckpointDetails(checkpointId);
         if (data.type === 'file_relationship_review') {
             renderRelationshipReviewContent(data);
+        } else if (data.type === 'checksum_failure') {
+            renderIntegrityReviewContent(data);
+        } else if (data.type === 'schema_mismatch') {
+            renderSchemaConstraintReviewContent(data);
         } else if (data.type === 'plan_review' || data.trigger_data?.approval_items?.length || data.trigger_data?.planned_rule_actions?.length) {
             renderPlanReviewContent(data);
         } else {
@@ -778,37 +922,41 @@ function setActiveReviewRow(id) {
 function renderDestructiveApprovalContent(data) {
     const previews = data.previews || [];
     const detailsEl = document.getElementById('reviewDetails');
-    const previewMarkup = previews.length
-        ? previews.map(p => {
-            const rowCount = Number(p.deleted_count ?? p.total_rows_to_delete ?? 0);
-            const columnCount = Number(p.total_columns_to_delete ?? 0);
-            const impactParts = [];
-            if (rowCount > 0) impactParts.push(`${rowCount} row${rowCount === 1 ? '' : 's'}`);
-            if (columnCount > 0) impactParts.push(`${columnCount} column${columnCount === 1 ? '' : 's'}`);
-            const impactLabel = impactParts.length ? impactParts.join(' and ') : 'No rows or columns would be removed';
-            return `
-                <div class="field-item destructive-preview-card">
-                    <div class="destructive-preview-header">
-                        <strong class="destructive-preview-tool">${escapeHtml(p.tool_name || 'Unknown tool')}</strong>
-                        <span class="field-badge destructive-preview-count">${escapeHtml(impactLabel)}</span>
-                    </div>
-                    <div class="destructive-preview-meta">
-                        ${p.sample_deleted_data && p.sample_deleted_data.length > 0
-                            ? `
-                                <p>Sample of data to be removed:</p>
-                                <div class="destructive-preview-sample">${escapeHtml(JSON.stringify(p.sample_deleted_data[0], null, 2))}</div>
-                            `
-                            : '<p>No sample data available for this operation.</p>'}
-                    </div>
-                </div>
-            `;
-        }).join('')
-        : `
+    const withRemovals = previews.filter((p) => {
+        const rowCount = Number(p.deleted_count ?? p.total_rows_to_delete ?? 0);
+        const columnCount = Number(p.total_columns_to_delete ?? 0);
+        return rowCount > 0 || columnCount > 0;
+    });
+
+    const statsHtml = withRemovals.length
+        ? `<ul class="combine-dedupe-callout__facts combine-dedupe-callout__facts-row">${withRemovals.map((p) => {
+            const label = escapeHtml(p.step_title || p.tool_name || 'Step');
+            const before = Number(p.rows_before || 0);
+            const after = Number(p.rows_after || 0);
+            const removed = Number(p.deleted_count ?? p.total_rows_to_delete ?? 0);
+            const cols = Number(p.total_columns_to_delete ?? 0);
+            const colPart = cols > 0 ? `, ${cols} column${cols === 1 ? '' : 's'}` : '';
+            const rowPart = before && after
+                ? ` (${before} → ${after} rows)`
+                : '';
+            return `<li><code>${label}</code> — would remove <strong>${removed}</strong> row${removed === 1 ? '' : 's'}${colPart}${rowPart}.</li>`;
+        }).join('')}</ul>`
+        : '';
+
+    const visualBlocks = previews
+        .map((p) => _renderDuplicateVisualSample(_buildRemovalVisualSampleFromPreview(p)))
+        .filter(Boolean)
+        .join('');
+
+    const emptyNote = !previews.length
+        ? `
             <div class="empty-state compact">
                 <h3>No destructive changes detected</h3>
                 <p>This pause was raised without any rows or columns marked for removal.</p>
-            </div>
-        `;
+            </div>`
+        : !withRemovals.length
+            ? `<p class="combine-dedupe-callout__note">Destructive steps were planned, but the preview found <strong>no rows or columns</strong> to remove on this sheet sample.</p>`
+            : '';
 
     detailsEl.innerHTML = `
         <div class="review-detail-header">
@@ -822,17 +970,20 @@ function renderDestructiveApprovalContent(data) {
             </div>
         </div>
 
-        <div class="reason-box reason-box-warning">
-            <p><strong>What this is:</strong> The next steps can delete rows or columns.</p>
-            <p class="reason-box-followup">${escapeHtml(data.reason)}</p>
-        </div>
-
-        <div class="preview-section">
-            <h4>Proposed Destructive Operations</h4>
-            <div class="field-list">
-                ${previewMarkup}
+        <section class="planner-review-card combine-dedupe-callout" aria-label="What would be removed">
+            <div class="combine-dedupe-callout__title">What needs your review</div>
+            <p class="combine-dedupe-callout__lead">${escapeHtml(data.reason || 'The next steps can delete rows or columns.')}</p>
+            <ul class="combine-dedupe-callout__help">
+                <li><strong>If you continue:</strong> the rows and columns shown below will be removed.</li>
+                <li><strong>If you stop:</strong> processing halts and your data stays unchanged.</li>
+            </ul>
+            <div class="combine-dedupe-callout__status" role="status">
+                <strong>Removal preview</strong> — approve to apply; stop to keep current data unchanged.
             </div>
-        </div>
+            ${statsHtml}
+            ${emptyNote}
+            ${visualBlocks}
+        </section>
 
         <div class="review-actions">
             <button class="btn-primary destructive-approve-btn" onclick="handleApproveDeletions('${data.job_id}')">
@@ -1017,7 +1168,7 @@ function buildPlannerPlanReadoutHtml(toolCalls) {
     return `
         <section class="planner-review-card planner-plan-readout">
             <h4>What will run</h4>
-            <p class="planner-review-help planner-review-help--tight">Listed in <strong>execution order</strong>. Weekly roll-ups only appear if the planner emitted <code>transform.aggregate_weekly</code> or <code>transform.date_range_to_weekly</code> (otherwise the model chose a different path).</p>
+            <p class="planner-review-help planner-review-help--tight">${toolCalls.length} step${toolCalls.length === 1 ? '' : 's'} in execution order.</p>
             <ol class="planner-plan-readout-list">${items}</ol>
         </section>`;
 }
@@ -1027,7 +1178,7 @@ function buildPlannerNeedsYourOkHtml(approvalItems) {
     return `
         <section class="planner-review-card planner-decisions-card planner-decisions-card--dense">
             <h4 class="planner-decisions-heading">Decisions needed (${approvalItems.length})</h4>
-            <p class="planner-review-help planner-review-help--dense">Only ambiguous or high-impact checks appear here. Pick the option that best matches your file, choose <strong>None of the above — use my notes</strong> when no option fits, or write <strong>at least 15 characters</strong> in notes (notes-only is accepted). Every item needs one of those before <strong>Continue</strong> or <strong>Replan</strong>.</p>
+            <p class="planner-review-help planner-review-help--dense">Pick the option that matches your file, or add notes (15+ characters) if none fit.</p>
             <div class="planner-review-list planner-review-list--dense">
                 ${approvalItems.map((item, index) => {
         const q = item.question || item.summary || item.description || item.reason || item.title || 'Planner question';
@@ -1054,6 +1205,127 @@ function buildPlannerNeedsYourOkHtml(approvalItems) {
         </section>`;
 }
 
+function isExclusionTool(toolName) {
+    const normalized = String(toolName || '').toLowerCase();
+    return ['drop', 'filter', 'exclude', 'remove', 'discard'].some(token => normalized.includes(token));
+}
+
+function renderPlanImpactPreviewPayload(payload) {
+    const mount = document.getElementById('planImpactPreviewMount');
+    if (!mount) return;
+
+    const impacts = Array.isArray(payload?.impacts) ? payload.impacts : [];
+    const destructiveTools = Array.isArray(payload?.destructive_tools) ? payload.destructive_tools : [];
+    const basis = String(payload?.preview_basis || '').trim();
+    const available = Boolean(payload?.preview_available);
+
+    if (!destructiveTools.length) {
+        mount.innerHTML = '';
+        return;
+    }
+
+    const withRemovals = impacts.filter((p) => p.has_removals);
+    const noRemoval = impacts.filter((p) => !p.has_removals);
+
+    let statsHtml = '';
+    if (withRemovals.length) {
+        const statItems = withRemovals.map((p) => {
+            const label = escapeHtml(p.step_title || p.tool_name || 'Step');
+            const before = Number(p.rows_before || 0);
+            const after = Number(p.rows_after || 0);
+            const removed = Math.max(0, before - after);
+            const cols = Number(p.total_columns_to_delete || 0);
+            const colPart = cols > 0 ? `, ${cols} column${cols === 1 ? '' : 's'}` : '';
+            return `<li><code>${label}</code> — would remove <strong>${removed}</strong> row${removed === 1 ? '' : 's'}${colPart} (${before} → ${after} rows).</li>`;
+        }).join('');
+        statsHtml = `<ul class="combine-dedupe-callout__facts combine-dedupe-callout__facts-row">${statItems}</ul>`;
+    }
+
+    const visualBlocks = withRemovals
+        .map((p) => _renderDuplicateVisualSample(p.visual_sample))
+        .filter(Boolean)
+        .join('');
+
+    let emptyNote = '';
+    if (noRemoval.length && !withRemovals.length) {
+        emptyNote = `
+            <p class="combine-dedupe-callout__note">
+                Destructive steps are in the plan, but the preview found <strong>no rows or columns</strong> to remove on this sheet sample.
+                You can continue safely, or replan if that seems wrong.
+            </p>`;
+    } else if (noRemoval.length) {
+        emptyNote = `
+            <p class="combine-dedupe-callout__note muted">
+                Other destructive steps in the plan did not match any rows/columns in the preview.
+            </p>`;
+    }
+
+    const unavailable = !available
+        ? `<p class="combine-dedupe-callout__note">Preview data unavailable: ${escapeHtml(basis || 'could not load sheet sample')}.</p>`
+        : basis
+            ? `<p class="combine-dedupe-callout__verify muted">Preview basis: ${escapeHtml(basis)}</p>`
+            : '';
+
+    mount.innerHTML = `
+        <div class="combine-dedupe-callout__status" role="status">
+            <strong>Removal preview</strong> — approve to apply; replan or cancel to keep current data unchanged.
+        </div>
+        ${unavailable}
+        ${statsHtml}
+        ${emptyNote}
+        ${visualBlocks}
+    `;
+}
+
+async function hydratePlanImpactPreview(checkpointId) {
+    const mount = document.getElementById('planImpactPreviewMount');
+    if (!mount || !checkpointId) return;
+    try {
+        const payload = await fetchJson(`/api/review/checkpoint/${encodeURIComponent(checkpointId)}/plan-impact-preview`);
+        renderPlanImpactPreviewPayload(payload);
+    } catch (e) {
+        mount.innerHTML = `<p class="combine-dedupe-callout__note">Could not load removal preview: ${escapeHtml(e.message || String(e))}</p>`;
+    }
+}
+
+function buildPlannerReviewFocusHtml(pauseReason, toolCalls, approvalItems, checkpointId) {
+    const destructiveSteps = (toolCalls || []).filter((t) => isExclusionTool(t.tool || t.name));
+    const decisionCount = Array.isArray(approvalItems) ? approvalItems.length : 0;
+    const bullets = [];
+
+    if (destructiveSteps.length) {
+        const labels = destructiveSteps.map((t) => planReadoutStepTitle(t)).join(', ');
+        bullets.push(
+            `<li><strong>Data removal:</strong> ${destructiveSteps.length} step${destructiveSteps.length === 1 ? '' : 's'} may delete rows or columns (${escapeHtml(labels)}). Review the impact preview below before continuing.</li>`,
+        );
+    }
+    if (decisionCount > 0) {
+        bullets.push(
+            `<li><strong>Planner decisions:</strong> ${decisionCount} question${decisionCount === 1 ? '' : 's'} need your answer in <em>Decisions needed</em>.</li>`,
+        );
+    }
+    if (!bullets.length) {
+        bullets.push(
+            `<li><strong>Plan sign-off:</strong> Confirm the steps below match your intent before execution starts.</li>`,
+        );
+    }
+    bullets.push(
+        `<li><strong>If you reject:</strong> use <em>Replan with notes</em> or <em>Cancel job</em> — nothing is deleted until you continue.</li>`,
+    );
+
+    const cpAttr = checkpointId ? ` data-checkpoint-id="${escapeAttr(String(checkpointId))}"` : '';
+
+    return `
+        <section class="planner-review-card planner-review-focus combine-dedupe-callout" aria-label="What needs your review">
+            <div class="combine-dedupe-callout__title">What needs your review</div>
+            <p class="combine-dedupe-callout__lead">${escapeHtml(pauseReason)}</p>
+            <ul class="combine-dedupe-callout__help">${bullets.join('')}</ul>
+            <div id="planImpactPreviewMount" class="plan-impact-preview-mount"${cpAttr}>
+                <p class="muted plan-impact-preview-loading">Loading removal preview…</p>
+            </div>
+        </section>`;
+}
+
 function renderPlanReviewContent(data) {
     const plan = data.plan || {};
     const approvalItems = plan.approval_items || data.trigger_data?.approval_items || [];
@@ -1064,28 +1336,22 @@ function renderPlanReviewContent(data) {
     const mappingSummary = data.planning_summary?.mapping_summary || {};
     const excludedColumns = mappingSummary.excluded_columns || [];
     const reasoning = (plan.reasoning || data.trigger_data?.reasoning || '').trim();
-    const cleanupSteps = toolCalls.filter(tool => isExclusionTool(tool.tool || tool.name || ''));
     const reasoningText = reasoning || buildFallbackPlanReasoning(data, toolCalls, expectedColumns, excludedColumns);
     const detailsEl = document.getElementById('reviewDetails');
+    const pauseReason = (data.reason || data.description || 'Planner review required before execution continues.').trim();
 
-    const guidedHtml = buildGuidedSetupSnapshotHtml(data);
     const needsOkHtml = buildPlannerNeedsYourOkHtml(approvalItems);
     const planReadoutHtml = buildPlannerPlanReadoutHtml(toolCalls);
-    const whatToDoHtml = buildPlannerWhatToDoHintHtml(approvalItems.length, toolCalls.length);
-    const ruleActionMismatch = rawRuleSource.length && rawRuleSource.length !== plannedRuleActions.length;
-    const plainBits = [];
-    if (toolCalls.length) plainBits.push(`${toolCalls.length} step${toolCalls.length === 1 ? '' : 's'}`);
-    if (expectedColumns.length) plainBits.push(`${expectedColumns.length} output column${expectedColumns.length === 1 ? '' : 's'}`);
-    if (cleanupSteps.length) plainBits.push(`${cleanupSteps.length} may drop/filter data`);
-    const plainPlanSummary = plainBits.length ? `${plainBits.join(' · ')}.` : 'No executable steps were attached to this plan.';
+    const focusHtml = buildPlannerReviewFocusHtml(pauseReason, toolCalls, approvalItems, data.checkpoint_id);
 
+    const planConf = reviewItemConfidence(data);
     detailsEl.innerHTML = `
         <div class="planner-workspace-shell">
         <div class="planner-sticky-actions review-actions">
-            <button type="button" class="btn-primary btn-approve plan-action-btn" data-plan-action="approve" title="Approve this plan and resume processing. There is no separate Run control on this screen." onclick="submitPlanReview('${data.checkpoint_id}', 'approve')">
+            <button type="button" class="btn-primary btn-approve plan-action-btn" data-plan-action="approve" title="Approve this plan and resume processing." onclick="submitPlanReview('${data.checkpoint_id}', 'approve')">
                 Continue with plan
             </button>
-            <button type="button" class="btn-secondary plan-action-btn" data-plan-action="modify" title="Discard this plan draft, keep your notes and edits below, and ask the planner to try again." onclick="submitPlanReview('${data.checkpoint_id}', 'modify')">
+            <button type="button" class="btn-secondary plan-action-btn" data-plan-action="modify" title="Keep your notes below and ask the planner to try again." onclick="submitPlanReview('${data.checkpoint_id}', 'modify')">
                 Replan with notes
             </button>
             <button type="button" class="btn-danger plan-action-btn" data-plan-action="cancel" title="Stop this job." onclick="submitPlanReview('${data.checkpoint_id}', 'cancel')" style="margin-left: auto;">
@@ -1096,78 +1362,18 @@ function renderPlanReviewContent(data) {
         <div class="planner-inline-titlebar">
             <h2 class="planner-inline-title">${escapeHtml(data.filename)}</h2>
             <div class="planner-inline-meta">
-                <span class="confidence-tag confidence-medium">${(Number(data.confidence || 0.5) * 100).toFixed(0)}% confidence</span>
+                <span class="confidence-tag confidence-medium">${formatConfidencePct(planConf)} confidence</span>
                 <span class="review-detail-job-id">Job ${escapeHtml(data.job_id || '')}</span>
                 <span class="planner-inline-badge">Planner review</span>
             </div>
+            <p class="planner-pause-line"><span class="planner-pause-line-label">Paused:</span> ${escapeHtml(pauseReason)}</p>
         </div>
 
+        ${focusHtml}
         ${planReadoutHtml}
         ${needsOkHtml}
-        ${whatToDoHtml}
-
-        <details class="planner-review-card planner-guided-setup-wrap">
-            <summary>Where this plan comes from (Guided Setup snapshot)</summary>
-            ${guidedHtml}
-        </details>
-
-        <div class="reason-box">
-            <p><strong>Why paused:</strong> ${escapeHtml(data.reason || 'The planner needs a decision before execution continues.')}</p>
-        </div>
 
         <div class="planner-body-stack">
-            <details class="planner-review-card planner-summary-card">
-                <summary>Plan snapshot</summary>
-                <p class="planner-review-help planner-review-help--tight">${escapeHtml(plainPlanSummary)}</p>
-                <div class="planner-summary-grid">
-                    <div class="planner-summary-stat">
-                        <span class="planner-summary-label">Steps</span>
-                        <strong>${toolCalls.length}</strong>
-                    </div>
-                    <div class="planner-summary-stat">
-                        <span class="planner-summary-label">Output cols</span>
-                        <strong>${expectedColumns.length}</strong>
-                    </div>
-                    <div class="planner-summary-stat">
-                        <span class="planner-summary-label">Risky cleanup</span>
-                        <strong>${cleanupSteps.length}</strong>
-                    </div>
-                    <div class="planner-summary-stat">
-                        <span class="planner-summary-label">Rules</span>
-                        <strong>${plannedRuleActions.length}</strong>
-                    </div>
-                </div>
-                <div class="planner-summary-note">
-                    ${cleanupSteps.length > 0
-        ? `Cleanup-related tools: ${escapeHtml(cleanupSteps.map(tool => tool.tool || tool.name || 'step').join(', '))}.`
-        : 'No drop/filter-style tools called out by name on this plan.'}
-                    <div class="planner-summary-footnote">Excluded mapping columns are still removed downstream even if not listed here.</div>
-                    ${ruleActionMismatch ? `<div class="planner-summary-footnote">${rawRuleSource.length} rule row(s) from planner; ${plannedRuleActions.length} mapped to the editor below.</div>` : ''}
-                </div>
-            </details>
-
-            <details class="planner-review-card">
-                <summary>Excluded columns (from mapping)</summary>
-                <p class="planner-review-help planner-review-help--tight">Source columns you marked Exclude in Guided Setup.</p>
-                ${excludedColumns.length
-        ? `<div class="planner-chip-list">${excludedColumns.map(column => `<span class="planner-chip danger">${escapeHtml(column)}</span>`).join('')}</div>`
-        : '<div class="empty-state compact">None recorded on this job snapshot.</div>'}
-            </details>
-
-            <details class="planner-review-card planner-exec-plan-section">
-                <summary>Steps that will run (${toolCalls.length})</summary>
-                <div class="planner-exec-plan-heading" style="margin-bottom: 10px;">
-                    <label class="planner-tech-toggle-label">
-                        <input type="checkbox" id="plannerShowTechnicalSteps" onchange="toggleAllPlannerTechnicalSteps(this.checked)" />
-                        <span>Open technical details on every step</span>
-                    </label>
-                </div>
-                <p class="planner-review-help planner-review-help--tight">Each card summarizes the step; expand technical details to edit tool id, description, or JSON parameters.</p>
-                <div class="planner-tool-list" id="plannerToolList">
-                    ${toolCalls.map((tool, index) => renderPlanToolEditor(tool, index)).join('') || '<div class="empty-state compact">No executable steps on this plan.</div>'}
-                </div>
-            </details>
-
             <details class="planner-review-card" open>
                 <summary>Guidance, expected columns &amp; reasoning</summary>
                 <div class="planner-review-layout">
@@ -1203,6 +1409,262 @@ function renderPlanReviewContent(data) {
         </div>
         </div>
     `;
+
+    if (data.checkpoint_id && (toolCalls || []).some((t) => isExclusionTool(t.tool || t.name))) {
+        void hydratePlanImpactPreview(data.checkpoint_id);
+    } else {
+        const mount = document.getElementById('planImpactPreviewMount');
+        if (mount) mount.innerHTML = '';
+    }
+}
+
+function renderIntegrityReviewContent(data) {
+    const detailsEl = document.getElementById('reviewDetails');
+    const triggerData = data.trigger_data || {};
+    const violation = triggerData.integrity_violation || {};
+    const subtype = violation.subtype || triggerData.subtype || 'integrity';
+    const toolName = violation.tool || triggerData.tool || 'unknown tool';
+    const cols = Array.isArray(violation.columns_affected) ? violation.columns_affected.join(', ') : '';
+    const previewRows = Array.isArray(data.data_preview) ? data.data_preview : [];
+    const previewHtml = renderCheckpointDataPreview(previewRows);
+
+    detailsEl.innerHTML = `
+        <div class="review-detail-header">
+            <div>
+                <h2>${escapeHtml(data.filename || 'Data integrity review')}</h2>
+                <p class="review-detail-subtitle">${escapeHtml(data.title || 'Processing paused for data integrity')}</p>
+            </div>
+            <div class="review-detail-meta">
+                <span class="review-status-chip warning">${escapeHtml(String(data.severity || 'high'))}</span>
+                <span class="review-detail-job-id">Job ${escapeHtml(data.job_id || '')}</span>
+            </div>
+        </div>
+        <div class="reason-box reason-box-warning">
+            <p><strong>What happened:</strong> ${escapeHtml(data.description || data.reason || 'A tool step changed the data in a way that failed integrity checks.')}</p>
+            <p class="reason-box-followup" style="margin-top: 8px;">
+                Tool: <strong>${escapeHtml(toolName)}</strong>
+                ${subtype ? ` · Issue: <strong>${escapeHtml(String(subtype).replace(/_/g, ' '))}</strong>` : ''}
+                ${cols ? ` · Columns: ${escapeHtml(cols)}` : ''}
+            </p>
+        </div>
+        <section class="planner-review-card">
+            <h4 style="margin: 0 0 8px;">Current data preview</h4>
+            <div class="mini-data-preview">${previewHtml}</div>
+        </section>
+        <p class="planner-review-help" style="margin-top: 12px;">
+            <strong>Approve</strong> to continue with the remaining plan steps (integrity checks are suppressed for this resume).
+            <strong>Cancel</strong> stops the job. Open <a href="debug.html">Results</a> for full execution trace.
+        </p>
+        <div class="review-actions">
+            ${renderCheckpointActions(data.checkpoint_id, data.available_actions || ['approve', 'investigate', 'cancel'])}
+        </div>
+    `;
+}
+
+function _constraintDecisionFromPayload(decisions, column, fallback = 'keep_as_is') {
+    if (!decisions || typeof decisions !== 'object') return fallback;
+    const key = String(column || '');
+    if (decisions[key]) return String(decisions[key]);
+    const lower = key.toLowerCase();
+    for (const [k, v] of Object.entries(decisions)) {
+        if (String(k).toLowerCase() === lower) return String(v);
+    }
+    return fallback;
+}
+
+function _constraintChoiceBtn(value, label, selected) {
+    return `<button type="button" class="dup-choice-btn${selected ? ' is-selected' : ''}"
+        data-constraint-action="${escapeAttr(value)}" aria-pressed="${selected ? 'true' : 'false'}">${escapeHtml(label)}</button>`;
+}
+
+function renderSchemaConstraintReviewContent(data) {
+    const detailsEl = document.getElementById('reviewDetails');
+    const triggerData = data.trigger_data || {};
+    const violations = Array.isArray(triggerData.constraint_violations)
+        ? triggerData.constraint_violations
+        : [];
+    const decisions = (data.resolution_data && data.resolution_data.constraint_decisions)
+        || triggerData.constraint_decisions
+        || {};
+    const previewRows = Array.isArray(data.data_preview) ? data.data_preview : [];
+    const previewHtml = renderCheckpointDataPreview(previewRows);
+
+    const cards = violations.map((v, idx) => {
+        const col = String(v.column || `column_${idx}`);
+        const issue = String(v.issue || 'CONSTRAINT').replace(/_/g, ' ');
+        const bound = v.bound ?? v.minimum ?? v.maximum ?? '?';
+        const count = Number(v.violation_count || v.count || 0);
+        const samples = Array.isArray(v.sample_values) ? v.sample_values.slice(0, 5) : [];
+        const cur = _constraintDecisionFromPayload(decisions, col, 'keep_as_is');
+        return `
+            <section class="dup-group-card" data-constraint-column="${escapeAttr(col)}">
+                <div class="dup-group-card__header">
+                    <strong>${escapeHtml(col)}</strong>
+                    <span class="muted">${escapeHtml(issue)} · bound ${escapeHtml(String(bound))} · ${count} value(s)</span>
+                </div>
+                ${samples.length ? `<p class="dup-section__hint muted">Samples: ${escapeHtml(samples.map(String).join(', '))}</p>` : ''}
+                <div class="dup-group-card__toolbar" role="toolbar" aria-label="Decision for ${escapeAttr(col)}">
+                    ${_constraintChoiceBtn('keep_as_is', 'Keep as-is', cur === 'keep_as_is')}
+                    ${_constraintChoiceBtn('clip_to_bound', 'Clip to bound', cur === 'clip_to_bound')}
+                    ${_constraintChoiceBtn('drop_rows', 'Drop rows', cur === 'drop_rows')}
+                </div>
+            </section>
+        `;
+    }).join('');
+
+    detailsEl.innerHTML = `
+        <div class="review-detail-header">
+            <div>
+                <h2>${escapeHtml(data.filename || 'Template constraint review')}</h2>
+                <p class="review-detail-subtitle">${escapeHtml(data.title || 'Values outside template min/max')}</p>
+            </div>
+            <div class="review-detail-meta">
+                <span class="review-status-chip warning">${escapeHtml(String(data.severity || 'high'))}</span>
+                <span class="review-detail-job-id">Job ${escapeHtml(data.job_id || '')}</span>
+            </div>
+        </div>
+        <div class="reason-box reason-box-warning">
+            <p><strong>What happened:</strong> ${escapeHtml(data.description || data.reason || 'Output values violate template minimum/maximum constraints.')}</p>
+            <p class="reason-box-followup" style="margin-top: 8px;">
+                Choose per column: keep negatives/outliers, clip them to the bound, or drop those rows — same style as duplicate review.
+            </p>
+        </div>
+        <section class="dup-section" aria-label="Constraint violations">
+            <h4 class="dup-section__title">Constraint breaches</h4>
+            ${cards || '<p class="muted">No detailed constraint rows were attached.</p>'}
+        </section>
+        <section class="planner-review-card" style="margin-top: 12px;">
+            <h4 style="margin: 0 0 8px;">Current data preview</h4>
+            <div class="mini-data-preview">${previewHtml}</div>
+        </section>
+        <p class="planner-review-help" style="margin-top: 12px;">
+            <strong>Approve</strong> applies your choices and continues.
+            Unspecified columns default to <em>Keep as-is</em>.
+            <strong>Cancel</strong> stops the job.
+        </p>
+        <div class="review-actions">
+            <div class="action-buttons">
+                <button class="btn-action approve" type="button" id="schemaConstraintApproveBtn">Approve</button>
+                <button class="btn-action reject" type="button" id="schemaConstraintCancelBtn">Cancel Job</button>
+            </div>
+        </div>
+    `;
+
+    detailsEl.querySelectorAll('.dup-group-card').forEach((card) => {
+        card.querySelectorAll('[data-constraint-action]').forEach((btn) => {
+            btn.addEventListener('click', () => {
+                card.querySelectorAll('[data-constraint-action]').forEach((b) => {
+                    b.classList.remove('is-selected');
+                    b.setAttribute('aria-pressed', 'false');
+                });
+                btn.classList.add('is-selected');
+                btn.setAttribute('aria-pressed', 'true');
+            });
+        });
+    });
+
+    const approveBtn = document.getElementById('schemaConstraintApproveBtn');
+    const cancelBtn = document.getElementById('schemaConstraintCancelBtn');
+    if (approveBtn) {
+        approveBtn.addEventListener('click', () => submitSchemaConstraintReview(data.checkpoint_id, 'approve'));
+    }
+    if (cancelBtn) {
+        cancelBtn.addEventListener('click', () => submitSchemaConstraintReview(data.checkpoint_id, 'cancel'));
+    }
+}
+
+function collectSchemaConstraintDecisions() {
+    const decisions = {};
+    document.querySelectorAll('.dup-group-card[data-constraint-column]').forEach((card) => {
+        const col = card.getAttribute('data-constraint-column');
+        const selected = card.querySelector('[data-constraint-action].is-selected');
+        decisions[col] = selected
+            ? (selected.getAttribute('data-constraint-action') || 'keep_as_is')
+            : 'keep_as_is';
+    });
+    return decisions;
+}
+
+async function submitSchemaConstraintReview(checkpointId, action) {
+    const resolutionData = action === 'cancel'
+        ? { reason: 'Cancelled from template constraint review' }
+        : { constraint_decisions: collectSchemaConstraintDecisions() };
+    await resolveCheckpoint(checkpointId, action, resolutionData);
+}
+
+function renderVerificationStallContent(data) {
+    const detailsEl = document.getElementById('reviewDetails');
+    const triggerData = data.trigger_data || {};
+    const jobId = data.job_id || '';
+    const sheetName = triggerData.sheet_name || data.sheet_name || '';
+    const sourceId = triggerData.source_id || data.source_id || '';
+    const issues = Array.isArray(triggerData.verifier_issues) ? triggerData.verifier_issues : [];
+    const actions = Array.isArray(data.available_actions) && data.available_actions.length
+        ? data.available_actions
+        : ['accept_as_is', 'retry', 'cancel'];
+    const setupQs = new URLSearchParams();
+    if (jobId) setupQs.set('job_id', jobId);
+    if (sheetName) setupQs.set('sheet_name', sheetName);
+    if (sourceId) setupQs.set('source_id', sourceId);
+    const setupHref = `setup.html${setupQs.toString() ? `?${setupQs.toString()}` : ''}`;
+    const issueList = issues.length
+        ? `<ul class="planner-guided-setup-list">${issues.slice(0, 8).map((issue) => {
+            const text = issue?.description || issue?.issue_type || issue?.summary || JSON.stringify(issue);
+            return `<li>${escapeHtml(String(text))}</li>`;
+        }).join('')}${issues.length > 8 ? '<li>…and more</li>' : ''}</ul>`
+        : '<p class="planner-review-help">No verifier issue list was attached. Use Accept as-is to keep the current output, or Retry to run the latest plan again.</p>';
+
+    detailsEl.innerHTML = `
+        <div class="planner-sticky-actions review-actions">
+            ${renderCheckpointActions(data.checkpoint_id, actions)}
+        </div>
+        <div class="review-detail-header">
+            <div>
+                <h2>${escapeHtml(data.filename || 'Checkpoint')}</h2>
+                <p class="review-detail-subtitle">${escapeHtml(data.title || 'Replanner Escalation')}</p>
+            </div>
+            <div class="review-detail-meta">
+                <span class="confidence-tag confidence-medium">${(Number(data.confidence || 0.5) * 100).toFixed(0)}% confidence</span>
+                <span class="review-detail-job-id">Job ${escapeHtml(jobId)}</span>
+            </div>
+        </div>
+        <div class="reason-box">
+            <p><strong>Why paused:</strong> ${escapeHtml(data.reason || 'Automatic retry stopped.')}</p>
+            ${data.description ? `<p style="margin-top: 8px;">${escapeHtml(data.description)}</p>` : ''}
+        </div>
+        <section class="planner-review-card">
+            <h4 style="margin: 0 0 6px;">Latest verifier issues</h4>
+            ${issueList}
+        </section>
+        <section class="planner-review-card">
+            <div style="display:flex; align-items:center; justify-content: space-between; gap: 12px; flex-wrap: wrap;">
+                <div>
+                    <h4 style="margin: 0;">Mapped output preview</h4>
+                    <p class="planner-review-help" style="margin: 4px 0 0;">Selected / mapped columns from the current processed frame, not the full source sheet.</p>
+                </div>
+                <div style="display:flex; gap:8px; flex-wrap: wrap;">
+                    <button type="button" id="checkpointLoadPreviewBtn" class="btn-secondary btn-sm"
+                        data-checkpoint-id="${escapeAttr(data.checkpoint_id || '')}">
+                        Refresh preview
+                    </button>
+                    <a class="btn-secondary btn-sm" href="${escapeAttr(setupHref)}">Open source in Guided Setup</a>
+                </div>
+            </div>
+            <div id="checkpointSheetPreview" class="mini-data-preview" style="margin-top: 12px;">
+                ${renderCheckpointDataPreview(
+                    Array.isArray(data.data_preview) ? data.data_preview : [],
+                    Array.isArray(data.data_preview_column_order) ? data.data_preview_column_order : [],
+                )}
+            </div>
+        </section>
+    `;
+
+    const loadBtn = document.getElementById('checkpointLoadPreviewBtn');
+    if (loadBtn) {
+        loadBtn.addEventListener('click', () => {
+            loadStallOutputPreview(loadBtn.dataset.checkpointId || data.checkpoint_id || '');
+        });
+    }
 }
 
 function renderCheckpointDetailContent(data) {
@@ -1212,6 +1674,18 @@ function renderCheckpointDetailContent(data) {
     }
     if (data.type === 'file_relationship_review') {
         renderRelationshipReviewContent(data);
+        return;
+    }
+    if (data.type === 'checksum_failure') {
+        renderIntegrityReviewContent(data);
+        return;
+    }
+    if (data.type === 'schema_mismatch') {
+        renderSchemaConstraintReviewContent(data);
+        return;
+    }
+    if (data.type === 'verification_stall') {
+        renderVerificationStallContent(data);
         return;
     }
 
@@ -1400,23 +1874,68 @@ function renderStructuralFindings(td) {
     `;
 }
 
-function renderCheckpointDataPreview(rows) {
+function looksLikeIntegerPreviewKeys(keys) {
+    return Array.isArray(keys) && keys.length > 0 && keys.every((key) => /^\d+$/.test(String(key).trim()));
+}
+
+function looksLikeHeaderPreviewRow(row, keys) {
+    if (!row || !Array.isArray(keys) || keys.length === 0) return false;
+    const named = keys.filter((key) => {
+        const token = String(row[key] ?? '').trim();
+        if (!token || ['nan', 'none', 'null'].includes(token.toLowerCase())) return false;
+        if (/^\d+$/.test(token)) return false;
+        const numeric = Number(token.replace(/,/g, ''));
+        return !Number.isFinite(numeric);
+    }).length;
+    return named >= Math.max(1, Math.floor(0.6 * keys.length));
+}
+
+function renderCheckpointDataPreview(rows, columnOrder) {
     if (!Array.isArray(rows) || rows.length === 0) {
-        return '<div class="empty-state compact" style="padding: 10px;">No preview loaded yet. Click <strong>Load sheet preview</strong> above to fetch the first rows.</div>';
+        return '<div class="empty-state compact" style="padding: 10px;">No processed preview is attached yet. Click <strong>Refresh preview</strong> to load mapped columns.</div>';
     }
-    const columns = Object.keys(rows[0] || {});
+    const columns = Array.isArray(columnOrder) && columnOrder.length
+        ? columnOrder.map(String)
+        : Object.keys(rows[0] || {});
+    const firstRow = rows[0] || {};
+    const promoteHeader = looksLikeIntegerPreviewKeys(columns) && looksLikeHeaderPreviewRow(firstRow, columns);
+    const headers = promoteHeader
+        ? columns.map((key, idx) => String(firstRow[key] ?? '').trim() || `Column ${idx + 1}`)
+        : columns;
+    const bodyRows = promoteHeader ? rows.slice(1) : rows;
     return `
         <table>
             <thead>
-                <tr>${columns.map(c => `<th>${escapeHtml(c)}</th>`).join('')}</tr>
+                <tr>${headers.map(c => `<th>${escapeHtml(c)}</th>`).join('')}</tr>
             </thead>
             <tbody>
-                ${rows.slice(0, 30).map(row => `
+                ${bodyRows.slice(0, 30).map(row => `
                     <tr>${columns.map(c => `<td>${escapeHtml(String(row[c] ?? ''))}</td>`).join('')}</tr>
                 `).join('')}
             </tbody>
         </table>
     `;
+}
+
+async function loadStallOutputPreview(checkpointId) {
+    const container = document.getElementById('checkpointSheetPreview');
+    if (!container) return;
+    if (!checkpointId) {
+        container.innerHTML = '<div class="error">Missing checkpoint id; cannot load preview.</div>';
+        return;
+    }
+    container.innerHTML = '<div class="loading">Loading mapped preview…</div>';
+    try {
+        const data = await fetchJson(`/api/review/checkpoint/${encodeURIComponent(checkpointId)}`);
+        const rows = Array.isArray(data.data_preview) ? data.data_preview : [];
+        container.innerHTML = renderCheckpointDataPreview(
+            rows,
+            Array.isArray(data.data_preview_column_order) ? data.data_preview_column_order : [],
+        );
+    } catch (e) {
+        console.error('[Review] Failed to load stall preview:', e);
+        container.innerHTML = `<div class="error">Failed to load preview: ${escapeHtml(e.message || String(e))}</div>`;
+    }
 }
 
 async function loadCheckpointSheetPreview(jobId, sheetName, sourceId) {
@@ -1441,18 +1960,34 @@ async function loadCheckpointSheetPreview(jobId, sheetName, sourceId) {
             container.innerHTML = '<div class="empty-state compact" style="padding: 10px;">No rows returned for this sheet preview.</div>';
             return;
         }
-        const columns = Array.isArray(data.columns) && data.columns.length
+        const keys = Array.isArray(data.columns) && data.columns.length
             ? data.columns.map(String)
             : Object.keys(rows[0] || {});
+        const firstRow = rows[0] || {};
+        const promoteHeader = looksLikeIntegerPreviewKeys(keys) && looksLikeHeaderPreviewRow(firstRow, keys);
+        const headers = promoteHeader
+            ? keys.map((key, idx) => {
+                const label = String(firstRow[key] ?? '').trim();
+                return label || (Array.isArray(data.column_letters) ? data.column_letters[idx] : '') || `Column ${idx + 1}`;
+            })
+            : (Array.isArray(data.column_letters) && data.column_letters.length === keys.length
+                ? data.column_letters.map(String)
+                : keys);
+        const bodyRows = promoteHeader ? rows.slice(1) : rows;
+        const rangeNote = data.excel_range
+            ? (promoteHeader
+                ? `Range: <code>${escapeHtml(String(data.excel_range))}</code>. First row used as column names.`
+                : `Range: <code>${escapeHtml(String(data.excel_range))}</code>. Column letters are Excel positions; the first data row is often the real header.`)
+            : '';
         container.innerHTML = `
-            ${data.excel_range ? `<p class="planner-review-help" style="margin: 0 0 6px;">Range: <code>${escapeHtml(String(data.excel_range))}</code></p>` : ''}
+            ${rangeNote ? `<p class="planner-review-help" style="margin: 0 0 6px;">${rangeNote}</p>` : ''}
             <table>
                 <thead>
-                    <tr>${columns.map(c => `<th>${escapeHtml(String(c))}</th>`).join('')}</tr>
+                    <tr>${headers.map(c => `<th>${escapeHtml(String(c))}</th>`).join('')}</tr>
                 </thead>
                 <tbody>
-                    ${rows.slice(0, 40).map(row => `
-                        <tr>${columns.map(c => `<td>${escapeHtml(String(row[c] ?? ''))}</td>`).join('')}</tr>
+                    ${bodyRows.slice(0, 40).map(row => `
+                        <tr>${keys.map(c => `<td>${escapeHtml(String(row[c] ?? ''))}</td>`).join('')}</tr>
                     `).join('')}
                 </tbody>
             </table>
@@ -1464,6 +1999,7 @@ async function loadCheckpointSheetPreview(jobId, sheetName, sourceId) {
 }
 
 function renderRelationshipReviewContent(data) {
+    const cpId = data.checkpoint_id || reviewState.selectedCheckpointId || '';
     const detailsEl = document.getElementById('reviewDetails');
     const triggerData = data.trigger_data || {};
     const sources = Array.isArray(triggerData.sources) ? triggerData.sources : [];
@@ -1478,6 +2014,17 @@ function renderRelationshipReviewContent(data) {
         Number.isFinite(c) && c > 0.9 ? 'confidence-high' : Number.isFinite(c) && c > 0.6 ? 'confidence-medium' : 'confidence-low';
     const alignLine = _alignmentColumnsLine(hero, sources);
     const kindLower = String(hero && hero.relationship_kind || '').toLowerCase();
+    const gate = triggerData.pipeline_evals_gate || {};
+    const gateBlocked = gate.pass === false;
+    const gateBanner = gateBlocked ? `
+        <div class="reason-box" style="border-color: var(--danger); background: rgba(239,68,68,0.08); margin-bottom: 16px;">
+            <p><strong>Evals blocked export</strong> — fix critical integrity issues before merging (e.g. context bleed across sheets).</p>
+            <ul style="margin: 8px 0 0; font-size: 0.85rem;">${(gate.blocked_reasons || []).slice(0, 6).map((r) => `<li>${escapeHtml(r)}</li>`).join('')}</ul>
+            <p style="margin-top: 10px; font-size: 0.85rem;">You may <strong>Proceed anyway</strong> with a logged reason (not recommended for production data).</p>
+            <label style="display:block;margin-top:8px;font-size:0.85rem;">Override reason (required to proceed)</label>
+            <input type="text" id="pipelineEvalsOverrideReason" class="planner-rule-input" placeholder="e.g. Analyst verified bleed is acceptable for this draft" />
+        </div>
+    ` : '';
     const colHeading =
         kindLower.includes('union') || kindLower.includes('independent')
             ? 'Column alignment'
@@ -1485,6 +2032,7 @@ function renderRelationshipReviewContent(data) {
 
     detailsEl.innerHTML = `
         <div class="combine-confirm" data-combine-confirm="1">
+            ${gateBanner}
             <div class="combine-confirm-header">
                 <div>
                     <h2 class="combine-confirm-title">Confirm how data will be combined</h2>
@@ -1536,14 +2084,14 @@ function renderRelationshipReviewContent(data) {
 
             <div class="review-actions combine-confirm-actions" data-relationship-review-actions>
                 <div class="relationship-review-actions-row">
-                    <button type="button" class="btn-primary" onclick="submitRelationshipReview('${escapeJsString(data.checkpoint_id)}', 'approve')">Confirm &amp; continue</button>
-                    <button type="button" class="btn-danger btn-iconish" onclick="submitRelationshipReview('${escapeJsString(data.checkpoint_id)}', 'cancel')" title="Stop run">Stop run</button>
+                    <button type="button" class="btn-primary" onclick="submitRelationshipReview('${escapeJsString(cpId)}', 'approve')">${gateBlocked ? 'Proceed anyway' : 'Confirm &amp; continue'}</button>
+                    <button type="button" class="btn-danger btn-iconish" onclick="submitRelationshipReview('${escapeJsString(cpId)}', 'cancel')" title="Stop run">Stop run</button>
                 </div>
             </div>
         </div>
     `;
     _wireCombineChangeDrawer(detailsEl);
-    void hydrateRelationshipSamples(data.checkpoint_id, initialDupMode, {});
+    void hydrateRelationshipSamples(cpId, initialDupMode, {});
 }
 
 function renderColumnDecisionContent(data) {
@@ -1826,7 +2374,14 @@ async function handleReject(jobId) {
 }
 
 // ===== Checkpoint Resolution =====
+function setReviewActionLoading(isLoading) {
+    document.querySelectorAll('.review-actions .btn-action, .planner-sticky-actions .btn-action').forEach((button) => {
+        button.disabled = Boolean(isLoading);
+    });
+}
+
 async function resolveCheckpoint(checkpointId, action, resolutionData = {}) {
+    setReviewActionLoading(true);
     try {
         const result = await fetchJson(`/api/review/checkpoint/${checkpointId}/resolve`, {
             method: 'POST',
@@ -1835,16 +2390,21 @@ async function resolveCheckpoint(checkpointId, action, resolutionData = {}) {
         if (result.success) {
             const message = result.message || `Checkpoint resolved: ${action}`;
             showToast(message, 'success');
-            fetchPendingReviews();
-            if (result.status === 'completed') {
-                document.getElementById('reviewDetails').innerHTML = `
-                    <div class="empty-state">
-                        <div class="empty-icon">✅</div>
-                        <h3>Processing Complete</h3>
-                        <p>The job continued after review and completed successfully.</p>
-                        <button class="btn-primary" onclick="navigateTo('dashboard')" style="margin-top: 16px;">Go to Dashboard</button>
-                    </div>
-                `;
+            if (result.status === 'processing' || result.status === 'queued' || result.status === 'completed') {
+                routeJobByState(result);
+                return;
+            }
+            await fetchPendingReviews({ skipAutoSelect: true });
+            if (result.status === 'awaiting_review') {
+                const targetId = result.next_checkpoint_id
+                    || pickLatestPendingCheckpointId(reviewState.items, result.job_id);
+                if (targetId) {
+                    reviewState.selectedCheckpointId = targetId;
+                    await showCheckpointDetail(targetId, { scrollIntoView: true });
+                }
+            } else if (result.status === 'cancelled') {
+                reviewState.selectedCheckpointId = null;
+                reviewState.selectedJobId = null;
             }
         } else {
             showToast(`Failed: ${result.error}`, 'error');
@@ -1852,6 +2412,8 @@ async function resolveCheckpoint(checkpointId, action, resolutionData = {}) {
     } catch (e) {
         console.error('[Review] Error resolving checkpoint:', e);
         showToast('Failed to resolve checkpoint', 'error');
+    } finally {
+        setReviewActionLoading(false);
     }
 }
 
@@ -1919,26 +2481,20 @@ async function submitPlanReview(checkpointId, action) {
             reviewState.selectedJobId = null;
         }
 
-        await fetchPendingReviews();
+        await fetchPendingReviews({ skipAutoSelect: true });
 
         if (result.status === 'awaiting_review') {
             showToast(result.message || 'Another review is ready.', 'warning');
-            const targetId = result.next_checkpoint_id || pickLatestPlanReviewCheckpointId(reviewState.items, result.job_id);
+            const targetId = result.next_checkpoint_id
+                || pickLatestPendingCheckpointId(reviewState.items, result.job_id)
+                || pickLatestPlanReviewCheckpointId(reviewState.items, result.job_id);
             if (targetId) {
                 reviewState.selectedCheckpointId = targetId;
                 await showCheckpointDetail(targetId, { scrollIntoView: true });
             }
         } else if (result.status === 'completed') {
             showToast(result.message || 'Processing complete.', 'success');
-            const jobIdForNav = result.job_id || reviewState.selectedJobId || getCurrentJob().jobId || '';
-            document.getElementById('reviewDetails').innerHTML = `
-                <div class="empty-state">
-                    <div class="empty-icon">✅</div>
-                    <h3>Processing complete</h3>
-                    <p>The job finished after planner review.</p>
-                    <button type="button" class="btn-primary" onclick="goToProcessingForJob('${escapeJsString(jobIdForNav)}')" style="margin-top: 16px;">Go to Processing</button>
-                </div>
-            `;
+            routeJobByState(result);
         } else if (result.status === 'awaiting_approval') {
             showToast('Plan accepted. Paused again for an approval step.', 'warning');
         } else if (result.status === 'processing' || result.status === 'queued') {
@@ -1973,6 +2529,7 @@ function setRelationshipReviewSubmitting(isSubmitting) {
 }
 
 async function submitRelationshipReview(checkpointId, action) {
+    const effectiveId = reviewState.selectedCheckpointId || checkpointId;
     setRelationshipReviewSubmitting(true);
     try {
         const relationships = Array.from(document.querySelectorAll('[data-relationship-card]')).map((card) => {
@@ -1997,20 +2554,35 @@ async function submitRelationshipReview(checkpointId, action) {
             return rel;
         });
         const analystNotes = document.getElementById('relationshipAnalystNotes')?.value?.trim() || '';
+        const overrideReason = document.getElementById('pipelineEvalsOverrideReason')?.value?.trim() || '';
+        const resolution = {
+            relationships,
+            analyst_notes: analystNotes,
+            reason: analystNotes,
+        };
+        if (overrideReason) {
+            resolution.override_reason = overrideReason;
+            resolution.proceed_anyway = true;
+        }
         if (action === 'approve') {
             showToast('Submitting… combining sources can take a minute. You will be sent to Processing.', 'info');
         }
-        const result = await fetchJson(`/api/review/checkpoint/${checkpointId}/resolve`, {
-            method: 'POST',
-            body: JSON.stringify({
-                action,
-                resolution_data: {
-                    relationships,
-                    analyst_notes: analystNotes,
-                    reason: analystNotes,
-                }
-            })
-        });
+        let result;
+        try {
+            result = await fetchJson(`/api/review/checkpoint/${encodeURIComponent(effectiveId)}/resolve`, {
+                method: 'POST',
+                body: JSON.stringify({
+                    action,
+                    resolution_data: resolution,
+                })
+            });
+        } catch (err) {
+            if (err?.status === 409 && err?.data?.requires_override) {
+                showToast('Critical eval gate blocked export — enter an override reason to proceed anyway.', 'error');
+                return;
+            }
+            throw err;
+        }
         if (!result.success) {
             showToast(`Failed: ${result.error || 'Unable to resolve relationship review'}`, 'error');
             return;
@@ -2021,22 +2593,16 @@ async function submitRelationshipReview(checkpointId, action) {
         }
         const toastKind = result.status === 'cancelled' ? 'warning' : 'success';
         showToast(result.message || 'Relationship review resolved', toastKind);
-        await fetchPendingReviews();
+        await fetchPendingReviews({ skipAutoSelect: true });
         if (result.status === 'processing' || result.status === 'queued') {
             routeJobByState(result);
             return;
         }
         if (result.status === 'completed') {
-            const jobIdForNav = result.job_id || reviewState.selectedJobId || getCurrentJob().jobId || '';
-            document.getElementById('reviewDetails').innerHTML = `
-                <div class="empty-state">
-                    <div class="empty-icon">✅</div>
-                    <h3>Processing Complete</h3>
-                    <p>The approved file relationships were applied and processing finished.</p>
-                    <button type="button" class="btn-primary" onclick="goToProcessingForJob('${escapeJsString(jobIdForNav)}')" style="margin-top: 16px;">Go to Processing</button>
-                </div>
-            `;
-        } else if (result.status === 'cancelled') {
+            routeJobByState(result);
+            return;
+        }
+        if (result.status === 'cancelled') {
             document.getElementById('reviewDetails').innerHTML = `
                 <div class="empty-state">
                     <div class="empty-icon">🛑</div>
@@ -2044,10 +2610,30 @@ async function submitRelationshipReview(checkpointId, action) {
                     <p>This job will not continue.</p>
                 </div>
             `;
+            return;
+        }
+        const nextId = pickLatestPendingCheckpointId(reviewState.items, result.job_id);
+        if (nextId) {
+            reviewState.selectedCheckpointId = nextId;
+            await showCheckpointDetail(nextId, { scrollIntoView: true });
         }
     } catch (e) {
         console.error('[Review] Error submitting relationship review:', e);
-        showToast(e.message || 'Failed to submit relationship review', 'error');
+        const msg = e?.message || String(e);
+        if (msg.includes('Checkpoint not found') || e?.status === 404) {
+            await fetchPendingReviews();
+            const fallbackId = (reviewState.items || []).find(
+                (it) => it.type === 'file_relationship_review' && it.checkpoint_id,
+            )?.checkpoint_id;
+            showToast(
+                fallbackId
+                    ? 'That review item expired (server may have restarted). Select it again from the queue and retry.'
+                    : 'That review item is no longer on the server. Refresh the queue and start a new run if needed.',
+                'error',
+            );
+        } else {
+            showToast(msg || 'Failed to submit relationship review', 'error');
+        }
     } finally {
         setRelationshipReviewSubmitting(false);
     }
@@ -2325,11 +2911,6 @@ function buildFallbackPlanReasoning(data, toolCalls, expectedColumns, excludedCo
     return segments.join(' ') || 'The planner did not return a detailed written rationale for this plan.';
 }
 
-function isExclusionTool(toolName) {
-    const normalized = String(toolName || '').toLowerCase();
-    return ['drop', 'filter', 'exclude', 'remove', 'discard'].some(token => normalized.includes(token));
-}
-
 function setPlanActionLoading(action, isLoading) {
     document.querySelectorAll('.plan-action-btn').forEach(button => {
         if (isLoading) {
@@ -2350,6 +2931,7 @@ function setPlanActionLoading(action, isLoading) {
 }
 
 function renderCheckpointActions(checkpointId, availableActions) {
+    const actions = Array.isArray(availableActions) ? availableActions : [];
     const labels = {
         approve: { label: 'Approve', className: 'approve' },
         modify: { label: 'Revise', className: 'secondary' },
@@ -2371,15 +2953,21 @@ function renderCheckpointActions(checkpointId, availableActions) {
         fix_manually: { label: 'Manual Fix', className: 'secondary' },
         proceed: { label: 'Proceed', className: 'approve' },
         skip_destructive: { label: 'Skip Destructive', className: 'secondary' },
+        skip_verification: { label: 'Skip Verification', className: 'secondary' },
+        retry_with_different_tools: { label: 'Retry', className: 'secondary' },
     };
 
     const priorityOrder = [
         'approve', 'accept', 'accept_as_is', 'accept_with_note', 'proceed',
-        'modify', 'resolve', 'regenerate', 'retry', 'retry_with_hints',
+        'modify', 'resolve', 'regenerate', 'retry', 'retry_with_hints', 'retry_with_different_tools',
         'investigate', 'manual_correction', 'fix_manually', 'select_header_row',
+        'skip_verification',
         'reject', 'skip_sheet', 'ignore', 'rollback', 'cancel', 'skip_destructive'
     ];
-    const orderedActions = priorityOrder.filter(action => availableActions.includes(action));
+    const orderedActions = [
+        ...priorityOrder.filter(action => actions.includes(action)),
+        ...actions.filter(action => !priorityOrder.includes(action)),
+    ];
 
     return `
         <div class="action-buttons">

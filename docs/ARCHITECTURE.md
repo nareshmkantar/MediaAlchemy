@@ -70,6 +70,17 @@ Each node in `sia/agent/nodes.py` is a specialized wrapper around domain logic a
 7. **`verify_output_node`** — validates flatness; **weekly template grain** is enforced here only for **single-source** runs or join-style multi-source paths. For **union batches with deferred weekly rollup**, grain checks are skipped at this node and applied on the combined output after collation.
 8. **`finalize_node`** — emits the final schema and judge summary.
 
+#### Context verification vs output verification
+
+Two verifier layers must not be conflated:
+
+| Component | Module | Purpose |
+|-----------|--------|---------|
+| **ContextVerifier** | `sia/context/verifier.py` | Deterministic, no LLM. Pre-execute plan literals vs scoped fields; post-finalize dimension/metric isolation vs local context and clean template; packet lineage. Gates execution in `execute_tools_node` and finalize in `web_server._finalize_per_source_output_frame`. |
+| **OutputVerifier** | `sia/agent/verifier.py` | LLM-assisted flat-table / schema / template rule checks after tool execution. Replanner consumes its suggestions. Does **not** enforce cross-sheet context scope. |
+
+Pipeline evals surface ContextVerifier failures as `context_grounding_critical`, `dimension_mismatch`, `metric_mismatch`, and `memory_scope`. OutputVerifier issues appear under execution/verification stages.
+
 ### C. Execution Layer
 - **`sia/tools/transformation_tools.py`** implements the pure Python transformation primitives.
 - **`sia/mcp_server.py`** exposes those primitives to the LLM with JSON-safe serialization.

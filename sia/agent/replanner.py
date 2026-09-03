@@ -10,10 +10,60 @@ from .base import ExtractionPlan, VerificationResult, load_prompt_from_file
 from .context_packet import effective_target_date_granularity
 from .llm_handler import LLMCallWrapper, RetryConfig, robust_json_parse, JSONParseError
 from ..debug.llm_observer import get_observer
-from ..tools.tool_validator import validate_tool_sequence, sort_tool_calls_by_pipeline_stage
+from ..tools.tool_validator import (
+    dedupe_redundant_tool_calls,
+    normalize_tool_name,
+    validate_tool_sequence,
+    sort_tool_calls_by_pipeline_stage,
+)
 from ..tools.pipeline_catalog import augment_system_prompt_with_catalog
+from .target_template_utils import normalize_target_template
 
 logger = logging.getLogger(__name__)
+
+
+def tool_plan_fingerprint(tool_calls: List[Dict[str, Any]]) -> str:
+    """Stable semantic identity for a plan, excluding step labels and prose."""
+    canonical: List[Dict[str, Any]] = []
+    for call in tool_calls or []:
+        if not isinstance(call, dict):
+            continue
+        tool, _ = normalize_tool_name(str(call.get("tool") or ""))
+        canonical.append(
+            {
+                "tool": tool,
+                "params": call.get("params") if isinstance(call.get("params"), dict) else {},
+            }
+        )
+    return json.dumps(canonical, sort_keys=True, ensure_ascii=False, default=str)
+
+
+def _enrich_replanned_tools(
+    tool_calls: List[Dict[str, Any]],
+    target_template: Optional[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Fill deterministic template-owned params before tool validation."""
+    template = normalize_target_template(target_template) if target_template else {}
+    column_rules = (
+        list((template.get("business_logic") or {}).get("column_rules") or [])
+        if isinstance(template.get("business_logic"), dict)
+        else []
+    )
+    enriched: List[Dict[str, Any]] = []
+    for call in tool_calls or []:
+        if not isinstance(call, dict):
+            enriched.append(call)
+            continue
+        item = dict(call)
+        params = dict(item.get("params") or {})
+        canonical, _ = normalize_tool_name(str(item.get("tool") or ""))
+        if canonical == "verify.schema" and template.get("properties"):
+            params["schema"] = template
+        elif canonical == "transform.apply_column_rules" and column_rules and not params.get("column_rules"):
+            params["column_rules"] = column_rules
+        item["params"] = params
+        enriched.append(item)
+    return enriched
 
 
 def _format_granularity_alignment_for_replan(alignment: Optional[Dict[str, Any]]) -> str:
@@ -210,8 +260,10 @@ Issues: {verification_result.issues if verification_result else []}
 ### Your Task
 1. Analyze WHY the previous attempts failed
 2. Identify the ROOT CAUSE of the persistent issue
-3. Propose a corrected plan; avoid retrying the exact same failing tool+params, but reuse tools freely when parameters or upstream data justify it
-4. If we're on the last iteration, consider accepting partial success or escalating
+3. Build a fresh, complete tool_calls sequence from the original grid based on the current DataFrame, latest issues, and target template
+4. Treat execution history only as failure evidence; do not copy, append to, or patch the previous tool sequence
+5. Avoid retrying the exact same failing tool+params, but reuse tools freely when parameters or upstream data justify it
+6. If we're on the last iteration, consider accepting partial success or escalating
 
 Respond with JSON containing your analysis and new tool_calls."""
 
@@ -246,7 +298,8 @@ Respond with JSON containing your analysis and new tool_calls."""
                         plan = self._parse_replan_response(
                             response_text,
                             previous_tools,
-                            verification_result=verification_result
+                            verification_result=verification_result,
+                            target_template=target_template,
                         )
                         
                         # Add detail fields for observer UI
@@ -276,7 +329,8 @@ Respond with JSON containing your analysis and new tool_calls."""
                 return self._parse_replan_response(
                     response.text,
                     previous_tools,
-                    verification_result=verification_result
+                    verification_result=verification_result,
+                    target_template=target_template,
                 )
                 
         except Exception as e:
@@ -343,9 +397,10 @@ Respond with JSON containing your analysis and new tool_calls."""
         self,
         response_text: str,
         previous_tools: List[Dict] = None,
-        verification_result: Optional[VerificationResult] = None
+        verification_result: Optional[VerificationResult] = None,
+        target_template: Optional[Dict[str, Any]] = None,
     ) -> ExtractionPlan:
-        """Parse replanner response into ExtractionPlan."""
+        """Parse a fresh, issue-driven replan into an ExtractionPlan."""
         data = {}
         try:
             # Use robust JSON parser
@@ -356,7 +411,6 @@ Respond with JSON containing your analysis and new tool_calls."""
                  logger.warning(f"Replanner response parsed as string, attempting to fix: {data[:100]}...")
                  # Try to force parse if it looks like JSON but was returned as string
                  try:
-                     import json
                      data = json.loads(data)
                  except:
                      pass
@@ -371,27 +425,38 @@ Respond with JSON containing your analysis and new tool_calls."""
             
             # Use safe_get for all field extractions
             tool_calls = safe_get(data, "tool_calls", list)
-            delta_plan = safe_get(data, "delta_plan", dict, {})
-            if not isinstance(delta_plan, dict):
-                delta_plan = {}
-            
-            # Use delta_plan logic if present and we have previous tools
-            if delta_plan and previous_tools and not tool_calls:
-                logger.info("Replanner using delta_plan to modify previous tools")
-                tool_calls = self.apply_delta_plan(previous_tools, delta_plan)
-            elif not tool_calls:
-                 tool_calls = []
+            tool_calls = _enrich_replanned_tools(tool_calls, target_template)
 
-            recommendation = safe_get(data, "recommendation", str, "proceed")
+            strategy = safe_get(data, "strategy", str, "")
+            if not strategy:
+                strategy = safe_get(data, "new_strategy", str, "")
+            recommendation = safe_get(data, "recommendation", str, "")
+            if not recommendation:
+                recommendation = (
+                    strategy
+                    if strategy in {"accept_partial", "escalate_to_human"}
+                    else "proceed"
+                )
             confidence = safe_get(data, "confidence", float, 0.5)
             analysis = safe_get(data, "analysis", str, "")
-            strategy = safe_get(data, "new_strategy", str, "")
+            if not analysis:
+                diagnosis = data.get("diagnosis")
+                if diagnosis:
+                    analysis = json.dumps(diagnosis, ensure_ascii=False)
             
-            # Validate tool calls
+            # Template-owned parameters must exist before validation. Otherwise,
+            # valid calls such as verify.schema are discarded as incomplete.
             validated_tools, validation_errors = validate_tool_sequence(tool_calls)
             valid_tools = [t for t in validated_tools if isinstance(t, dict) and t.get("_valid", True)]
             if valid_tools:
                 valid_tools = sort_tool_calls_by_pipeline_stage(valid_tools)
+                valid_tools, dedupe_notes = dedupe_redundant_tool_calls(valid_tools)
+                if dedupe_notes:
+                    logger.info(
+                        "Replan: dropped %s redundant tool call(s): %s",
+                        len(dedupe_notes),
+                        "; ".join(dedupe_notes[:8]),
+                    )
             if validation_errors:
                 logger.warning(f"Replan tool validation errors: {validation_errors}")
             # region agent log
@@ -448,16 +513,28 @@ Respond with JSON containing your analysis and new tool_calls."""
                 
                 # Extract fields safely using safe_get
                 analysis = safe_get(data, "analysis", str, "")
-                strategy = safe_get(data, "new_strategy", str, "")
-                recommendation = safe_get(data, "recommendation", str, "proceed")
+                strategy = safe_get(data, "strategy", str, "")
+                if not strategy:
+                    strategy = safe_get(data, "new_strategy", str, "")
+                recommendation = safe_get(data, "recommendation", str, "")
+                if not recommendation:
+                    recommendation = (
+                        strategy
+                        if strategy in {"accept_partial", "escalate_to_human"}
+                        else "proceed"
+                    )
                 confidence = safe_get(data, "confidence", float, 0.5)
-                tool_calls = safe_get(data, "tool_calls", list, [])
+                tool_calls = _enrich_replanned_tools(
+                    safe_get(data, "tool_calls", list, []),
+                    target_template,
+                )
                 
                 # Re-validate tool calls
                 validated_tools, _ = validate_tool_sequence(tool_calls)
                 valid_tools = [t for t in validated_tools if isinstance(t, dict) and t.get("_valid", True)]
                 if valid_tools:
                     valid_tools = sort_tool_calls_by_pipeline_stage(valid_tools)
+                    valid_tools, _ = dedupe_redundant_tool_calls(valid_tools)
 
                 return ExtractionPlan(
                     blocks=[],
@@ -483,84 +560,6 @@ Respond with JSON containing your analysis and new tool_calls."""
                 raw_analysis=response_text
             )
     
-    def apply_delta_plan(self, previous_tools: List[Dict], delta_plan: Dict) -> List[Dict]:
-        """
-        Apply delta modifications (replace, insert, remove) to previous tools.
-        Returns a new tool_calls list.
-        """
-        # Strip internal tracking fields from previous tools for a clean new plan
-        clean_tools = []
-        for t in previous_tools:
-            clean_t = {
-                "step": t.get("step"),
-                "tool": t.get("tool"),
-                "params": t.get("params"),
-                "description": t.get("description", "")
-            }
-            clean_tools.append(clean_t)
-            
-        new_tools = list(clean_tools)
-        # Sort by step to ensure order
-        new_tools.sort(key=lambda x: x.get("step", 0))
-        
-        # 1. Handle Removes (By step number)
-        remove_steps = [r.get("step") for r in (delta_plan.get("remove") or [])]
-        new_tools = [t for t in new_tools if t.get("step") not in remove_steps]
-        
-        # 2. Handle Replaces
-        for r in (delta_plan.get("replace") or []):
-            step_to_replace = r.get("step")
-            new_op = r.get("with")
-            if not new_op: continue
-            
-            for i, t in enumerate(new_tools):
-                if t.get("step") == step_to_replace:
-                    new_tools[i] = {
-                        "step": step_to_replace,
-                        "tool": new_op.get("tool"),
-                        "params": new_op.get("params"),
-                        "description": new_op.get("description", t.get("description"))
-                    }
-                    break
-                    
-        # 3. Handle Inserts
-        # insert_after contains {step: int, op: {tool, params}}
-        # Sort inserts by step descending to maintain indexing logic if multiple inserts 
-        # (but here we just append more tools which is safer)
-        for ins in (delta_plan.get("insert_after") or []):
-            after_step = ins.get("step")
-            new_op = ins.get("op")
-            if not new_op: continue
-            
-            insert_idx = -1
-            if after_step == 0: # Insert at beginning
-                insert_idx = 0
-            else:
-                for i, t in enumerate(new_tools):
-                    if t.get("step") == after_step:
-                        insert_idx = i + 1
-                        break
-            
-            if insert_idx != -1:
-                new_tools.insert(insert_idx, {
-                    "tool": new_op.get("tool"),
-                    "params": new_op.get("params"),
-                    "description": new_op.get("description", "Inserted fix")
-                })
-            else:
-                # If step not found, append to end
-                new_tools.append({
-                    "tool": new_op.get("tool"),
-                    "params": new_op.get("params"),
-                    "description": new_op.get("description", "Appended fix")
-                })
-        
-        # Re-index all steps sequentially
-        for i, t in enumerate(new_tools):
-            t["step"] = i + 1
-            
-        return new_tools
-
     def _fallback_plan(
         self, 
         verification_result: Optional[VerificationResult],

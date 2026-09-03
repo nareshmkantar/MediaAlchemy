@@ -9,6 +9,46 @@ from sia.tools.tool_validator import TOOL_SCHEMAS
 from sia.tools.transformation_tools import TransformationTools
 
 
+def test_column_sets_from_job_mapping_use_keep_targets_not_raw_headers():
+    from web_server import column_sets_by_source_from_job_mapping
+
+    job = {
+        "mapping_registry": [
+            {
+                "source_id": "amazon",
+                "source_column": "orderStartDate",
+                "target_column": "date",
+                "decision": "Keep",
+            },
+            {
+                "source_id": "amazon",
+                "source_column": "date",
+                "target_column": "No match",
+                "role": "exclude",
+                "decision": "Discard",
+            },
+            {
+                "source_id": "cm360",
+                "source_column": "Campaign End Date",
+                "target_column": "date",
+                "decision": "Keep",
+            },
+            {
+                "source_id": "cm360",
+                "source_column": "Media Cost",
+                "target_column": "spends",
+                "decision": "Keep",
+            },
+        ]
+    }
+    sets = column_sets_by_source_from_job_mapping(job)
+    assert sets["amazon"] == ["date"]
+    assert sets["cm360"] == ["date", "spends"]
+    report = validate_column_sets_for_union(sets)
+    assert "date" in report["intersection"]
+    assert not any(w.get("code") == "NO_COLUMN_INTERSECTION" for w in report["warnings"])
+
+
 def test_validate_column_sets_for_union_overlap():
     r = validate_column_sets_for_union(
         {"a": ["x", "y"], "b": ["x", "z"]},

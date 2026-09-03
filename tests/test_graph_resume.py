@@ -85,3 +85,48 @@ def test_destructive_resume_skips_to_execute_tools():
         "grid": _FakeGrid(),
     }
     assert resolve_resume_graph_entry(state) == "execute_tools"
+
+
+def test_integrity_resume_preserves_dataframe_and_skips_reload():
+    import pandas as pd
+
+    df = pd.DataFrame([{"impressions": 1}])
+    state = _plan_review_artifacts_state(
+        hitl_resume_from="integrity_review",
+        resume_mode="use_existing_plan",
+        current_df=df,
+        integrity_suppress_checks=True,
+        integrity_pause_tool="transform.rename",
+    )
+    out = prepare_plan_review_resume_state(state)
+    assert out.get("current_df") is df
+    assert out.get("resume_skip_pipeline_after_load") is None
+    assert out.get("resume_graph_from") == "execute_tools"
+    assert resolve_resume_graph_entry(out) == "execute_tools"
+
+
+def test_explicit_finalize_resume_is_honored():
+    state = {
+        "resume_graph_from": "finalize",
+        "hitl_resume_from": "verification_stall",
+        "current_df": object(),
+        "suggested_tools": [{"tool": "transform.rename"}],
+    }
+    assert resolve_resume_graph_entry(state) == "finalize"
+
+
+def test_verification_stall_prepare_keeps_current_df_and_finalize():
+    frame = object()
+    state = {
+        "hitl_resume_from": "verification_stall",
+        "resume_mode": "use_existing_plan",
+        "resume_graph_from": "finalize",
+        "current_df": frame,
+        "structure_analysis": {"tables": [{"label": "Main"}]},
+        "approved_mappings": [{"source_column": "Spend", "target_column": "spends"}],
+        "suggested_tools": [{"tool": "transform.rename"}],
+    }
+    out = prepare_plan_review_resume_state(state)
+    assert out.get("current_df") is frame
+    assert out.get("resume_graph_from") == "finalize"
+    assert not out.get("resume_skip_pipeline_after_load")

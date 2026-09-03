@@ -6,8 +6,10 @@ from sia.agent.context_packet import (
     build_canonical_planning_view,
     build_context_packet,
     compute_date_granularity_alignment,
+    create_source_registry,
     derive_date_context_from_mappings,
     effective_target_date_granularity,
+    is_context_only_sheet_name,
     normalize_mapping_records,
 )
 from sia.agent.job_manager import JobManager
@@ -42,18 +44,21 @@ def test_build_context_packet_summarizes_current_job_context():
         },
         "mapping_registry": [
             {
+                "source_id": "src_001",
                 "source_column": "Event Date",
                 "target_column": "date_paid_media",
                 "decision": "Keep",
                 "target_match_confidence": 0.99,
             },
             {
+                "source_id": "src_001",
                 "source_column": "Total Cost",
                 "target_column": "total_cost_paid_media",
                 "decision": "Keep",
                 "target_match_confidence": 0.98,
             },
             {
+                "source_id": "src_001",
                 "source_column": "Targeting Value",
                 "target_column": "No match",
                 "decision": "Discard",
@@ -265,6 +270,110 @@ def test_apply_context_to_dataframe_renames_formats_and_fills_values():
     assert result["creative_type_paid_media"].tolist() == ["blank-social", "blank-social"]
     assert "applied 3 approved column mappings" in actions
     assert "formatted date_paid_media" in actions
+
+
+def test_apply_context_keeps_renamed_date_when_raw_date_was_excluded():
+    """Amazon DSP: exclude unused ``date``, keep ``orderStartDate`` mapped to ``date``."""
+    df = pd.DataFrame(
+        {
+            "date": ["2026-04-13", "2026-04-14"],
+            "advertiser": ["DEU_ALPRO_ALPRO", "DEU_ALPRO_ALPRO"],
+            "spends": [36000.0, 18000.0],
+            "impressions": [9121572, 975665],
+        }
+    )
+    result, actions = apply_context_to_dataframe(
+        df,
+        approved_mappings=[
+            {"source_column": "orderStartDate", "target_column": "date", "decision": "Keep", "role": "primary"},
+            {"source_column": "date", "target_column": "No match", "role": "exclude", "decision": "Discard"},
+            {"source_column": "orderBudget", "target_column": "spends", "decision": "Keep"},
+            {"source_column": "impressions", "target_column": "impressions", "decision": "Keep"},
+        ],
+    )
+    assert "date" in result.columns
+    assert result["date"].tolist() == ["2026-04-13", "2026-04-14"]
+    assert not any("discarded" in str(a) for a in actions)
+
+
+def test_apply_context_still_drops_raw_date_when_keep_source_is_still_present():
+    """Before rename, unused Amazon ``date`` must still be excluded."""
+    df = pd.DataFrame(
+        {
+            "date": ["2020-01-01"],
+            "orderStartDate": ["2026-04-13"],
+            "impressions": [10],
+        }
+    )
+    result, _actions = apply_context_to_dataframe(
+        df,
+        approved_mappings=[
+            {"source_column": "orderStartDate", "target_column": "date", "decision": "Keep", "role": "primary"},
+            {"source_column": "date", "target_column": "No match", "role": "exclude", "decision": "Discard"},
+            {"source_column": "impressions", "target_column": "impressions", "decision": "Keep"},
+        ],
+    )
+    assert "orderStartDate" in result.columns or "date" in result.columns
+    # Raw excluded ``date`` is dropped; keep source is then renamed to ``date``.
+    assert result["date"].tolist() == ["2026-04-13"]
+    assert "orderStartDate" not in result.columns
+
+
+def test_apply_context_still_drops_excluded_source_that_is_not_a_keep_target():
+    df = pd.DataFrame({"orderId": ["abc"], "impressions": [10]})
+    result, _actions = apply_context_to_dataframe(
+        df,
+        approved_mappings=[
+            {"source_column": "orderId", "target_column": "No match", "role": "exclude", "decision": "Discard"},
+            {"source_column": "impressions", "target_column": "impressions", "decision": "Keep"},
+        ],
+    )
+    assert "orderId" not in result.columns
+    assert "impressions" in result.columns
+
+
+def test_apply_context_can_skip_exclude_after_tools_already_renamed():
+    df = pd.DataFrame({"date": ["2026-04-13"], "spends": [10.0], "impressions": [1]})
+    result, actions = apply_context_to_dataframe(
+        df,
+        approved_mappings=[
+            {"source_column": "orderStartDate", "target_column": "date", "decision": "Keep"},
+            {"source_column": "date", "target_column": "No match", "role": "exclude", "decision": "Discard"},
+        ],
+        drop_excluded=False,
+    )
+    assert result["date"].tolist() == ["2026-04-13"]
+    assert not any("discarded" in str(a) for a in actions)
+
+
+def test_apply_context_drops_role_exclude_even_if_decision_is_keep():
+    df = pd.DataFrame(
+        {
+            "Campaign End Date": ["2024-12-15"],
+            "orderId": ["abc"],
+            "impressions": [10],
+        }
+    )
+    result, actions = apply_context_to_dataframe(
+        df,
+        approved_mappings=[
+            {"source_column": "orderid", "target_column": "No match", "role": "exclude", "decision": "Keep"},
+            {"source_column": "impressions", "target_column": "impressions", "decision": "Keep"},
+        ],
+    )
+    assert "orderId" not in result.columns
+    assert "impressions" in result.columns
+    assert any("discarded" in str(a) for a in actions)
+
+
+def test_normalize_mapping_records_coerces_exclude_role_to_discard():
+    rows = normalize_mapping_records(
+        [{"column_name": "orderExternalId", "role": "exclude", "decision": "Keep", "target_column": "order_id"}],
+        source_id="src_1",
+    )
+    assert rows[0]["decision"] == "Discard"
+    assert rows[0]["role"] == "exclude"
+    assert rows[0]["target_column"] == "No match"
 
 
 def test_job_manager_persists_context_registries_by_sheet():
@@ -702,12 +811,14 @@ def test_canonical_planning_view_merges_mapping_supplement_into_full_context():
             }
         ],
         "mapping_registry": [
-            {"source_column": "Spend", "target_column": "spends", "decision": "Keep"}
+            {"source_id": "s1", "source_column": "Spend", "target_column": "spends", "decision": "Keep"}
         ],
         "business_rules_registry": [],
         "approved_file_relationships": [{"relationship_id": "r1", "status": "approved"}],
     }
-    packet = build_context_packet(job, target_template={"properties": {}}, selected_sheet="Main")
+    packet = build_context_packet(
+        job, target_template={"properties": {}}, selected_sheet="Main", selected_source_id="s1"
+    )
 
     view = build_canonical_planning_view(
         packet,
@@ -776,3 +887,175 @@ def test_planning_summary_does_not_flag_supporting_targets_unresolved_when_mappe
     packet = build_context_packet(job, target_template=target_template, selected_sheet="Raw")
     summary = ContextPacket(**packet).planning_summary()
     assert "region" not in (summary.get("mapping_summary") or {}).get("unresolved_target_columns", [])
+
+
+def test_merge_plan_review_context_packet_overlays_decisions_on_fresh():
+    from sia.agent.context_packet import merge_plan_review_context_packet
+
+    fresh = {
+        "job_id": "j1",
+        "approved_mappings": [
+            {"source_column": "Spend_A", "target_column": "spends", "decision": "Keep"},
+            {"source_column": "Spend_B", "target_column": "spends", "decision": "Keep"},
+        ],
+        "approved_layout": {"header_row": 3},
+        "business_rules": [{"target_column": "date", "rule_type": "iso_date"}],
+    }
+    saved = {
+        "resolved_planner_decisions": [{"analyst_confirm": "single_column", "target_column": "spends"}],
+        "planner_decision_notes": ["Use Spend_A only"],
+        "duplicate_target_mappings": {"spends": ["Spend_A", "Spend_B"]},
+        "approved_mappings": [
+            {"source_column": "Spend_A", "target_column": "spends", "decision": "Keep", "role": "primary"},
+            {"source_column": "Spend_B", "target_column": "No match", "decision": "Discard"},
+        ],
+        "approved_layout": {"header_row": 1},
+    }
+
+    merged = merge_plan_review_context_packet(fresh, saved)
+
+    assert merged["resolved_planner_decisions"][0]["analyst_confirm"] == "single_column"
+    assert merged["planner_decision_notes"] == ["Use Spend_A only"]
+    assert merged["duplicate_target_mappings"]["spends"] == ["Spend_A", "Spend_B"]
+    assert merged["approved_layout"]["header_row"] == 3
+    assert merged["business_rules"] == fresh["business_rules"]
+    by_src = {m["source_column"]: m for m in merged["approved_mappings"]}
+    assert by_src["Spend_A"]["role"] == "primary"
+    assert by_src["Spend_B"]["decision"] == "Discard"
+    assert by_src["Spend_B"]["target_column"] == "No match"
+
+
+def test_merge_plan_review_context_packet_fresh_mapping_wins_new_columns():
+    from sia.agent.context_packet import merge_plan_review_context_packet
+
+    fresh = {
+        "approved_mappings": [
+            {"source_column": "Spend_A", "target_column": "spends", "decision": "Keep"},
+            {"source_column": "New_Col", "target_column": "channel", "decision": "Keep"},
+        ],
+    }
+    saved = {
+        "resolved_planner_decisions": [{"analyst_confirm": "yes"}],
+        "approved_mappings": [
+            {"source_column": "Spend_A", "target_column": "spends", "decision": "Keep"},
+        ],
+    }
+
+    merged = merge_plan_review_context_packet(fresh, saved)
+    names = {m["source_column"] for m in merged["approved_mappings"]}
+    assert "New_Col" in names
+    assert merged["resolved_planner_decisions"]
+
+
+def test_merge_plan_review_context_packet_job_fallback_decisions():
+    from sia.agent.context_packet import merge_plan_review_context_packet
+
+    fresh = {"approved_mappings": []}
+    job = {"resolved_planner_decisions": [{"analyst_confirm": "combine_sources"}]}
+
+    merged = merge_plan_review_context_packet(fresh, {}, job=job)
+    assert merged["resolved_planner_decisions"][0]["analyst_confirm"] == "combine_sources"
+
+
+def test_merge_plan_review_never_bleeds_saved_interpreted_context():
+    from sia.agent.context_packet import merge_plan_review_context_packet
+
+    fresh = {
+        "lineage": {"source_id": "radio-de", "sheet_name": "Radio_DE"},
+        "interpreted_context": {
+            "fields": {"market": "DE"},
+            "scoped_fields": {"market": {"value": "DE", "scope": "block", "source_id": "radio-de"}},
+        },
+        "context_block_snippets": [{"block_label": "Meta DE"}],
+        "approved_mappings": [],
+    }
+    saved = {
+        "lineage": {"source_id": "digital-uk", "sheet_name": "Digital_UK"},
+        "interpreted_context": {
+            "fields": {"market": "UK"},
+            "scoped_fields": {"market": {"value": "UK", "scope": "block", "source_id": "digital-uk"}},
+        },
+        "context_block_snippets": [{"block_label": "Meta UK"}],
+        "resolved_planner_decisions": [{"analyst_confirm": "yes"}],
+    }
+    merged = merge_plan_review_context_packet(fresh, saved)
+    assert merged["interpreted_context"]["fields"]["market"] == "DE"
+    assert merged["context_block_snippets"][0]["block_label"] == "Meta DE"
+    assert merged["resolved_planner_decisions"][0]["analyst_confirm"] == "yes"
+
+
+def test_is_context_only_sheet_name_notes_global():
+    assert is_context_only_sheet_name("Notes_Global") is True
+    assert is_context_only_sheet_name("notes") is True
+    assert is_context_only_sheet_name("Digital_UK") is False
+
+
+def test_create_source_registry_marks_notes_global_as_reference():
+    registry = create_source_registry(
+        "/tmp/CP-07.xlsx",
+        "CP-07_08_multisheet_context_isolation.xlsx",
+        sheets=["Digital_UK", "Notes_Global"],
+        job_id="job_cp07",
+    )
+    by_sheet = {row["sheet_name"]: row for row in registry}
+    assert by_sheet["Digital_UK"]["contains_main_data"] is True
+    assert by_sheet["Digital_UK"]["contains_reference_data"] is False
+    assert by_sheet["Notes_Global"]["contains_main_data"] is False
+    assert by_sheet["Notes_Global"]["contains_reference_data"] is True
+
+
+def test_refresh_job_source_context_flags_updates_stale_registry():
+    from sia.agent.context_packet import refresh_job_source_context_flags, source_registry_entry_is_main_data
+
+    job = {
+        "source_registry": [
+            {
+                "source_id": "a:Notes_Global",
+                "sheet_name": "Notes_Global",
+                "contains_main_data": True,
+                "contains_reference_data": False,
+            }
+        ]
+    }
+    refresh_job_source_context_flags(job)
+    row = job["source_registry"][0]
+    assert row["contains_main_data"] is False
+    assert row["contains_reference_data"] is True
+    assert source_registry_entry_is_main_data(row) is False
+
+
+def test_metadata_layout_excludes_source_from_processing():
+    from sia.agent.context_packet import (
+        refresh_job_source_context_flags,
+        source_is_main_data_for_processing,
+    )
+
+    job = {
+        "source_registry": [
+            {
+                "source_id": "job:file:Validation_Rules",
+                "sheet_name": "Validation_Rules",
+                "contains_main_data": True,
+                "contains_reference_data": False,
+            },
+            {
+                "source_id": "job:file:UK_TV_Spend",
+                "sheet_name": "UK_TV_Spend",
+                "contains_main_data": True,
+                "contains_reference_data": False,
+            },
+        ],
+        "layout_registry": [
+            {
+                "source_id": "job:file:Validation_Rules",
+                "block_category": "Main Data",
+                "decision": "context",
+            }
+        ],
+    }
+    refresh_job_source_context_flags(job)
+    val = job["source_registry"][0]
+    assert val["contains_main_data"] is False
+    assert val["contains_reference_data"] is True
+    assert source_is_main_data_for_processing(job, val) is False
+    assert source_is_main_data_for_processing(job, job["source_registry"][1]) is True

@@ -7,8 +7,9 @@ import json
 import copy
 import uuid
 import logging
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from flask import Flask, request, jsonify, send_from_directory, send_file, redirect, make_response
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
@@ -25,9 +26,23 @@ from sia.agent.orchestrator import StructureInferenceAgent
 from datetime import datetime, date, timezone
 from enum import Enum
 from sia.utils.logger import setup_logging
-from sia.utils.df_preview import dataframe_to_preview_records
+from sia.utils.df_preview import (
+    dataframe_to_preview_records,
+    mapped_preview_column_names,
+    promote_numeric_header_row_for_preview,
+)
+from sia.agent.json_safe import sanitize_json_tree
 from sia.agent.job_manager import job_manager
-from sia.agent.context_packet import ContextPacket, build_context_packet
+from sia.modules.csv_workbook import CsvConversionError, convert_csv_to_xlsx
+from sia.agent.context_packet import (
+    ContextPacket,
+    build_canonical_planning_view,
+    build_context_packet,
+    mapping_is_excluded,
+    refresh_job_source_context_flags,
+    source_is_main_data_for_processing,
+    source_registry_entry_is_main_data,
+)
 from sia.agent.hitl import CheckpointType, HITLManager
 from sia.agent.parent_collation_graph import (
     build_suggested_duplicate_key_decisions,
@@ -42,6 +57,7 @@ from sia.agent.relationships import (
     collate_frames,
     collate_frames_detailed,
     propose_file_relationships,
+    refresh_union_join_keys_in_proposals,
     union_stack_break_row_indices,
     _collate_frames_baseline,
     _normalize_frames_keys,
@@ -55,12 +71,23 @@ from sia.agent.artifact_exports import (
 )
 from sia.agent.schema_mapper import SchemaMapper
 from sia.agent.demarcator import StructureDemarcator
+from sia.agent.sheet_layout_class import format_cell_display
 from collections import OrderedDict
 
 from sia.agent.scoped_source import build_scoped_source, load_raw_sheet_dataframe, load_scoped_dataframe
+from sia.agent.layout_standardize import (
+    get_standardize_meta,
+    load_visual_grid_dataframe,
+    needs_standardize_step,
+    standardize_messy_layout,
+    store_standardize_on_job,
+    try_load_standardized_dataframe,
+    write_standardized_workbook,
+)
 from sia.agent.materialized_clean_sheet import (
     refresh_materialized_clean_templates,
     resolve_processing_workbook,
+    scoped_source_for_materialized_workbook,
 )
 from sia.agent.job_run_ledger import (
     clear_multi_source_ledger,
@@ -76,6 +103,7 @@ from sia.agent.multi_block_sheet import (
     resolve_block_run,
 )
 from sia.agent.target_template_utils import (
+    is_no_match_target,
     mapping_target_columns_for_ui,
     normalize_target_template,
     primary_target_columns,
@@ -1023,6 +1051,271 @@ SNAPSHOT_FOLDER.mkdir(parents=True, exist_ok=True)
 LOG_FOLDER.mkdir(parents=True, exist_ok=True)
 LEGACY_TOOL_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
+# Tier-1 production defaults (override via env)
+JOB_RETENTION_WARN_COUNT = int(os.environ.get("SIA_JOB_RETENTION_WARN", "15"))
+
+
+def _is_production_deploy() -> bool:
+    """True on Render/PaaS or when SIA_PRODUCTION is set."""
+    if os.environ.get("RENDER"):
+        return True
+    flag = str(os.environ.get("SIA_PRODUCTION", "")).strip().lower()
+    return flag in ("1", "true", "yes", "on")
+
+
+def _resolve_debug_enabled(persisted: Optional[bool] = None) -> bool:
+    """Debug off in production unless SIA_DEBUG_ENABLED=true."""
+    env = os.environ.get("SIA_DEBUG_ENABLED")
+    if env is not None and str(env).strip() != "":
+        return str(env).strip().lower() in ("1", "true", "yes", "on")
+    if _is_production_deploy():
+        return False
+    if persisted is not None:
+        return bool(persisted)
+    return False
+
+
+def _finalize_per_source_output_frame(
+    df: Any,
+    *,
+    job: Dict[str, Any],
+    context_packet: Dict[str, Any],
+    source_id: str,
+    multi_source_batch: bool,
+    job_id: Optional[str] = None,
+) -> Any:
+    """Apply clean-template metric alignment, then source-local dimension stamping."""
+    from sia.evals.runner import PipelineEvalRunner
+    from sia.context.verifier import ContextVerifier
+    from sia.context.stamp_policy import context_ambiguity_requires_hitl
+    from sia.context.artifacts import persist_finalize_output_frame
+    from sia.integrity.context_isolation import (
+        align_output_metrics_to_clean_template,
+        apply_local_context_dimensions,
+        has_context_packet_lineage,
+    )
+
+    if df is None or getattr(df, "empty", True):
+        return df
+    out = df
+    if multi_source_batch:
+        out = align_output_metrics_to_clean_template(out, job, str(source_id))
+    jid = str(job_id or job.get("id") or "")
+    approvals = job.get("context_ambiguity_approvals")
+    if not isinstance(approvals, dict):
+        approvals = {}
+        job["context_ambiguity_approvals"] = approvals
+    sid = str(source_id)
+    if (
+        has_context_packet_lineage(context_packet)
+        and context_ambiguity_requires_hitl(context_packet, job)
+        and not approvals.get(sid)
+    ):
+        _queue_context_ambiguity_review(jid, job, context_packet, sid)
+    elif has_context_packet_lineage(context_packet):
+        out = apply_local_context_dimensions(
+            out,
+            context_packet,
+            job=job,
+            source_id=sid,
+        )
+    else:
+        logger.warning(
+            "[CONTEXT] source %s missing lineage.sheet_name on context_packet; skipping dimension stamp",
+            source_id,
+        )
+    ctx_fp = str(context_packet.get("context_fingerprint") or "")
+    try:
+        persist_finalize_output_frame(
+            job,
+            source_id=sid,
+            frame=out,
+            context_fingerprint=ctx_fp,
+        )
+    except Exception:
+        logger.debug("persist_finalize_output_frame failed", exc_info=True)
+    report = ContextVerifier.assess_output_frame(
+        out,
+        context_packet,
+        job=job,
+        source_id=sid,
+    )
+    PipelineEvalRunner.ensure(job)
+    PipelineEvalRunner.record_context_isolation(
+        job,
+        sid,
+        frame=out,
+        context_packet=context_packet,
+        precomputed=report,
+    )
+    PipelineEvalRunner.record_context_hop_eval(job, sid)
+    # Legacy flat flag for older UI paths
+    per_source = dict((job.get("pipeline_evals") or {}).get("per_source") or {})
+    job.setdefault("pipeline_evals", {})["context_isolation_pass"] = all(
+        bool((row.get("context_isolation") or row).get("pass", row.get("pass")))
+        for row in per_source.values()
+        if isinstance(row, dict)
+    )
+    if not report.get("pass"):
+        logger.warning(
+            "[CONTEXT] source %s isolation violations: %s",
+            source_id,
+            [v.get("message") for v in (report.get("violations") or [])[:3]],
+        )
+    return out
+
+
+def _pipeline_eval_gate_blocks(job: Dict[str, Any]) -> bool:
+    from sia.evals.runner import PipelineEvalRunner
+
+    return PipelineEvalRunner.critical_gate_blocks(job)
+
+
+def _pipeline_eval_gate_payload(job: Dict[str, Any]) -> Dict[str, Any]:
+    from sia.evals.runner import PipelineEvalRunner
+
+    pe = PipelineEvalRunner.ensure(job)
+    return dict(pe.get("critical_gate") or {"pass": True, "blocked_reasons": []})
+
+
+def _build_eval_display_for_job(job: Dict[str, Any]) -> Dict[str, Any]:
+    from sia.evals.display import build_eval_display
+
+    return build_eval_display(job) if isinstance(job, dict) else {}
+
+
+def _collect_job_judge_result(job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Judge result from job trace, pipeline_evals mirror, or per-source runs."""
+    pe = job.get("pipeline_evals") if isinstance(job.get("pipeline_evals"), dict) else {}
+    pe_judge = pe.get("judge") if isinstance(pe.get("judge"), dict) else {}
+    if pe_judge.get("aggregate"):
+        return pe_judge["aggregate"]
+    if pe_judge.get("per_source"):
+        per = pe_judge["per_source"]
+        if isinstance(per, dict) and per:
+            # Prefer last source with a verdict; expose per_source on aggregate copy
+            for row in reversed(list(per.values())):
+                if isinstance(row, dict) and row.get("verdict"):
+                    agg = dict(row)
+                    agg["per_source"] = per
+                    return agg
+    trace = job.get("trace") if isinstance(job.get("trace"), dict) else {}
+    jr = trace.get("judge_result") if isinstance(trace, dict) else None
+    if jr:
+        return jr
+    per_source_judges: Dict[str, Any] = {}
+    for run in list(job.get("source_traces") or []):
+        if not isinstance(run, dict):
+            continue
+        tr = run.get("trace") if isinstance(run.get("trace"), dict) else {}
+        sid = str(run.get("source_id") or "")
+        if tr.get("judge_result"):
+            jr = tr.get("judge_result")
+            if sid:
+                per_source_judges[sid] = jr
+    if per_source_judges:
+        last = list(per_source_judges.values())[-1]
+        if isinstance(last, dict):
+            agg = dict(last)
+            agg["per_source"] = per_source_judges
+            return agg
+    source_runs = trace.get("source_runs") if isinstance(trace, dict) else None
+    if isinstance(source_runs, list):
+        for run in source_runs:
+            if not isinstance(run, dict):
+                continue
+            tr = run.get("trace") if isinstance(run.get("trace"), dict) else {}
+            if tr.get("judge_result"):
+                jr = tr.get("judge_result")
+    return jr
+
+
+def _job_visible_in_evals(job: Dict[str, Any]) -> bool:
+    if _collect_job_judge_result(job):
+        return True
+    if job.get("pipeline_evals"):
+        return True
+    if job.get("trace") or job.get("source_traces"):
+        return True
+    status = str(job.get("status") or "").lower()
+    return status in {
+        "completed",
+        "awaiting_review",
+        "awaiting_approval",
+        "processing",
+        "error",
+    }
+
+
+def _collect_snapshot_basenames_from_job(job: Optional[Dict[str, Any]]) -> Set[str]:
+    """Snapshot CSV basenames referenced by job debug metadata."""
+    names: Set[str] = set()
+    if not isinstance(job, dict):
+        return names
+
+    def _add(val: Any) -> None:
+        if not val:
+            return
+        names.add(Path(str(val)).name)
+
+    for event in list(job.get("debug_events") or []):
+        if isinstance(event, dict):
+            _add(event.get("snapshot_path"))
+            for child in list(event.get("children") or []):
+                if isinstance(child, dict):
+                    _add(child.get("snapshot_path"))
+
+    for row in list(job.get("llm_traces") or []):
+        if isinstance(row, dict):
+            _add(row.get("snapshot_path"))
+
+    for row in list(job.get("state_snapshots") or []):
+        if isinstance(row, dict):
+            _add(row.get("snapshot_path"))
+
+    trace = job.get("trace")
+    if isinstance(trace, dict):
+        for step in list(trace.get("steps") or []):
+            if isinstance(step, dict):
+                _add(step.get("snapshot_path"))
+
+    return names
+
+
+def _delete_tool_snapshots_for_job(job_id: str, job: Optional[Dict[str, Any]] = None) -> List[str]:
+    """Remove per-job tool CSV snapshots from runtime/snapshots."""
+    deleted: List[str] = []
+    seen: Set[str] = set()
+
+    for basename in _collect_snapshot_basenames_from_job(job):
+        resolved = _resolve_debug_snapshot_file(basename)
+        if resolved and str(resolved) not in seen:
+            seen.add(str(resolved))
+            try:
+                resolved.unlink(missing_ok=True)
+                deleted.append(str(resolved))
+            except OSError as e:
+                logger.warning("[JOBS] Failed to delete snapshot %s: %s", resolved, e)
+
+    # Job-prefixed snapshots (current naming convention)
+    prefix = f"{job_id}_"
+    for base in (SNAPSHOT_FOLDER,):
+        try:
+            for path in base.glob(f"{prefix}*.csv"):
+                key = str(path.resolve())
+                if key in seen:
+                    continue
+                seen.add(key)
+                try:
+                    path.unlink(missing_ok=True)
+                    deleted.append(key)
+                except OSError as e:
+                    logger.warning("[JOBS] Failed to delete snapshot %s: %s", path, e)
+        except OSError:
+            continue
+
+    return deleted
+
 
 def _resolve_debug_snapshot_file(safe_name: str) -> Optional[Path]:
     """Resolve a snapshot basename under runtime/snapshots or legacy repo/output."""
@@ -1177,10 +1470,70 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
+def _parse_and_validate_target_template_upload(file) -> Tuple[Optional[Dict[str, Any]], bytes, str]:
+    """Parse an uploaded target template and validate runtime shape.
+
+    Returns ``(normalized_template, raw_bytes, error_message)``. On success the
+    error message is empty.
+    """
+    try:
+        raw = file.read()
+    except Exception as e:
+        return None, b"", f"Failed to read template file: {e}"
+    if not raw or not str(raw, "utf-8", errors="replace").strip():
+        return None, raw or b"", "Template file is empty"
+    try:
+        text = raw.decode("utf-8-sig")
+        tpl = json.loads(text)
+    except UnicodeDecodeError:
+        return None, raw, "Template must be UTF-8 encoded JSON"
+    except json.JSONDecodeError as e:
+        return None, raw, f"Invalid JSON: {e}"
+    if not isinstance(tpl, dict):
+        return None, raw, "Template must be a JSON object"
+    normalized = normalize_target_template(tpl)
+    ok, err = validate_template_shape(normalized)
+    if not ok:
+        return None, raw, err or "Invalid target template shape"
+    return normalized, raw, ""
+
+
 def safe_serialize_df(df):
     """Convert DataFrame to JSON-safe dicts with keys in frame column order."""
     _, records = dataframe_to_preview_records(df)
     return records
+
+
+def _stall_output_preview(
+    job: Dict[str, Any],
+    pending_state: Dict[str, Any],
+    context_packet: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Preview the current processed frame, limited to mapped/selected columns."""
+    df = (pending_state or {}).get("current_df")
+    if df is None or getattr(df, "empty", True):
+        df = (pending_state or {}).get("last_valid_checkpoint")
+    if df is None or getattr(df, "empty", True):
+        return [], []
+    preview_df = promote_numeric_header_row_for_preview(df)
+    mappings = list((pending_state or {}).get("approved_mappings") or [])
+    packet = context_packet if isinstance(context_packet, dict) else {}
+    if not mappings:
+        mappings = list(packet.get("approved_mappings") or [])
+    extra = list((pending_state or {}).get("expected_columns") or [])
+    plan = (pending_state or {}).get("extraction_plan")
+    if hasattr(plan, "expected_columns"):
+        extra.extend(list(getattr(plan, "expected_columns") or []))
+    elif isinstance(plan, dict):
+        extra.extend(list(plan.get("expected_columns") or []))
+    keep = mapped_preview_column_names(list(preview_df.columns), mappings, extra)
+    if keep:
+        keep_l = {str(c).strip().lower() for c in keep}
+        cols = [c for c in preview_df.columns if str(c).strip().lower() in keep_l]
+        if cols:
+            preview_df = preview_df.loc[:, cols]
+    order, records = dataframe_to_preview_records(preview_df, max_rows=20)
+    return records, order
 
 
 def assign_job_data_preview(job: Dict[str, Any], df, *, head: int = 20) -> None:
@@ -1394,7 +1747,10 @@ def _apply_hitl_pause(
     assign_job_data_preview(job, df, head=20)
     job["trace"] = trace.to_dict()
 
-    if checkpoints:
+    unresolved_checkpoints = [
+        cp for cp in checkpoints if isinstance(cp, dict) and not cp.get("resolved", False)
+    ]
+    if unresolved_checkpoints:
         pending_state = getattr(trace, "pending_state", {}) or {}
         added = 0
         checkpoint_types = set()
@@ -1406,48 +1762,61 @@ def _apply_hitl_pause(
             {
                 "job_id": job_id,
                 "pause_reason": pause_reason,
-                "checkpoint_types": [cp.get("checkpoint_type") for cp in checkpoints if isinstance(cp, dict)],
-                "checkpoint_titles": [cp.get("title") for cp in checkpoints if isinstance(cp, dict)],
+                "checkpoint_types": [cp.get("checkpoint_type") for cp in unresolved_checkpoints],
+                "checkpoint_titles": [cp.get("title") for cp in unresolved_checkpoints],
                 "trace_review_reason": getattr(trace, "review_reason", ""),
             },
         )
         # endregion
-        for checkpoint in checkpoints:
-            if checkpoint.get("resolved", False):
-                continue
+        for checkpoint in unresolved_checkpoints:
             checkpoint_payload = dict(checkpoint)
             checkpoint_payload["pending_state"] = pending_state
             cp_id = job_manager.add_checkpoint_to_review(job_id, checkpoint_payload)
             checkpoint_types.add(checkpoint.get("checkpoint_type"))
             added += 1
-            if next_checkpoint_id is None and checkpoint.get("checkpoint_type") == "plan_review":
+            if next_checkpoint_id is None:
                 next_checkpoint_id = cp_id
 
-        review_step = "Plan Review" if checkpoint_types == {"plan_review"} else "Human Review"
-        job_manager.update_job_status(job_id, "awaiting_review", pause_reason, review_step)
-        payload: Dict[str, Any] = {
-            "success": True,
-            "job_id": job_id,
-            "status": "awaiting_review",
-            "message": pause_reason,
-            "checkpoint_count": added,
-            "requires_review": True,
-        }
-        if next_checkpoint_id:
-            payload["next_checkpoint_id"] = next_checkpoint_id
-        try:
-            from sia.debug.hitl_debug_events import record_hitl_pause_debug
-
-            record_hitl_pause_debug(
-                job,
-                trace,
-                source_id=cap_sid,
-                sheet_name=cap_sheet or None,
-                processing_sheet=cap_proc or None,
+        if added == 0:
+            logger.warning(
+                "[HITL] Pause had unresolved checkpoints but none were queued for job %s",
+                job_id,
             )
-        except Exception as exc:
-            logger.debug("[HITL] Failed to record checkpoint pause debug for %s: %s", job_id, exc)
-        return payload, 200
+        else:
+            review_step = (
+                "Plan Review"
+                if checkpoint_types == {"plan_review"}
+                else "Integrity Review"
+                if "checksum_failure" in checkpoint_types
+                else "Constraint Review"
+                if "schema_mismatch" in checkpoint_types
+                else "Human Review"
+            )
+            job_manager.update_job_status(job_id, "awaiting_review", pause_reason, review_step)
+            payload: Dict[str, Any] = {
+                "success": True,
+                "job_id": job_id,
+                "status": "awaiting_review",
+                "message": pause_reason,
+                "checkpoint_count": added,
+                "requires_review": True,
+            }
+            if next_checkpoint_id:
+                payload["next_checkpoint_id"] = next_checkpoint_id
+            try:
+                from sia.debug.hitl_debug_events import record_hitl_pause_debug
+
+                record_hitl_pause_debug(
+                    job,
+                    trace,
+                    source_id=cap_sid,
+                    sheet_name=cap_sheet or None,
+                    processing_sheet=cap_proc or None,
+                )
+            except Exception as exc:
+                logger.debug("[HITL] Failed to record checkpoint pause debug for %s: %s", job_id, exc)
+            job_manager.sync_job(job_id)
+            return payload, 200
 
     if deletion_previews:
         job_manager.pause_for_destructive_approval(
@@ -1536,6 +1905,15 @@ def _run_resumed_processing(job_id: str, job: Dict[str, Any], resume_state: Dict
     if not resume_state:
         raise ValueError("No saved state to resume from")
 
+    job_manager.update_job_status(
+        job_id,
+        "processing",
+        "Resuming processing…",
+        "Processing",
+    )
+    if job_id in job_manager.jobs:
+        job_manager.jobs[job_id]["requires_review"] = False
+
     resume_state = dict(resume_state)
     multi_source_remaining_ids = list(resume_state.pop("multi_source_remaining_ids", []) or [])
     agent = _build_agent_from_config(config)
@@ -1618,12 +1996,30 @@ def _run_resumed_processing(job_id: str, job: Dict[str, Any], resume_state: Dict
         # are still withheld from this source until the parent duplicate check runs.
         resume_state["multi_source_active_batch"] = True
 
-    context_packet = build_context_packet(
+    from sia.agent.context_packet import build_context_packet, merge_plan_review_context_packet
+
+    fresh_context_packet = build_context_packet(
         job,
         target_template=target_template,
         selected_sheet=selected_sheet,
         selected_source_id=selected_source_id,
     )
+    saved_context_packet = (
+        resume_state.get("context_packet")
+        if isinstance(resume_state.get("context_packet"), dict)
+        else {}
+    )
+    use_plan_review_hybrid = str(resume_state.get("resume_mode") or "") == "use_existing_plan" or str(
+        resume_state.get("hitl_resume_from") or resume_state.get("hitl_pause_type") or ""
+    ) == "plan_review"
+    if use_plan_review_hybrid and saved_context_packet:
+        context_packet = merge_plan_review_context_packet(
+            fresh_context_packet,
+            saved_context_packet,
+            job=job,
+        )
+    else:
+        context_packet = fresh_context_packet
     job["context_packet"] = context_packet
 
     resume_state["context_packet"] = context_packet
@@ -1685,6 +2081,13 @@ def _run_resumed_processing(job_id: str, job: Dict[str, Any], resume_state: Dict
         canonical_done = str(selected_source_id or "").strip()
         seed_frames: Dict[str, pd.DataFrame] = {}
         if df is not None and not df.empty and canonical_done:
+            df = _finalize_per_source_output_frame(
+                df,
+                job=job,
+                context_packet=context_packet,
+                source_id=canonical_done,
+                multi_source_batch=True,
+            )
             seed_frames[canonical_done] = df
         seed_run = {
             "source_id": canonical_done,
@@ -1745,12 +2148,11 @@ def _run_resumed_processing(job_id: str, job: Dict[str, Any], resume_state: Dict
         job["overall_confidence"] = overall_confidence
 
         for step in new_trace.steps:
-            job["steps"].append(
-                {
-                    "step": step.get("module", "Resumed"),
-                    "message": step.get("output", ""),
-                    "confidence": step.get("confidence", {}).get("score", 0),
-                }
+            job_manager.record_step(
+                job_id,
+                step.get("module", "Resumed"),
+                step.get("output", ""),
+                confidence=step.get("confidence", {}).get("score", 0),
             )
 
         last_batch_sid = (
@@ -1972,12 +2374,11 @@ def _run_resumed_processing(job_id: str, job: Dict[str, Any], resume_state: Dict
             logger.error("[HITL] Error merging traces (multi resume tail): %s", merge_err)
 
         for step in new_trace.steps:
-            job.setdefault("steps", []).append(
-                {
-                    "step": step.get("module", "Resumed"),
-                    "message": step.get("output", ""),
-                    "confidence": step.get("confidence", {}).get("score", 0),
-                }
+            job_manager.record_step(
+                job_id,
+                step.get("module", "Resumed"),
+                step.get("output", ""),
+                confidence=step.get("confidence", {}).get("score", 0),
             )
 
         try:
@@ -2095,11 +2496,12 @@ def _run_resumed_processing(job_id: str, job: Dict[str, Any], resume_state: Dict
         job["trace"] = new_trace.to_dict()
 
     for step in new_trace.steps:
-        job["steps"].append({
-            "step": step.get("module", "Resumed"),
-            "message": step.get("output", ""),
-            "confidence": step.get("confidence", {}).get("score", 0)
-        })
+        job_manager.record_step(
+            job_id,
+            step.get("module", "Resumed"),
+            step.get("output", ""),
+            confidence=step.get("confidence", {}).get("score", 0),
+        )
 
     try:
         from sia.debug.llm_observer import get_observer
@@ -2157,6 +2559,58 @@ def _run_resumed_processing(job_id: str, job: Dict[str, Any], resume_state: Dict
     })
 
 
+def _queue_context_ambiguity_review(
+    job_id: str,
+    job: Dict[str, Any],
+    context_packet: Dict[str, Any],
+    source_id: str,
+) -> None:
+    """Pause for analyst confirmation when stamp dimensions are low-confidence."""
+    from sia.context.stamp_policy import low_confidence_stamp_fields
+
+    ambiguous = low_confidence_stamp_fields(context_packet)
+    if not ambiguous:
+        return
+    sheet = str(
+        (context_packet.get("lineage") or {}).get("sheet_name")
+        or (context_packet.get("source_metadata") or {}).get("sheet_name")
+        or source_id
+    )
+    checkpoint = HITLManager().create_checkpoint(
+        CheckpointType.CONTEXT_AMBIGUITY_REVIEW,
+        {
+            "current_step": "context_ambiguity",
+            "confidence_trajectory": [min((r.get("confidence", 0.5) for r in ambiguous), default=0.5)],
+        },
+        f"Context for {sheet} has ambiguous dimension fields — confirm before stamping.",
+        title="Context ambiguity review",
+        description=(
+            "Market/channel values come from tab inference or low-confidence sources. "
+            "Confirm or correct before dimensions are stamped on the output."
+        ),
+        severity="medium",
+        available_actions=["approve", "modify", "cancel"],
+        recommended_action="approve",
+        trigger_data={
+            "ambiguous_fields": ambiguous,
+            "source_id": source_id,
+            "sheet_name": sheet,
+        },
+    ).to_dict()
+    checkpoint["pending_state"] = {
+        "source_id": source_id,
+        "sheet_name": sheet,
+        "context_packet": context_packet,
+    }
+    job_manager.add_checkpoint_to_review(job_id, checkpoint)
+    job_manager.update_job_status(
+        job_id,
+        "awaiting_review",
+        checkpoint.get("trigger_reason") or "Context ambiguity review",
+        "Context Ambiguity",
+    )
+
+
 def _create_relationship_review(job_id: str, job: Dict[str, Any], source_ids: List[str]):
     target_template = load_target_template_for_job(job)
     packet = build_context_packet(
@@ -2164,7 +2618,10 @@ def _create_relationship_review(job_id: str, job: Dict[str, Any], source_ids: Li
         target_template=target_template,
         selected_source_id=source_ids[0] if source_ids else None,
     )
-    proposals = propose_file_relationships(packet.get("available_source_summaries") or [])
+    proposals = propose_file_relationships(
+        packet.get("available_source_summaries") or [],
+        target_template=target_template,
+    )
     if not proposals:
         return None
 
@@ -2214,14 +2671,53 @@ def _queue_post_execution_relationship_review(
     Stores output frames on the job for collation-only resolve. Analyst reviews the same
     checkpoint type as the pre-process flow, but copy reflects post-execution context.
     """
+    from sia.evals.runner import PipelineEvalRunner
+
     target_template = load_target_template_for_job(job)
+    PipelineEvalRunner.ensure(job)
+    PipelineEvalRunner.record_collation(
+        job,
+        frames_by_source=frames_by_source,
+        target_template=target_template if isinstance(target_template, dict) else None,
+    )
+    gate = _pipeline_eval_gate_payload(job)
+    if not gate.get("pass", True):
+        logger.warning(
+            "[PIPELINE_EVALS] Critical gate blocked relationship review for job %s: %s",
+            job_id,
+            gate.get("blocked_reasons"),
+        )
+
+    description = (
+        "Each source has been transformed. Review how to merge the resulting tables "
+        "into one deliverable. Row/column previews reflect executed outputs."
+    )
+    if not gate.get("pass", True):
+        blocked = list(gate.get("blocked_reasons") or [])
+        bleed_signals = (
+            "dimension_mismatch",
+            "metric_mismatch",
+            "context_grounding",
+            "union_false_duplicate",
+            "context_lineage_missing",
+        )
+        if any(any(sig in str(r) for sig in bleed_signals) for r in blocked):
+            description += (
+                " Warning: context isolation evals failed for one or more sources — "
+                "duplicate rows in the preview may be cross-sheet context bleed, not true duplicates."
+            )
+
     packet = build_context_packet(
         job,
         target_template=target_template,
         selected_source_id=source_ids[0] if source_ids else None,
     )
     summaries = list(packet.get("available_source_summaries") or [])
-    proposals = propose_file_relationships(summaries)
+    proposals = propose_file_relationships(
+        summaries,
+        target_template=target_template,
+        frames_by_source=frames_by_source,
+    )
     if not proposals:
         return
 
@@ -2248,10 +2744,7 @@ def _queue_post_execution_relationship_review(
         {"current_step": "relationship_review_post_exec", "confidence_trajectory": [min((item.get("confidence", 0.7) for item in proposals), default=0.7)]},
         reason,
         title="Combine outputs (post-execution)",
-        description=(
-            "Each source has been transformed. Review how to merge the resulting tables "
-            "into one deliverable. Row/column previews reflect executed outputs."
-        ),
+        description=description,
         severity="medium",
         available_actions=["approve", "modify", "cancel"],
         recommended_action="approve",
@@ -2260,6 +2753,7 @@ def _queue_post_execution_relationship_review(
             "sources": summaries,
             "post_execution_preview": execution_preview,
             "post_execution": True,
+            "pipeline_evals_gate": gate,
         },
     ).to_dict()
     checkpoint["pending_state"] = {
@@ -2273,6 +2767,118 @@ def _queue_post_execution_relationship_review(
     job_manager.update_job_status(job_id, "awaiting_review", reason, "Relationship Review")
 
 
+def _pending_relationship_checkpoint_id(job_id: str) -> Optional[str]:
+    for cp_id, item in job_manager.pending_checkpoints.items():
+        if (
+            item.get("job_id") == job_id
+            and item.get("type") == "file_relationship_review"
+            and item.get("status") == "pending"
+        ):
+            return str(cp_id)
+    return None
+
+
+def _cached_collation_frames(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Per-source frames left after the first pass (pending collation or last batch)."""
+    pending = job.get("_pending_collation_frames")
+    if isinstance(pending, dict) and pending:
+        return pending
+    cached = job.get("_multi_source_frames_by_source")
+    if isinstance(cached, dict) and cached:
+        return cached
+    return {}
+
+
+def _relationship_review_resume_plan(job: Dict[str, Any], checkpoint: Dict[str, Any]) -> str:
+    """How to finish after relationship review.
+
+    collation_only — combine stored per-source frames (no LangGraph re-run)
+    already_done — export already completed
+    full_reprocess — pre-execution review; run source pipelines
+    missing_frames — post-execution review but no frames remain
+    """
+    trigger = checkpoint.get("trigger_data") if isinstance(checkpoint, dict) else {}
+    if not isinstance(trigger, dict):
+        trigger = {}
+    frames = _cached_collation_frames(job)
+    is_post_exec = bool(
+        trigger.get("post_execution")
+        or job.get("_post_execution_relationship_review")
+        or frames
+    )
+    if frames:
+        if not job.get("_pending_collation_frames"):
+            job["_pending_collation_frames"] = dict(frames)
+        return "collation_only"
+    if str(job.get("status") or "").lower() == "completed":
+        return "already_done"
+    if is_post_exec:
+        return "missing_frames"
+    return "full_reprocess"
+
+
+def _rehydrate_post_exec_relationship_checkpoint(job_id: str) -> Optional[str]:
+    """Recreate relationship review checkpoint when in-memory queue was lost but job still has frames."""
+    job = job_manager.get_job(job_id)
+    if not job or job.get("status") in {"cancelled", "completed", "error"}:
+        return None
+    if job.get("_relationship_resume_running") or job.get("_process_worker_running"):
+        return None
+    if not job.get("_post_execution_relationship_review"):
+        return None
+    frames = job.get("_pending_collation_frames")
+    if not isinstance(frames, dict) or not frames:
+        return None
+    existing = _pending_relationship_checkpoint_id(job_id)
+    if existing:
+        return existing
+    refresh_job_source_context_flags(job)
+    source_ids = [
+        str(row.get("source_id"))
+        for row in (job.get("source_registry") or [])
+        if row.get("source_id")
+        and source_is_main_data_for_processing(job, row)
+    ]
+    if not source_ids:
+        source_ids = [str(k) for k in frames.keys()]
+    logger.info("[HITL] Rehydrating post-exec relationship review for job %s", job_id)
+    _queue_post_execution_relationship_review(
+        job_id,
+        job,
+        source_ids,
+        frames,
+        job.get("_pending_collation_schema"),
+        list(job.get("source_traces") or []),
+    )
+    return _pending_relationship_checkpoint_id(job_id)
+
+
+def _rehydrate_all_stale_relationship_checkpoints() -> None:
+    for job_id in list(job_manager.jobs.keys()):
+        _rehydrate_post_exec_relationship_checkpoint(job_id)
+
+
+def _lookup_checkpoint_for_review(checkpoint_id: str) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    _rehydrate_all_stale_relationship_checkpoints()
+    cp = job_manager.pending_checkpoints.get(checkpoint_id)
+    if cp:
+        return checkpoint_id, job_manager._ensure_checkpoint_actions(cp)
+    rel_pending = [
+        (cid, item)
+        for cid, item in job_manager.pending_checkpoints.items()
+        if item.get("type") == "file_relationship_review" and item.get("status") == "pending"
+    ]
+    if len(rel_pending) == 1:
+        cid, item = rel_pending[0]
+        logger.warning(
+            "[HITL] Checkpoint %s not found; using pending relationship review %s",
+            checkpoint_id,
+            cid,
+        )
+        return cid, job_manager._ensure_checkpoint_actions(item)
+    return None, None
+
+
 def _execute_collation_only_after_review(job_id: str) -> None:
     """Apply approved relationships to pre-computed per-source frames; export only (no LangGraph re-run)."""
     import traceback as tb
@@ -2281,81 +2887,95 @@ def _execute_collation_only_after_review(job_id: str) -> None:
     if not job:
         logger.error("[REL_REVIEW] Collation-only worker: job %s not found", job_id)
         return
-    try:
-        frames = job.get("_pending_collation_frames") or {}
-        if not isinstance(frames, dict) or not frames:
-            logger.warning("[REL_REVIEW] Collation-only: no pending frames for job %s", job_id)
-            job_manager.update_job_status(job_id, "error", "Missing pending output frames for collation.", "Error")
-            return
-
-        approved = list(job.get("approved_file_relationships") or [])
-        target_tpl = load_target_template_for_job(job)
-        df, col_trace, col_dbg = collate_frames_detailed(frames, approved, target_template=target_tpl)
-        df, pc_ev, pc_dbg = _apply_job_deferred_post_collate(job, df)
-        if pc_ev:
-            col_trace = list(col_trace or []) + [{"step": "post_collate_transforms", "events": pc_ev}]
-        if pc_dbg:
-            col_dbg = list(col_dbg or []) + _link_deferred_collation_debug_events(
-                list(col_dbg or []), pc_dbg
-            )
-        schema_obj = job.pop("_pending_collation_schema", None)
-        job.pop("_pending_collation_frames", None)
-        job.pop("_post_execution_relationship_review", None)
-
-        if schema_obj is None and df is not None and not df.empty:
-            from sia.models.schema import InferredSchema
-
-            schema_obj = InferredSchema.from_dataframe(df, "combined")
-        elif schema_obj is None:
-            from sia.models.schema import InferredSchema
-
-            schema_obj = InferredSchema("combined")
-
-        export_df = normalize_dataframe_dates_for_export(df) if df is not None else None
-        tabular_df = export_df if export_df is not None else df
-        assign_job_data_preview(job, export_df, head=20)
-        job["total_rows"] = len(df) if df is not None else 0
-        job["schema"] = schema_obj.to_dict() if hasattr(schema_obj, "to_dict") else {}
-
-        config = load_user_config()
-        output_format = config.get("output_format", "csv")
-        agent = _build_agent_from_config(config)
-        outputs = agent.save_results(schema_obj, tabular_df, str(OUTPUT_FOLDER), format=output_format)
-        job["output_files"] = outputs
-        try:
-            _persist_excel_output(job_id, job, tabular_df)
-        except Exception as excel_err:
-            logger.warning("[REL_REVIEW] Collation-only Excel export failed: %s", excel_err)
-
-        job["trace"] = {
-            "overall_confidence": float(job.get("overall_confidence") or 1.0),
-            "steps": _collation_trace_to_job_steps(col_trace)
-            + [
-                {
-                    "module": "post_execution_collation",
-                    "input": "",
-                    "output": f"Collated {len(frames)} sources after relationship review",
-                    "confidence": {
-                        "score": float(job.get("overall_confidence") or 1.0),
-                        "decision": "unknown",
-                        "rationale": "",
-                        "signals": [],
-                    },
-                }
-            ],
-            "hitl_checkpoints": [],
-            "source_runs": job.get("source_traces") or [],
-        }
-
-        _merge_collation_debug_into_job(job, col_trace, col_dbg)
-
+    if _pipeline_eval_gate_blocks(job):
+        gate = _pipeline_eval_gate_payload(job)
+        reasons = "; ".join(gate.get("blocked_reasons") or [])
         job_manager.update_job_status(
             job_id,
-            "completed",
-            f"Exported {len(df) if df is not None else 0} combined rows after relationship review",
-            "Complete",
+            "awaiting_review",
+            f"Export blocked by pipeline evals critical gate: {reasons}",
+            "Evals blocked",
         )
-        logger.info("[REL_REVIEW] Job %s collation-only export completed", job_id)
+        job["requires_review"] = True
+        job["review_reason"] = f"Pipeline evals critical gate: {reasons}"
+        job["_relationship_resume_running"] = False
+        return
+    try:
+        with app.app_context():
+            frames = job.get("_pending_collation_frames") or {}
+            if not isinstance(frames, dict) or not frames:
+                logger.warning("[REL_REVIEW] Collation-only: no pending frames for job %s", job_id)
+                job_manager.update_job_status(job_id, "error", "Missing pending output frames for collation.", "Error")
+                return
+
+            approved = list(job.get("approved_file_relationships") or [])
+            target_tpl = load_target_template_for_job(job)
+            df, col_trace, col_dbg = collate_frames_detailed(frames, approved, target_template=target_tpl)
+            df, pc_ev, pc_dbg = _apply_job_deferred_post_collate(job, df)
+            if pc_ev:
+                col_trace = list(col_trace or []) + [{"step": "post_collate_transforms", "events": pc_ev}]
+            if pc_dbg:
+                col_dbg = list(col_dbg or []) + _link_deferred_collation_debug_events(
+                    list(col_dbg or []), pc_dbg
+                )
+            schema_obj = job.pop("_pending_collation_schema", None)
+            job.pop("_pending_collation_frames", None)
+            job.pop("_post_execution_relationship_review", None)
+
+            if schema_obj is None and df is not None and not df.empty:
+                from sia.models.schema import InferredSchema
+
+                schema_obj = InferredSchema.from_dataframe(df, "combined")
+            elif schema_obj is None:
+                from sia.models.schema import InferredSchema
+
+                schema_obj = InferredSchema("combined")
+
+            export_df = normalize_dataframe_dates_for_export(df) if df is not None else None
+            tabular_df = export_df if export_df is not None else df
+            assign_job_data_preview(job, export_df, head=20)
+            job["total_rows"] = len(df) if df is not None else 0
+            job["schema"] = schema_obj.to_dict() if hasattr(schema_obj, "to_dict") else {}
+
+            config = load_user_config()
+            output_format = config.get("output_format", "csv")
+            agent = _build_agent_from_config(config)
+            outputs = agent.save_results(schema_obj, tabular_df, str(OUTPUT_FOLDER), format=output_format)
+            job["output_files"] = outputs
+            try:
+                _persist_excel_output(job_id, job, tabular_df)
+            except Exception as excel_err:
+                logger.warning("[REL_REVIEW] Collation-only Excel export failed: %s", excel_err)
+
+            job["trace"] = {
+                "overall_confidence": float(job.get("overall_confidence") or 1.0),
+                "steps": _collation_trace_to_job_steps(col_trace)
+                + [
+                    {
+                        "module": "post_execution_collation",
+                        "input": "",
+                        "output": f"Collated {len(frames)} sources after relationship review",
+                        "confidence": {
+                            "score": float(job.get("overall_confidence") or 1.0),
+                            "decision": "unknown",
+                            "rationale": "",
+                            "signals": [],
+                        },
+                    }
+                ],
+                "hitl_checkpoints": [],
+                "source_runs": job.get("source_traces") or [],
+            }
+
+            _merge_collation_debug_into_job(job, col_trace, col_dbg)
+
+            job_manager.update_job_status(
+                job_id,
+                "completed",
+                f"Exported {len(df) if df is not None else 0} combined rows after relationship review",
+                "Complete",
+            )
+            logger.info("[REL_REVIEW] Job %s collation-only export completed", job_id)
     except Exception as e:
         error_traceback = tb.format_exc()
         logger.error("[REL_REVIEW] Collation-only failed for job %s:\n%s", job_id, error_traceback)
@@ -2645,6 +3265,13 @@ def _process_job_sources(
         )
         last_schema = schema
         if df is not None and not df.empty:
+            df = _finalize_per_source_output_frame(
+                df,
+                job=job,
+                context_packet=context_packet,
+                source_id=canonical_id,
+                multi_source_batch=len(source_ids) > 1,
+            )
             frames_by_source[canonical_id] = df
         if len(source_ids) > 1:
             job["_multi_source_frames_by_source"] = dict(frames_by_source)
@@ -2824,9 +3451,35 @@ def _expand_relationship_resume_source_ids(job: Dict[str, Any], seed_ids: List[A
         for reg in job.get("source_registry") or []:
             if not isinstance(reg, dict):
                 continue
-            if reg.get("contains_main_data", True) or not reg.get("contains_reference_data"):
+            if source_is_main_data_for_processing(job, reg):
                 add(reg.get("source_id"))
     return out
+
+
+def _execute_plan_review_resume(
+    job_id: str,
+    pending_state: Dict[str, Any],
+    config: Dict[str, Any],
+) -> None:
+    """Resume agent after planner review in a background thread (HTTP returns immediately)."""
+    import traceback as tb
+
+    job = job_manager.get_job(job_id)
+    if not job:
+        logger.error("[PLAN_REVIEW] Worker: job %s not found", job_id)
+        return
+    try:
+        with app.app_context():
+            _run_resumed_processing(job_id, job, dict(pending_state), config)
+    except Exception as e:
+        error_traceback = tb.format_exc()
+        logger.error("[PLAN_REVIEW] Resume failed for job %s:\n%s", job_id, error_traceback)
+        job_manager.update_job_status(job_id, "error", str(e), "Error")
+        job["error_details"] = error_traceback
+    finally:
+        j = job_manager.get_job(job_id)
+        if j is not None:
+            j["_plan_review_resume_running"] = False
 
 
 def _execute_relationship_review_resume(job_id: str, source_ids: List[str]) -> None:
@@ -2838,83 +3491,85 @@ def _execute_relationship_review_resume(job_id: str, source_ids: List[str]) -> N
         logger.error("[REL_REVIEW] Worker: job %s not found", job_id)
         return
     try:
-        config = load_user_config()
-        target_template = load_target_template_for_job(job)
-        sid_list = [s for s in (source_ids or []) if s]
-        if not sid_list:
-            registry = list(job.get("source_registry") or [])
-            sid_list = [
-                s.get("source_id")
-                for s in registry
-                if s.get("contains_main_data", True) or not s.get("contains_reference_data")
-            ] or [s.get("source_id") for s in registry if s.get("source_id")]
-        sid_list = _expand_relationship_resume_source_ids(job, sid_list)
-        logger.info(
-            "[REL_REVIEW] Worker job=%s expanded source_ids for resume: %s",
-            job_id,
-            sid_list,
-        )
+        with app.app_context():
+            config = load_user_config()
+            target_template = load_target_template_for_job(job)
+            sid_list = [s for s in (source_ids or []) if s]
+            if not sid_list:
+                registry = list(job.get("source_registry") or [])
+                refresh_job_source_context_flags(job)
+                sid_list = [
+                    s.get("source_id")
+                    for s in registry
+                    if source_is_main_data_for_processing(job, s)
+                ] or [s.get("source_id") for s in registry if s.get("source_id")]
+            sid_list = _expand_relationship_resume_source_ids(job, sid_list)
+            logger.info(
+                "[REL_REVIEW] Worker job=%s expanded source_ids for resume: %s",
+                job_id,
+                sid_list,
+            )
 
-        if len(sid_list) > 1:
+            if len(sid_list) > 1:
+                try:
+                    from sia.debug.llm_observer import clear_observer
+
+                    clear_observer()
+                except Exception:
+                    pass
+                job["debug_events"] = []
+                job["llm_traces"] = []
+                job["tool_executions"] = []
+
+            schema, multi_result, pause_response = _process_job_sources(job_id, job, config, target_template, sid_list)
+            if pause_response is not None:
+                logger.info("[REL_REVIEW] Worker: HITL pause or error during resume for job %s", job_id)
+                return
+
+            df = (multi_result or {}).get("combined_df")
+            if df is None:
+                df = pd.DataFrame()
+            job["status"] = "completed"
+            job["schema"] = schema.to_dict() if schema is not None else {}
+            export_df = normalize_dataframe_dates_for_export(df) if df is not None else None
+            tabular_df = export_df if export_df is not None else df
+            assign_job_data_preview(job, export_df, head=20)
+            job["total_rows"] = len(df) if df is not None else 0
+            overall_confidence = min(
+                (item.get("overall_confidence", 1.0) for item in (multi_result or {}).get("traces", [])),
+                default=1.0,
+            )
+            sr = (multi_result or {}).get("source_runs") or []
+            job["source_traces"] = sr
+            col_tr = (multi_result or {}).get("collation_trace")
+            job["trace"] = _build_multi_source_job_trace(
+                source_runs=sr,
+                trace_payloads=(multi_result or {}).get("traces") or [],
+                collation_trace=col_tr,
+                overall_confidence=overall_confidence,
+                summary_message=f"Collated {len(sid_list)} sources after relationship review",
+            )
+            capture_llm_metadata(job_id)
+            _merge_collation_debug_into_job(job, col_tr, (multi_result or {}).get("collation_debug_events"))
+            job["overall_confidence"] = overall_confidence
+
+            output_format = config.get("output_format", "csv")
+            agent = _build_agent_from_config(config)
+            outputs = agent.save_results(schema, tabular_df, str(OUTPUT_FOLDER), format=output_format)
+            job["output_files"] = outputs
+
             try:
-                from sia.debug.llm_observer import clear_observer
+                _persist_excel_output(job_id, job, tabular_df)
+            except Exception as excel_err:
+                logger.warning("[REL_REVIEW] Failed to save Excel export: %s", excel_err)
 
-                clear_observer()
-            except Exception:
-                pass
-            job["debug_events"] = []
-            job["llm_traces"] = []
-            job["tool_executions"] = []
-
-        schema, multi_result, pause_response = _process_job_sources(job_id, job, config, target_template, sid_list)
-        if pause_response is not None:
-            logger.info("[REL_REVIEW] Worker: HITL pause or error during resume for job %s", job_id)
-            return
-
-        df = (multi_result or {}).get("combined_df")
-        if df is None:
-            df = pd.DataFrame()
-        job["status"] = "completed"
-        job["schema"] = schema.to_dict() if schema is not None else {}
-        export_df = normalize_dataframe_dates_for_export(df) if df is not None else None
-        tabular_df = export_df if export_df is not None else df
-        assign_job_data_preview(job, export_df, head=20)
-        job["total_rows"] = len(df) if df is not None else 0
-        overall_confidence = min(
-            (item.get("overall_confidence", 1.0) for item in (multi_result or {}).get("traces", [])),
-            default=1.0,
-        )
-        sr = (multi_result or {}).get("source_runs") or []
-        job["source_traces"] = sr
-        col_tr = (multi_result or {}).get("collation_trace")
-        job["trace"] = _build_multi_source_job_trace(
-            source_runs=sr,
-            trace_payloads=(multi_result or {}).get("traces") or [],
-            collation_trace=col_tr,
-            overall_confidence=overall_confidence,
-            summary_message=f"Collated {len(sid_list)} sources after relationship review",
-        )
-        capture_llm_metadata(job_id)
-        _merge_collation_debug_into_job(job, col_tr, (multi_res or {}).get("collation_debug_events"))
-        job["overall_confidence"] = overall_confidence
-
-        output_format = config.get("output_format", "csv")
-        agent = _build_agent_from_config(config)
-        outputs = agent.save_results(schema, tabular_df, str(OUTPUT_FOLDER), format=output_format)
-        job["output_files"] = outputs
-
-        try:
-            _persist_excel_output(job_id, job, tabular_df)
-        except Exception as excel_err:
-            logger.warning("[REL_REVIEW] Failed to save Excel export: %s", excel_err)
-
-        job_manager.update_job_status(
-            job_id,
-            "completed",
-            f"Processed {len(df)} rows after relationship review",
-            "Complete",
-        )
-        logger.info("[REL_REVIEW] Job %s completed after relationship review (background)", job_id)
+            job_manager.update_job_status(
+                job_id,
+                "completed",
+                f"Processed {len(df)} rows after relationship review",
+                "Complete",
+            )
+            logger.info("[REL_REVIEW] Job %s completed after relationship review (background)", job_id)
     except Exception as e:
         error_traceback = tb.format_exc()
         logger.error("[REL_REVIEW] Resume failed for job %s:\n%s", job_id, error_traceback)
@@ -2957,7 +3612,7 @@ def make_unique_columns(columns):
     return new_cols
 
 def load_target_columns_for_job(job: Dict[str, Any]) -> List[str]:
-    """Load semantic-mapping target columns: date, uid hierarchy (rest), metrics."""
+    """Load semantic-mapping target columns: template UID/metrics + media hierarchy attributes."""
     candidate_paths = []
     if job.get("template_path"):
         candidate_paths.append(Path(job["template_path"]))
@@ -2966,6 +3621,7 @@ def load_target_columns_for_job(job: Dict[str, Any]) -> List[str]:
     default_template = CONFIG_DIR / "target_template.json"
     candidate_paths.append(default_template)
 
+    cols: List[str] = []
     for path in candidate_paths:
         try:
             if path.exists():
@@ -2973,11 +3629,53 @@ def load_target_columns_for_job(job: Dict[str, Any]) -> List[str]:
                     tpl = normalize_target_template(json.load(f))
                 ok, err = validate_template_shape(tpl)
                 if ok:
-                    return mapping_target_columns_for_ui(tpl)
+                    cols = list(mapping_target_columns_for_ui(tpl))
+                    break
                 logger.warning("Invalid target template at %s: %s", path, err)
         except Exception as e:
             logger.warning(f"Failed to load target columns from {path}: {e}")
-    return []
+
+    # Merge shared media hierarchy + common attributes + catalog metrics
+    try:
+        from sia.agent.hierarchy_register import (
+            mapping_attribute_targets,
+            mapping_metric_targets,
+            mapping_target_option_catalog,
+        )
+
+        attr_targets = mapping_attribute_targets()
+        metric_targets = [m["id"] for m in mapping_metric_targets()]
+        # Prefer destination_grain_columns from column standardize registry when present
+        grain_pref: List[str] = []
+        for row in job.get("column_standardize_registry") or []:
+            if isinstance(row, dict) and row.get("destination_grain_columns"):
+                grain_pref.extend(str(x) for x in row["destination_grain_columns"] if x)
+        # Metrics first so Spend / Impressions / Clicks / ROAS are always present
+        merge_list = list(metric_targets) + list(grain_pref) + list(attr_targets)
+        seen = set(cols)
+        for t in merge_list:
+            if t and t not in seen:
+                seen.add(t)
+                cols.append(t)
+        # Job-level custom metrics added by the analyst in mapping UI
+        for custom in job.get("custom_mapping_metrics") or []:
+            cid = str(custom.get("id") or custom or "").strip()
+            if cid and cid not in seen:
+                seen.add(cid)
+                cols.append(cid)
+        job["_mapping_target_options"] = mapping_target_option_catalog()
+        for custom in job.get("custom_mapping_metrics") or []:
+            if isinstance(custom, dict) and custom.get("id"):
+                job["_mapping_target_options"].append({
+                    "id": str(custom["id"]),
+                    "name": str(custom.get("name") or custom["id"]),
+                    "kind": "metric",
+                    "supports_currency": bool(custom.get("supports_currency")),
+                    "group": "custom",
+                })
+    except Exception as exc:
+        logger.warning("Could not merge mapping attribute targets: %s", exc)
+    return cols
 
 
 def load_target_template_for_job(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -3004,14 +3702,21 @@ def load_target_template_for_job(job: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def layout_registry_row_is_main_data(row: Dict[str, Any]) -> bool:
-    """Include only Main Data blocks the user approved as data (Treat as Data), not Ignore/Metadata."""
-    cat_compact = str(row.get("block_category") or "").strip().lower().replace(" ", "").replace("_", "")
-    if cat_compact != "maindata":
-        return False
+    """Include only blocks the user treats as data (Treat as Data), not Ignore/Metadata.
+
+    The user's explicit decision wins over the AI-proposed category: clicking
+    "Treat as Data" promotes a block even when the AI first labelled it
+    Context/Noise (the UI toggle only changes ``decision``, never ``category``).
+    Mirrors sia.agent.scoped_source._classify_blocks.
+    """
     dec = str(row.get("decision") or "").strip().lower()
-    if dec in ("discard", "context"):
+    if dec in ("discard", "ignore", "noise", "context", "metadata", "use as context"):
         return False
-    return dec in ("keep", "approved") or dec == ""
+    if dec in ("keep", "approved"):
+        return True
+    # No recognized decision → fall back to the AI-proposed category.
+    cat_compact = str(row.get("block_category") or "").strip().lower().replace(" ", "").replace("_", "")
+    return cat_compact == "maindata"
 
 
 def layout_registry_row_to_block(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -3148,7 +3853,7 @@ def load_user_config():
     config = {
         "api_key": "",
         "llm_model": "azure-gpt-5.3-chat",
-        "debug_enabled": True,
+        "debug_enabled": False,
         "enable_llm_judge": False,
         "azure_api_version": "2025-04-01-preview",
         "azure_deployment": "gpt-5.3-chat",
@@ -3214,6 +3919,8 @@ def load_user_config():
         config["enable_llm_judge"] = True
     elif _ej is not None and str(_ej).strip().lower() in ("0", "false", "no", "off"):
         config["enable_llm_judge"] = False
+
+    config["debug_enabled"] = _resolve_debug_enabled(config.get("debug_enabled"))
 
     return config
 
@@ -3320,6 +4027,18 @@ def index():
     return redirect('/pages/upload.html')
 
 
+@app.route('/workbench/')
+@app.route('/workbench/<path:filename>')
+def serve_harmonization_workbench(filename='index.html'):
+    """Analyst Media Data Harmonization Workbench (separate from Schema Agent)."""
+    workbench_dir = Path(__file__).resolve().parent / "workbench"
+    response = make_response(send_from_directory(workbench_dir, filename))
+    if filename.endswith('.html') or filename == 'index.html':
+        response.headers['Content-Type'] = 'text/html; charset=utf-8'
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    return response
+
+
 @app.route('/pages/<path:filename>')
 def serve_page(filename):
     """Serve pages from web/pages directory."""
@@ -3356,6 +4075,8 @@ def get_config():
         config['api_key_preview'] = ''
     for key in SECRET_CONFIG_KEYS:
         config.pop(key, None)
+    config["production_deploy"] = _is_production_deploy()
+    config["debug_locked"] = _is_production_deploy() and os.environ.get("SIA_DEBUG_ENABLED") is None
     return jsonify(config)
 
 
@@ -3408,7 +4129,12 @@ def update_config():
         if target_provider in config.get('keys', {}):
             config['api_key'] = config['keys'][target_provider]
 
-    config['debug_enabled'] = True
+    if 'debug_enabled' in data and not _is_production_deploy():
+        config['debug_enabled'] = bool(data['debug_enabled'])
+    elif 'debug_enabled' in data and os.environ.get("SIA_DEBUG_ENABLED") is not None:
+        config['debug_enabled'] = _resolve_debug_enabled(bool(data['debug_enabled']))
+    else:
+        config['debug_enabled'] = _resolve_debug_enabled(config.get('debug_enabled'))
 
     env_updates = {}
     if 'api_key' in data and data['api_key']:
@@ -3632,7 +4358,36 @@ def upload_file():
         
         # Detect sheets if Excel
         sheets = []
-        if filename.endswith(('.xlsx', '.xls')):
+        csv_conversion = None
+        if filename.lower().endswith('.csv'):
+            # Guided setup scans sources via openpyxl, so a CSV becomes a one-sheet workbook.
+            try:
+                csv_conversion = convert_csv_to_xlsx(
+                    file_path,
+                    sheet_name=Path(file.filename).stem,
+                )
+            except CsvConversionError as e:
+                try:
+                    file_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return jsonify({"error": f"Could not read {file.filename}: {e}."}), 400
+            except Exception as e:
+                logger.warning(f"CSV conversion failed for {filename}: {e}")
+                try:
+                    file_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return jsonify({
+                    "error": f"Could not convert {file.filename} to a workbook: {e}",
+                }), 400
+            try:
+                file_path.unlink(missing_ok=True)
+            except OSError as e:
+                logger.warning(f"Failed to remove source CSV {file_path}: {e}")
+            file_path = csv_conversion["path"]
+            sheets = [csv_conversion["sheet_name"]]
+        elif filename.endswith(('.xlsx', '.xls')):
             try:
                 wb = load_workbook(str(file_path), read_only=True)
                 sheets = [s for s in wb.sheetnames if wb[s].sheet_state == 'visible']
@@ -3674,6 +4429,17 @@ def upload_file():
                     "file_count": len(dfs),
                     "total_sheets": total_sheets,
                     "source_count": len(job.get("source_registry") or []),
+                    **(
+                        {
+                            "converted_from_csv": True,
+                            "csv_delimiter": csv_conversion["delimiter"],
+                            "csv_encoding": csv_conversion["encoding"],
+                            "csv_rows": csv_conversion["rows"],
+                            "csv_columns": csv_conversion["columns"],
+                        }
+                        if csv_conversion
+                        else {}
+                    ),
                 },
             )
         
@@ -3683,6 +4449,7 @@ def upload_file():
             "job_id": job_id,
             "filename": file.filename,
             "sheets": sheets,
+            "converted_from_csv": bool(csv_conversion),
             "sources": serialize_job_sources(job or {}),
             "data_files": list((job or {}).get("data_files") or []),
         })
@@ -3690,16 +4457,34 @@ def upload_file():
     elif upload_type == 'schema':
         if not job_id:
             return jsonify({"error": "Job ID required for schema upload"}), 400
-        
-        # Save schema associated with job
+
+        normalized_tpl, raw_bytes, validation_err = _parse_and_validate_target_template_upload(file)
+        if validation_err:
+            job = job_manager.get_job(job_id)
+            if job:
+                _record_job_debug(
+                    job,
+                    label="Target template upload rejected",
+                    phase="upload",
+                    module="upload",
+                    operation="target_template",
+                    status="error",
+                    summary=f"Schema template rejected: {filename}",
+                    metadata={"filename": filename, "template_validation_error": validation_err},
+                )
+            return jsonify({
+                "error": f"Invalid target template: {validation_err}",
+                "template_validation_error": validation_err,
+            }), 400
+
         schema_path = UPLOAD_FOLDER / f"{job_id}_schema_{filename}"
-        file.save(str(schema_path))
-        
-        # Update job with schema path
+        schema_path.write_bytes(raw_bytes)
+
         job = job_manager.get_job(job_id)
         if job:
             job['template_path'] = str(schema_path)
             job['target_template_path'] = str(schema_path)
+            target_columns = mapping_target_columns_for_ui(normalized_tpl or {})
             _record_job_debug(
                 job,
                 label="Target template uploaded",
@@ -3708,13 +4493,17 @@ def upload_file():
                 operation="target_template",
                 status="success",
                 summary=f"Schema template: {filename}",
-                metadata={"template_path": str(schema_path)},
+                metadata={
+                    "template_path": str(schema_path),
+                    "target_columns": target_columns,
+                },
             )
-            
+
         return jsonify({
             "success": True,
             "message": "Schema uploaded",
-            "job_id": job_id
+            "job_id": job_id,
+            "target_columns": mapping_target_columns_for_ui(normalized_tpl or {}),
         })
     
     return jsonify({"error": "Invalid upload type"}), 400
@@ -3744,6 +4533,7 @@ def _execute_process_file_impl(job_id: str, data: Dict[str, Any]) -> None:
             },
         )
         config = load_user_config()
+        refresh_job_source_context_flags(job)
 
         if config.get("langsmith_api_key"):
             os.environ["LANGCHAIN_TRACING_V2"] = "true"
@@ -3784,7 +4574,7 @@ def _execute_process_file_impl(job_id: str, data: Dict[str, Any]) -> None:
             source_ids = [
                 source.get("source_id")
                 for source in source_registry
-                if source.get("contains_main_data", True) or not source.get("contains_reference_data")
+                if source_is_main_data_for_processing(job, source)
             ] or [selected_source_id]
 
         _record_job_debug(
@@ -4038,10 +4828,11 @@ def process_file(job_id):
 
     source_ids = [selected_source_id]
     if process_all_sources:
+        refresh_job_source_context_flags(job)
         source_ids = [
             source.get("source_id")
             for source in source_registry
-            if source.get("contains_main_data", True) or not source.get("contains_reference_data")
+            if source_is_main_data_for_processing(job, source)
         ] or [selected_source_id]
 
     if job.get("_process_worker_running"):
@@ -4086,6 +4877,14 @@ def _download_availability(job: Dict[str, Any]) -> Dict[str, bool]:
     excel_ok = _is_file(excel_p)
     post_ok = _is_file(post_p) and excel_ok and str(post_p) != str(excel_p)
 
+    from sia.debug.processing_log import processing_log_path
+
+    processing_log_ok = False
+    try:
+        processing_log_ok = processing_log_path(str(job.get("id") or "")).is_file()
+    except Exception:
+        processing_log_ok = False
+
     return {
         "excel": excel_ok,
         "schema": _is_file(out.get("schema")),
@@ -4093,6 +4892,8 @@ def _download_availability(job: Dict[str, Any]) -> Dict[str, bool]:
         "pre_transform": _is_file(pre_p),
         "post_transform": post_ok,
         "artifacts_bundle": _is_file(bundle_p),
+        "processing_log": processing_log_ok or bool(job.get("steps")),
+        "debug_json": True,
     }
 
 
@@ -4117,6 +4918,14 @@ def get_status(job_id):
     except Exception:
         payload["ux_stepper_summary"] = {}
     try:
+        from sia.evals.display import build_active_context_scope, compute_context_health
+
+        payload["context_health"] = compute_context_health(job)
+        payload["active_context_scope"] = build_active_context_scope(job)
+    except Exception:
+        payload["context_health"] = {}
+        payload["active_context_scope"] = {}
+    try:
         from sia.agent.transformation_phase_banner import build_transformation_phase_banner
 
         payload["transformation_phase_banner"] = build_transformation_phase_banner(
@@ -4127,6 +4936,8 @@ def get_status(job_id):
         )
     except Exception:
         payload["transformation_phase_banner"] = {}
+    if payload.get("status") in ("completed", "cancelled", "error"):
+        payload["requires_review"] = False
     return jsonify(payload)
 
 
@@ -4168,6 +4979,44 @@ def download_file(job_id, file_type):
     elif file_type == 'artifacts':
         artifacts = job.get("artifact_files") or {}
         file_path = artifacts.get("artifacts_bundle")
+    elif file_type == 'debug-json':
+        from sia.context.diff_log import build_debug_export_payload
+        import io
+
+        payload = build_debug_export_payload(job)
+        buf = io.BytesIO(json.dumps(payload, indent=2, default=str).encode("utf-8"))
+        return send_file(
+            buf,
+            mimetype="application/json",
+            as_attachment=True,
+            download_name=f"{job_id}_debug.json",
+        )
+    elif file_type == 'processing-log':
+        from sia.debug.processing_log import format_processing_line, processing_log_path
+        import io
+
+        log_path = processing_log_path(job_id)
+        if log_path.is_file():
+            return send_file(
+                log_path,
+                mimetype="text/plain",
+                as_attachment=True,
+                download_name=f"{job_id}_processing.log",
+            )
+        lines = [
+            format_processing_line(step)
+            for step in (job.get("steps") or [])
+            if isinstance(step, dict)
+        ]
+        if not lines:
+            return jsonify({"error": "Processing log not found"}), 404
+        buf = io.BytesIO(("\n".join(lines) + "\n").encode("utf-8"))
+        return send_file(
+            buf,
+            mimetype="text/plain",
+            as_attachment=True,
+            download_name=f"{job_id}_processing.log",
+        )
     else:
         return jsonify({"error": "Invalid file type"}), 400
     
@@ -4208,6 +5057,7 @@ def snapshot_preview(job_id: str):
             df = pd.read_csv(file_path, nrows=100)
         else:
             df = pd.read_excel(file_path, sheet_name=0, nrows=100, engine="openpyxl")
+        df = promote_numeric_header_row_for_preview(df)
     except Exception as ex:
         logger.warning("[SNAPSHOT_PREVIEW] read failed %s: %s", safe_name, ex)
         return jsonify({"error": str(ex)}), 400
@@ -4242,8 +5092,19 @@ def list_jobs():
     
     # Sort by created_at descending
     jobs.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-    
-    return jsonify({"jobs": jobs})
+
+    total = len(jobs)
+    warn = total >= JOB_RETENTION_WARN_COUNT
+    return jsonify({
+        "jobs": jobs,
+        "total_count": total,
+        "retention_warning": warn,
+        "retention_threshold": JOB_RETENTION_WARN_COUNT,
+        "retention_message": (
+            f"{total} jobs in memory. Delete finished jobs to free RAM on this server."
+            if warn else ""
+        ),
+    })
 
 
 @app.route('/api/jobs/<job_id>', methods=['DELETE'])
@@ -4296,6 +5157,8 @@ def delete_job(job_id):
         except Exception as e:
             logger.warning(f"[JOBS] Failed to delete file for job {job_id}: {resolved} ({e})")
 
+    deleted_snapshots = _delete_tool_snapshots_for_job(job_id, job)
+
     removed_job = job_manager.remove_job(job_id)
     if not removed_job:
         return jsonify({"error": "Job not found"}), 404
@@ -4304,6 +5167,7 @@ def delete_job(job_id):
         "success": True,
         "job_id": job_id,
         "deleted_files_count": len(deleted_files),
+        "deleted_snapshots_count": len(deleted_snapshots),
         "message": "Job deleted"
     })
 
@@ -4361,26 +5225,88 @@ def remove_job_data_file(job_id):
 @app.route('/api/evals', methods=['GET'])
 def list_evals():
     """List all job evaluations."""
+    from sia.evals.display import build_eval_display, eval_display_sort_key
+
     evals = []
     for job_id, job in job_manager.jobs.items():
-        # Check if job has trace with judge result
-        trace = job.get("trace", {})
-        judge_result = trace.get("judge_result") if trace else None
-        
-        if judge_result or job.get("status") == "completed":
-            evals.append({
-                "job_id": job_id,
-                "filename": job.get("filename"),
-                "status": job.get("status"),
-                "created_at": job.get("created_at"),
-                "judge_result": judge_result,
-                "overall_confidence": job.get("overall_confidence", 0.0)
-            })
-    
-    # Sort by created_at descending
-    evals.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-    
+        if not _job_visible_in_evals(job):
+            continue
+        judge_result = _collect_job_judge_result(job)
+        eval_display = build_eval_display(job)
+        evals.append({
+            "job_id": job_id,
+            "filename": job.get("filename"),
+            "status": job.get("status"),
+            "created_at": job.get("created_at"),
+            "judge_result": judge_result,
+            "judge_pending": judge_result is None,
+            "pipeline_evals": job.get("pipeline_evals"),
+            "eval_display": eval_display,
+            "overall_confidence": job.get("overall_confidence", 0.0),
+        })
+
+    evals.sort(
+        key=lambda x: (
+            eval_display_sort_key(x.get("eval_display") or {}, str(x.get("created_at") or ""))[0],
+            str(x.get("created_at") or ""),
+        ),
+        reverse=False,
+    )
+    # Within same verdict bucket, newest first (created_at is second sort key — invert manually)
+    by_verdict: Dict[str, List[Dict[str, Any]]] = {}
+    for row in evals:
+        v = str((row.get("eval_display") or {}).get("verdict") or "pending")
+        by_verdict.setdefault(v, []).append(row)
+    ordered: List[Dict[str, Any]] = []
+    for verdict in ("blocked", "advisory", "pending", "pass"):
+        bucket = by_verdict.pop(verdict, [])
+        bucket.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+        ordered.extend(bucket)
+    for rest in by_verdict.values():
+        rest.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+        ordered.extend(rest)
+    evals = ordered
+
     return jsonify({"evals": evals})
+
+
+@app.route('/api/evals/<job_id>', methods=['GET'])
+def get_job_evals(job_id):
+    """Detailed pipeline evals scorecard for one job."""
+    from sia.evals.display import build_eval_display
+    from sia.evals.runner import PipelineEvalRunner
+
+    job = job_manager.get_job(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    pe = PipelineEvalRunner.ensure(job)
+    return jsonify(
+        {
+            "job_id": job_id,
+            "filename": job.get("filename"),
+            "status": job.get("status"),
+            "created_at": job.get("created_at"),
+            "pipeline_evals": pe,
+            "eval_display": build_eval_display(job),
+            "judge_result": _collect_job_judge_result(job),
+        }
+    )
+
+
+@app.route('/api/jobs/<job_id>/pipeline-evals/override', methods=['POST'])
+def override_pipeline_evals_gate(job_id):
+    """Analyst override for critical gate (logged to pipeline_evals.overrides)."""
+    job = job_manager.get_job(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    data = request.get_json(silent=True) or {}
+    reason = str(data.get("reason") or "").strip()
+    if not reason:
+        return jsonify({"error": "reason is required"}), 400
+    from sia.evals.runner import PipelineEvalRunner
+
+    PipelineEvalRunner.record_override(job, reason=reason, actor=str(data.get("actor") or "analyst"))
+    return jsonify({"success": True, "critical_gate": _pipeline_eval_gate_payload(job)})
 
 
 @app.route('/api/health', methods=['GET'])
@@ -4432,32 +5358,176 @@ def get_debug_info(job_id):
                 }
             )
 
-    return jsonify({
-        "job_id": job_id,
-        "status": job.get("status"),
-        "filename": job.get("filename"),
-        "file_path": job.get("file_path"),
-        "output_file": job.get("output_file") or (trace.get("output_file") if isinstance(trace, dict) else None),
-        "steps": job.get("steps", []),
-        "error_details": job.get("error_details"),
-        "trace": trace,
-        "source_traces": source_traces,
-        "source_registry": source_registry_summary,
-        "schema": job.get("schema"),
-        "llm_traces": job.get("llm_traces"),
-        "llm_summary": _job_llm_summary_for_api(job),
-        "tool_executions": job.get("tool_executions"),
-        "debug_events": job.get("debug_events"),
-        "job_debug_events": get_job_debug_timeline(job),
-        "data_files_summary": data_files_summary(job),
-        "setup_summary": job_setup_summary(job),
-        "state_snapshots": job.get("state_snapshots", []),
-        "data_preview": job.get("data_preview", []),
-        "data_preview_column_order": job.get("data_preview_column_order", []),
-        "lifecycle_events": lifecycle_events or [],
-        "hitl_pause_type": trace.get("hitl_pause_type") if isinstance(trace, dict) else None,
-        "hitl_pending": trace.get("hitl_pending") if isinstance(trace, dict) else False,
-    })
+    return jsonify(
+        sanitize_json_tree(
+            {
+                "job_id": job_id,
+                "status": job.get("status"),
+                "filename": job.get("filename"),
+                "file_path": job.get("file_path"),
+                "output_file": job.get("output_file") or (trace.get("output_file") if isinstance(trace, dict) else None),
+                "steps": job.get("steps", []),
+                "error_details": job.get("error_details"),
+                "trace": trace,
+                "source_traces": source_traces,
+                "source_registry": source_registry_summary,
+                "schema": job.get("schema"),
+                "llm_traces": job.get("llm_traces"),
+                "llm_summary": _job_llm_summary_for_api(job),
+                "tool_executions": job.get("tool_executions"),
+                "debug_events": job.get("debug_events"),
+                "job_debug_events": get_job_debug_timeline(job),
+                "data_files_summary": data_files_summary(job),
+                "setup_summary": job_setup_summary(job),
+                "state_snapshots": job.get("state_snapshots", []),
+                "data_preview": job.get("data_preview", []),
+                "data_preview_column_order": job.get("data_preview_column_order", []),
+                "lifecycle_events": lifecycle_events or [],
+                "hitl_pause_type": trace.get("hitl_pause_type") if isinstance(trace, dict) else None,
+                "hitl_pending": trace.get("hitl_pending") if isinstance(trace, dict) else False,
+                "pipeline_evals": job.get("pipeline_evals"),
+                "eval_display": _build_eval_display_for_job(job),
+                "context_diff_log": list(job.get("context_diff_log") or []),
+            }
+        )
+    )
+
+
+@app.route('/api/debug/<job_id>/context/<path:source_id>', methods=['GET'])
+def get_source_context_debug(job_id: str, source_id: str):
+    """Per-source context inspector: scoped fields, evidence, snippets, fingerprint."""
+    job = job_manager.get_job(job_id)
+    if not job:
+        if job_id not in processing_results:
+            return jsonify({"error": "Job not found"}), 404
+        job = processing_results[job_id]
+    from sia.context.debug import build_source_context_debug_payload
+
+    try:
+        target_template = load_target_template_for_job(job)
+    except Exception:
+        target_template = None
+    return jsonify(
+        build_source_context_debug_payload(
+            job,
+            str(source_id),
+            target_template=target_template,
+        )
+    )
+
+
+def _resolve_job_for_debug(job_id: str) -> Optional[Dict[str, Any]]:
+    job = job_manager.get_job(job_id)
+    if job:
+        return job
+    if job_id in processing_results:
+        return processing_results[job_id]
+    return None
+
+
+@app.route('/api/debug/<job_id>/checkpoints', methods=['GET'])
+@app.route('/api/debug/<job_id>/checkpoints/<stage_id>', methods=['GET'])
+def get_checkpoint_export(job_id: str, stage_id: Optional[str] = None):
+    """
+    Export pipeline review checkpoints as one JSON bundle per stage.
+
+    Query params:
+      source_id — per-source stages (defaults to first registry source)
+      full_packet=true — rebuild full context_packet per stage (not just compact snapshot)
+    """
+    job = _resolve_job_for_debug(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+
+    source_id = (request.args.get("source_id") or "").strip() or None
+    full_packet = (request.args.get("full_packet") or "").strip().lower() in ("1", "true", "yes")
+    try:
+        target_template = load_target_template_for_job(job)
+    except Exception:
+        target_template = None
+
+    from sia.debug.checkpoint_export import build_checkpoint_export
+
+    payload = build_checkpoint_export(
+        job,
+        source_id=source_id,
+        stage_id=(stage_id or "").strip() or None,
+        full_packet=full_packet,
+        target_template=target_template,
+    )
+    if payload.get("error") and stage_id:
+        return jsonify(payload), 404
+    return jsonify(payload)
+
+
+@app.route('/api/download/<job_id>/checkpoints-json', methods=['GET'])
+def download_checkpoint_export(job_id: str):
+    """Download checkpoint export JSON (same body as GET /api/debug/<job_id>/checkpoints)."""
+    import io
+
+    job = _resolve_job_for_debug(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+
+    source_id = (request.args.get("source_id") or "").strip() or None
+    full_packet = (request.args.get("full_packet") or "").strip().lower() in ("1", "true", "yes")
+    stage_id = (request.args.get("stage") or request.args.get("stage_id") or "").strip() or None
+    try:
+        target_template = load_target_template_for_job(job)
+    except Exception:
+        target_template = None
+
+    from sia.debug.checkpoint_export import build_checkpoint_export
+
+    payload = build_checkpoint_export(
+        job,
+        source_id=source_id,
+        stage_id=stage_id,
+        full_packet=full_packet,
+        target_template=target_template,
+    )
+    buf = io.BytesIO(json.dumps(payload, indent=2, default=str).encode("utf-8"))
+    suffix = f"_{stage_id}" if stage_id else ""
+    src = f"_{source_id.split(':')[-1]}" if source_id else ""
+    return send_file(
+        buf,
+        mimetype="application/json",
+        as_attachment=True,
+        download_name=f"{job_id}_checkpoints{src}{suffix}.json",
+    )
+
+
+# ===== Tests module API =====
+
+@app.route('/api/tests/list', methods=['GET'])
+def list_test_scenarios():
+    """List agent test scenarios for the Tests UI."""
+    from sia.agent.test_runner import TestRunner
+
+    config = load_user_config()
+    runner = TestRunner(api_key=config.get("api_key"))
+    return jsonify({"success": True, "tests": runner.get_scenarios()})
+
+
+@app.route('/api/tests/run/<scenario_id>', methods=['POST'])
+def run_test_scenario(scenario_id: str):
+    """Run a single test scenario."""
+    from sia.agent.test_runner import TestRunner
+
+    config = load_user_config()
+    runner = TestRunner(api_key=config.get("api_key"))
+    result = runner.run_test(str(scenario_id))
+    if result.get("success"):
+        return jsonify(result)
+    return jsonify(result), 400
+
+
+@app.route('/api/tests/checkpoints/stages', methods=['GET'])
+def list_checkpoint_stages():
+    """Pipeline checkpoint stage catalog for Tests module checkpoint export UI."""
+    from sia.debug.checkpoint_export import list_checkpoint_specs
+
+    return jsonify({"success": True, "stages": list_checkpoint_specs()})
 
 
 # ===== HITL Review API Endpoints =====
@@ -4465,6 +5535,7 @@ def get_debug_info(job_id):
 @app.route('/api/review/pending', methods=['GET'])
 def get_pending_reviews():
     """List all items pending human review (both low confidence and destructive approvals)."""
+    _rehydrate_all_stale_relationship_checkpoints()
     pending = job_manager.get_all_pending_reviews()
     
     return jsonify({
@@ -4520,14 +5591,22 @@ def _planning_summary_for_review_job(job: Dict[str, Any]) -> Dict[str, Any]:
             selected_sheet=selected_sheet,
             selected_source_id=selected_source_id,
         )
-        return ContextPacket(**pkt).planning_summary()
+        return build_canonical_planning_view(pkt)
     except Exception as ex:
         logger.warning("Could not build planning_summary for review checkpoint: %s", ex)
         return {}
 
 
 def _preview_scalar_for_json(val: Any) -> Any:
-    if val is None or isinstance(val, (bool, int, float, str)):
+    import math
+
+    if val is None:
+        return None
+    if isinstance(val, float):
+        if math.isnan(val) or math.isinf(val):
+            return None
+        return val
+    if isinstance(val, (bool, int, str)):
         return val
     return str(val)
 
@@ -4624,9 +5703,11 @@ def _enrich_approval_items_with_previews(job: Dict[str, Any], approval_items: Li
 @app.route('/api/review/checkpoint/<checkpoint_id>', methods=['GET'])
 def get_checkpoint_details(checkpoint_id):
     """Get detailed review information for a specific checkpoint."""
-    checkpoint = job_manager.pending_checkpoints.get(checkpoint_id)
+    checkpoint_id, checkpoint = _lookup_checkpoint_for_review(checkpoint_id)
     if not checkpoint:
         return jsonify({"error": "Checkpoint not found"}), 404
+    if checkpoint.get("status") != "pending":
+        return jsonify({"error": "Checkpoint already resolved"}), 404
 
     job = job_manager.get_job(checkpoint.get("job_id")) or {}
     pending_state = checkpoint.get("pending_state") or {}
@@ -4658,17 +5739,48 @@ def get_checkpoint_details(checkpoint_id):
         for key, value in checkpoint.items()
         if key != "pending_state"
     }
+    output_preview, output_preview_columns = _stall_output_preview(job, pending_state, context_packet)
     return jsonify({
         **checkpoint_payload,
+        "checkpoint_id": checkpoint_id,
         "job_status": job.get("status"),
         "steps": job.get("steps", []),
         "trace": job.get("trace", {}),
-        "data_preview": job.get("data_preview", []),
+        "data_preview": output_preview or job.get("data_preview", []),
+        "data_preview_column_order": output_preview_columns or job.get("data_preview_column_order", []),
         "schema_preview": job.get("schema"),
         "plan": plan_payload,
         "planning_summary": planning_summary,
         "lineage": context_packet.get("lineage") or {},
     })
+
+
+@app.route("/api/review/checkpoint/<checkpoint_id>/plan-impact-preview", methods=["GET"])
+def get_plan_impact_preview(checkpoint_id: str):
+    """Simulate destructive plan steps and return row/column removal previews for plan review."""
+    checkpoint_id, checkpoint = _lookup_checkpoint_for_review(checkpoint_id)
+    if not checkpoint:
+        return jsonify({"error": "Checkpoint not found"}), 404
+
+    job = job_manager.get_job(checkpoint.get("job_id")) or {}
+    pending_state = checkpoint.get("pending_state") or {}
+    trigger_data = checkpoint.get("trigger_data") or {}
+    plan_payload = _serialize_plan_for_review(pending_state.get("extraction_plan"))
+    if not plan_payload:
+        plan_payload = _serialize_plan_for_review(trigger_data)
+    tool_calls = list((plan_payload or {}).get("tool_calls") or trigger_data.get("tool_calls") or [])
+
+    from sia.agent.plan_destructive_preview import compute_plan_destructive_impacts
+
+    payload = compute_plan_destructive_impacts(
+        job,
+        pending_state,
+        tool_calls,
+        resolve_job_source_fn=resolve_job_source,
+    )
+    payload["checkpoint_id"] = checkpoint_id
+    payload["job_id"] = checkpoint.get("job_id")
+    return jsonify(payload)
 
 
 def _relationship_duplicate_visual_sample(
@@ -4754,27 +5866,34 @@ def get_relationship_preview_samples(checkpoint_id: str):
     """First rows per source + illustrative combined head for file-relationship review (analyst preview)."""
     body = request.get_json(silent=True) if request.method == "POST" and request.is_json else {}
     body = body or {}
-    checkpoint = job_manager.pending_checkpoints.get(checkpoint_id)
+    checkpoint_id, checkpoint = _lookup_checkpoint_for_review(checkpoint_id)
     if not checkpoint or checkpoint.get("type") != "file_relationship_review":
         return jsonify({"error": "Not found"}), 404
     job_id = checkpoint.get("job_id")
     job = job_manager.get_job(job_id) if job_id else None
     if not job:
         return jsonify({"error": "Job not found"}), 404
+    refresh_job_source_context_flags(job)
+    trigger_data = checkpoint.get("trigger_data") or {}
     proposals = list(
-        (checkpoint.get("trigger_data") or {}).get("relationship_proposals")
+        trigger_data.get("relationship_proposals")
         or job.get("relationship_proposals")
         or []
     )
-    summaries = list((checkpoint.get("trigger_data") or {}).get("sources") or [])
+    summaries = list(trigger_data.get("sources") or [])
     sid_order: List[str] = []
     for prop in proposals:
         for sid in prop.get("source_ids") or []:
             s = str(sid)
+            source = resolve_job_source(job, source_id=s) or {}
+            if not source_is_main_data_for_processing(job, source):
+                continue
             if s and s not in sid_order:
                 sid_order.append(s)
     if not sid_order:
         for row in job.get("source_registry") or []:
+            if not source_is_main_data_for_processing(job, row):
+                continue
             s = str(row.get("source_id") or "")
             if s and s not in sid_order:
                 sid_order.append(s)
@@ -4783,39 +5902,67 @@ def get_relationship_preview_samples(checkpoint_id: str):
     frames_by_source: Dict[str, pd.DataFrame] = {}
     sample_limit = 3
     frame_cap = 120
-    for sid in sid_order:
-        source = resolve_job_source(job, source_id=sid)
-        if not source:
-            continue
-        sheet_name = str(source.get("sheet_name") or "")
-        scoped = dict(((job.get("source_scope_registry") or {}).get(str(sid))) or {})
-        try:
-            eff_path, eff_sheet, eff_scoped, _used = resolve_processing_workbook(
-                job,
-                str(sid),
-                str(source.get("file_path") or job.get("file_path") or ""),
-                sheet_name,
-                scoped,
+    pending_frames = job.get("_pending_collation_frames") if trigger_data.get("post_execution") else None
+    if isinstance(pending_frames, dict) and pending_frames:
+        for sid in sid_order:
+            fr = pending_frames.get(str(sid))
+            if fr is None or not hasattr(fr, "shape") or fr.empty:
+                continue
+            head = fr.head(sample_limit)
+            sm = summary_by_id.get(str(sid)) or {}
+            source = resolve_job_source(job, source_id=sid) or {}
+            inputs.append(
+                {
+                    "source_id": str(sid),
+                    "file_name": str(sm.get("file_name") or source.get("file_name") or ""),
+                    "sheet_name": str(sm.get("sheet_name") or source.get("sheet_name") or ""),
+                    "columns": [str(c) for c in head.columns],
+                    "rows": safe_serialize_df(head),
+                }
             )
-            raw_df = load_raw_sheet_dataframe(str(eff_path), str(eff_sheet or sheet_name))
-            df, _ = load_scoped_dataframe(str(eff_path), str(eff_sheet or sheet_name), eff_scoped or scoped, raw_df=raw_df)
-        except Exception as ex:
-            logger.warning("[REL_PREVIEW] skip source %s: %s", sid, ex)
-            continue
-        if df is None or df.empty:
-            continue
-        head = df.head(sample_limit)
-        sm = summary_by_id.get(str(sid)) or {}
-        inputs.append(
-            {
-                "source_id": str(sid),
-                "file_name": str(sm.get("file_name") or source.get("file_name") or ""),
-                "sheet_name": str(sm.get("sheet_name") or source.get("sheet_name") or eff_sheet or sheet_name),
-                "columns": [str(c) for c in head.columns],
-                "rows": safe_serialize_df(head),
-            }
+            frames_by_source[str(sid)] = fr.head(frame_cap)
+    else:
+        for sid in sid_order:
+            source = resolve_job_source(job, source_id=sid)
+            if not source:
+                continue
+            sheet_name = str(source.get("sheet_name") or "")
+            scoped = dict(((job.get("source_scope_registry") or {}).get(str(sid))) or {})
+            try:
+                eff_path, eff_sheet, eff_scoped, _used = resolve_processing_workbook(
+                    job,
+                    str(sid),
+                    str(source.get("file_path") or job.get("file_path") or ""),
+                    sheet_name,
+                    scoped,
+                )
+                raw_df = load_raw_sheet_dataframe(str(eff_path), str(eff_sheet or sheet_name))
+                df, _ = load_scoped_dataframe(str(eff_path), str(eff_sheet or sheet_name), eff_scoped or scoped, raw_df=raw_df)
+            except Exception as ex:
+                logger.warning("[REL_PREVIEW] skip source %s: %s", sid, ex)
+                continue
+            if df is None or df.empty:
+                continue
+            head = df.head(sample_limit)
+            sm = summary_by_id.get(str(sid)) or {}
+            inputs.append(
+                {
+                    "source_id": str(sid),
+                    "file_name": str(sm.get("file_name") or source.get("file_name") or ""),
+                    "sheet_name": str(sm.get("sheet_name") or source.get("sheet_name") or eff_sheet or sheet_name),
+                    "columns": [str(c) for c in head.columns],
+                    "rows": safe_serialize_df(head),
+                }
+            )
+            frames_by_source[str(sid)] = df.head(frame_cap)
+    target_tpl = load_target_template_for_job(job)
+    if frames_by_source and len(frames_by_source) >= 2:
+        proposals = refresh_union_join_keys_in_proposals(
+            proposals,
+            summaries,
+            target_template=target_tpl,
+            frames_by_source=frames_by_source,
         )
-        frames_by_source[str(sid)] = df.head(frame_cap)
     applied = apply_relationship_decisions(proposals, [])
     query_mode = str(body.get("duplicate_merge_mode") or request.args.get("duplicate_merge_mode") or "").strip()
     if query_mode:
@@ -4833,6 +5980,7 @@ def get_relationship_preview_samples(checkpoint_id: str):
     exact_groups: List[Dict[str, Any]] = []
     partial_groups: List[Dict[str, Any]] = []
     union_source_labels: List[str] = []
+    union_source_meta: List[Dict[str, Any]] = []
     duplicate_decisions: Dict[str, Dict[str, str]] = {}
     applied_for_collate = applied
 
@@ -4848,22 +5996,36 @@ def get_relationship_preview_samples(checkpoint_id: str):
             dup = int(diag.get("duplicate_rows_on_keys") or 0)
             conflict = bool(diag.get("numeric_conflict_on_duplicate_keys"))
             subset = list(diag.get("subset_for_dedupe") or [])
+            uid_rows = _union_stack_source_ids(norm_frames, applied)
+            for sid in uid_rows:
+                inp = next((x for x in inputs if str(x.get("source_id")) == str(sid)), None)
+                source = resolve_job_source(job, source_id=sid) or {}
+                file_name = str(
+                    (inp or {}).get("file_name")
+                    or source.get("file_name")
+                    or job.get("filename")
+                    or ""
+                ).strip()
+                sheet_name = str(
+                    (inp or {}).get("sheet_name") or source.get("sheet_name") or ""
+                ).strip()
+                union_source_meta.append(
+                    {
+                        "source_id": str(sid),
+                        "file_name": file_name,
+                        "sheet_name": sheet_name,
+                    }
+                )
+                lab = f"{file_name} · {sheet_name}".strip(" ·")
+                union_source_labels.append(lab or str(sid))
             if stacked is not None and not stacked.empty and dup > 0 and subset:
-                uid_rows = _union_stack_source_ids(norm_frames, applied)
-                union_source_labels = []
-                for sid in uid_rows:
-                    inp = next((x for x in inputs if str(x.get("source_id")) == str(sid)), None)
-                    if inp:
-                        lab = f"{inp.get('file_name') or ''} · {inp.get('sheet_name') or ''}".strip()
-                        union_source_labels.append(lab or str(sid))
-                    else:
-                        union_source_labels.append(str(sid))
                 breaks = union_stack_break_row_indices(frames_by_source, applied)
                 exact_groups, partial_groups = enumerate_duplicate_key_groups_for_review(
                     stacked,
                     subset,
                     union_break_before_row=breaks,
                     source_labels=union_source_labels,
+                    source_meta=union_source_meta,
                 )
                 for grp in exact_groups + partial_groups:
                     if grp.get("rows"):
@@ -4882,7 +6044,6 @@ def get_relationship_preview_samples(checkpoint_id: str):
     output_sample: Optional[Dict[str, Any]] = None
     combined: Optional[pd.DataFrame] = None
     try:
-        target_tpl = load_target_template_for_job(job)
         combined = collate_frames(frames_by_source, applied_for_collate, target_template=target_tpl)
         if combined is not None and not combined.empty:
             preview_cap = min(120, int(len(combined)))
@@ -4921,6 +6082,7 @@ def get_relationship_preview_samples(checkpoint_id: str):
                 "partial_duplicate_groups": partial_groups,
                 "source_1_label": union_source_labels[0] if len(union_source_labels) > 0 else "Source 1",
                 "source_2_label": union_source_labels[1] if len(union_source_labels) > 1 else "Source 2",
+                "union_source_stack": list(union_source_meta) if union_source_meta else [],
                 "row_count_before_stack": row_count_before_stack,
                 "row_count_stacked": stacked_n,
                 "rows_removed_duplicate": rows_removed_duplicate,
@@ -5010,13 +6172,16 @@ def resolve_checkpoint_review(checkpoint_id):
     )
     # endregion
     if checkpoint_id not in job_manager.pending_checkpoints:
-        return jsonify({"error": "Checkpoint not found"}), 404
-    
+        checkpoint_id, cp = _lookup_checkpoint_for_review(checkpoint_id)
+        if not cp:
+            return jsonify({"error": "Checkpoint not found"}), 404
+    else:
+        cp = job_manager.pending_checkpoints[checkpoint_id]
+
     data = request.json or {}
     action = data.get("action", "approve")
     resolution_data = data.get("resolution_data", {})
-    
-    cp = job_manager.pending_checkpoints[checkpoint_id]
+
     cp_type = cp.get("type")
     job_id = cp.get("job_id")
     job = job_manager.get_job(job_id) if job_id else None
@@ -5115,7 +6280,39 @@ def resolve_checkpoint_review(checkpoint_id):
             if job.get("_process_worker_running"):
                 return jsonify({"error": "Processing is already running for this job."}), 409
 
-            if job.get("_pending_collation_frames"):
+            proceed_anyway = bool(resolution_data.get("proceed_anyway"))
+            override_reason = str(resolution_data.get("override_reason") or "").strip()
+            if _pipeline_eval_gate_blocks(job) and not proceed_anyway:
+                return jsonify(
+                    {
+                        "error": "Pipeline evals critical gate blocked export/collation",
+                        "critical_gate": _pipeline_eval_gate_payload(job),
+                        "requires_override": True,
+                    }
+                ), 409
+            if proceed_anyway and override_reason:
+                from sia.evals.runner import PipelineEvalRunner
+
+                PipelineEvalRunner.record_override(job, reason=override_reason)
+
+            resume_plan = _relationship_review_resume_plan(job, cp)
+            if resume_plan == "already_done":
+                return jsonify({
+                    "success": True,
+                    "checkpoint_id": checkpoint_id,
+                    "action": action,
+                    "status": "completed",
+                    "job_id": job_id,
+                    "message": "Job already completed; relationship choice was already applied.",
+                })
+            if resume_plan == "missing_frames":
+                return jsonify({
+                    "error": (
+                        "Per-source outputs are no longer available to combine. "
+                        "Do not approve this review again; start a new job if you need a fresh export."
+                    ),
+                }), 409
+            if resume_plan == "collation_only" or job.get("_pending_collation_frames"):
                 job["_relationship_resume_running"] = True
                 job["requires_review"] = False
                 job_manager.update_job_status(
@@ -5309,17 +6506,34 @@ def resolve_checkpoint_review(checkpoint_id):
             except Exception as exc:
                 logger.debug("[HITL] Failed to record resume debug for %s: %s", job_id, exc)
 
+            if job.get("_plan_review_resume_running") or job.get("_process_worker_running"):
+                return jsonify({"error": "Processing is already running for this job."}), 409
+
             config = load_user_config()
-            resume_response = _run_resumed_processing(job_id, job, pending_state, config)
-            if isinstance(resume_response, tuple) and len(resume_response) == 2:
-                resp_obj, status_code = resume_response
-                payload = (resp_obj.get_json(silent=True) if resp_obj is not None else None) or {}
-            else:
-                resp_obj = resume_response
-                payload = (resp_obj.get_json(silent=True) if resp_obj is not None else None) or {}
-                status_code = getattr(resp_obj, "status_code", 200) or 200
-            payload["feedback"] = feedback_summary
-            return jsonify(payload), status_code
+            job["_plan_review_resume_running"] = True
+            job["requires_review"] = False
+            job_manager.update_job_status(
+                job_id,
+                "processing",
+                "Resuming after planner review…",
+                "Processing",
+            )
+            threading.Thread(
+                target=_execute_plan_review_resume,
+                args=(job_id, pending_state, config),
+                daemon=True,
+            ).start()
+            return jsonify(
+                {
+                    "success": True,
+                    "checkpoint_id": checkpoint_id,
+                    "action": action,
+                    "status": "processing",
+                    "job_id": job_id,
+                    "message": "Plan accepted. Open Processing to watch progress.",
+                    "feedback": feedback_summary,
+                }
+            )
         if action in {"cancel", "reject"}:
             cancelled_job = job_manager.cancel_job(job_id, resolution_data.get("reason") or "Planner review cancelled by user")
             return jsonify({
@@ -5331,6 +6545,243 @@ def resolve_checkpoint_review(checkpoint_id):
                 "message": "Job cancelled from planner review",
                 "job_status": (cancelled_job or {}).get("status", "cancelled"),
             })
+
+    if cp_type == "checksum_failure":
+        if action in {"approve", "investigate"}:
+            pending_state = dict(cp.get("pending_state") or {})
+            if not pending_state:
+                return jsonify({"error": "No saved execution state to resume from"}), 500
+
+            trigger_data = cp.get("trigger_data") or {}
+            violation = trigger_data.get("integrity_violation") or {}
+            resume_after = trigger_data.get("tool_index")
+            if resume_after is None:
+                resume_after = violation.get("tool_index")
+
+            pending_state["hitl_pending_approval"] = False
+            pending_state["hitl_pause_type"] = None
+            pending_state["hitl_resume_from"] = "integrity_review"
+            pending_state["requires_review"] = False
+            pending_state["review_reason"] = ""
+            pending_state["integrity_suppress_checks"] = True
+            pending_state["integrity_pause_tool"] = (
+                violation.get("tool")
+                or pending_state.get("integrity_pause_tool")
+            )
+            pending_state.pop("resume_skip_pipeline_after_load", None)
+            pending_state["resume_graph_from"] = "execute_tools"
+            if resume_after is not None:
+                pending_state["integrity_resume_after_tool_index"] = int(resume_after)
+
+            inferred_sid = _resolve_resume_source_id(job, pending_state)
+            if inferred_sid:
+                pending_state["source_id"] = inferred_sid
+
+            config = load_user_config()
+            resume_response = _run_resumed_processing(job_id, job, pending_state, config)
+            if isinstance(resume_response, tuple) and len(resume_response) == 2:
+                resp_obj, status_code = resume_response
+                payload = (resp_obj.get_json(silent=True) if resp_obj is not None else None) or {}
+            else:
+                resp_obj = resume_response
+                payload = (resp_obj.get_json(silent=True) if resp_obj is not None else None) or {}
+                status_code = getattr(resp_obj, "status_code", 200) or 200
+            payload["message"] = (
+                payload.get("message")
+                or "Integrity review acknowledged — resuming tool execution."
+            )
+            return jsonify(payload), status_code
+
+        if action in {"cancel", "reject"}:
+            cancelled_job = job_manager.cancel_job(
+                job_id,
+                resolution_data.get("reason") or "Data integrity review cancelled by user",
+            )
+            return jsonify({
+                "success": True,
+                "checkpoint_id": checkpoint_id,
+                "action": action,
+                "status": "cancelled",
+                "job_id": job_id,
+                "message": "Job cancelled from data integrity review",
+                "job_status": (cancelled_job or {}).get("status", "cancelled"),
+            })
+
+    if cp_type == "schema_mismatch":
+        if action in {"approve", "accept", "accept_as_is", "resolve"}:
+            pending_state = dict(cp.get("pending_state") or {})
+            if not pending_state:
+                return jsonify({"error": "No saved execution state to resume from"}), 500
+
+            trigger_data = cp.get("trigger_data") or {}
+            violations = list(trigger_data.get("constraint_violations") or [])
+            decisions = resolution_data.get("constraint_decisions") or {}
+            if not isinstance(decisions, dict):
+                decisions = {}
+
+            # Default missing decisions to keep_as_is so Approve always unblocks.
+            for v in violations:
+                col = str((v or {}).get("column") or "").strip()
+                if col and col not in decisions:
+                    decisions[col] = "keep_as_is"
+
+            notes: List[str] = []
+            current_df = pending_state.get("current_df")
+            if isinstance(current_df, pd.DataFrame) and decisions:
+                from sia.integrity.schema_constraints import apply_constraint_resolutions
+
+                current_df, notes = apply_constraint_resolutions(
+                    current_df, decisions, violations
+                )
+                pending_state["current_df"] = current_df
+                pending_state["current_frame"] = {
+                    "rows": len(current_df),
+                    "cols": len(current_df.columns),
+                }
+
+            resume_after = trigger_data.get("tool_index")
+            pending_state["hitl_pending_approval"] = False
+            pending_state["hitl_pause_type"] = None
+            pending_state["hitl_resume_from"] = "schema_constraint_review"
+            pending_state["requires_review"] = False
+            pending_state["review_reason"] = ""
+            pending_state["schema_constraint_suppress_checks"] = True
+            pending_state["schema_constraint_decisions"] = decisions
+            pending_state["schema_constraint_pause_tool"] = (
+                trigger_data.get("tool") or "verify.schema"
+            )
+            pending_state["integrity_pause_tool"] = (
+                trigger_data.get("tool")
+                or pending_state.get("integrity_pause_tool")
+                or "verify.schema"
+            )
+            if notes:
+                pending_state["warnings"] = list(pending_state.get("warnings") or []) + notes
+            pending_state.pop("resume_skip_pipeline_after_load", None)
+            pending_state["resume_graph_from"] = "execute_tools"
+            if resume_after is not None:
+                pending_state["integrity_resume_after_tool_index"] = int(resume_after)
+
+            inferred_sid = _resolve_resume_source_id(job, pending_state)
+            if inferred_sid:
+                pending_state["source_id"] = inferred_sid
+
+            config = load_user_config()
+            resume_response = _run_resumed_processing(job_id, job, pending_state, config)
+            if isinstance(resume_response, tuple) and len(resume_response) == 2:
+                resp_obj, status_code = resume_response
+                payload = (resp_obj.get_json(silent=True) if resp_obj is not None else None) or {}
+            else:
+                resp_obj = resume_response
+                payload = (resp_obj.get_json(silent=True) if resp_obj is not None else None) or {}
+                status_code = getattr(resp_obj, "status_code", 200) or 200
+            payload["message"] = (
+                payload.get("message")
+                or "Constraint review acknowledged — resuming."
+            )
+            if notes:
+                payload["constraint_notes"] = notes
+            return jsonify(payload), status_code
+
+        if action in {"cancel", "reject"}:
+            cancelled_job = job_manager.cancel_job(
+                job_id,
+                resolution_data.get("reason") or "Template constraint review cancelled by user",
+            )
+            return jsonify({
+                "success": True,
+                "checkpoint_id": checkpoint_id,
+                "action": action,
+                "status": "cancelled",
+                "job_id": job_id,
+                "message": "Job cancelled from template constraint review",
+                "job_status": (cancelled_job or {}).get("status", "cancelled"),
+            })
+
+    if cp_type == "verification_stall":
+        if action in {"cancel", "reject"}:
+            cancelled_job = job_manager.cancel_job(
+                job_id,
+                resolution_data.get("reason") or "Verification stall cancelled by user",
+            )
+            return jsonify({
+                "success": True,
+                "checkpoint_id": checkpoint_id,
+                "action": action,
+                "status": "cancelled",
+                "job_id": job_id,
+                "message": "Job cancelled from verification stall review",
+                "job_status": (cancelled_job or {}).get("status", "cancelled"),
+            })
+
+        pending_state = dict(cp.get("pending_state") or {})
+        if not pending_state:
+            return jsonify({"error": "No saved execution state to resume from"}), 500
+
+        pending_state["hitl_pending_approval"] = False
+        pending_state["hitl_pause_type"] = None
+        pending_state["requires_review"] = False
+        pending_state["review_reason"] = ""
+        pending_state["hitl_resume_from"] = "verification_stall"
+        inferred_sid = _resolve_resume_source_id(job, pending_state)
+        if inferred_sid:
+            pending_state["source_id"] = inferred_sid
+
+        accept_actions = {"accept_as_is", "accept", "approve", "proceed", "skip_verification"}
+        retry_actions = {"retry", "retry_with_hints", "retry_with_different_tools", "modify"}
+        if action in accept_actions:
+            current_df = pending_state.get("current_df")
+            if current_df is None or getattr(current_df, "empty", True):
+                current_df = pending_state.get("last_valid_checkpoint")
+            if current_df is not None and not getattr(current_df, "empty", True):
+                pending_state["current_df"] = current_df
+                pending_state["resume_graph_from"] = "finalize"
+                pending_state["resume_mode"] = "use_existing_plan"
+                pending_state["enable_llm_judge"] = False
+            else:
+                pending_state["resume_graph_from"] = "execute_tools"
+                pending_state["resume_mode"] = "use_existing_plan"
+                pending_state["current_df"] = None
+                pending_state["max_iterations"] = int(pending_state.get("iteration") or 1)
+        elif action in retry_actions:
+            pending_state["resume_graph_from"] = "execute_tools"
+            pending_state["resume_mode"] = "use_existing_plan"
+            pending_state["current_df"] = None
+            pending_state["max_iterations"] = int(pending_state.get("max_iterations") or 3) + 1
+        else:
+            return jsonify({"error": f"Unsupported stall action: {action}"}), 400
+
+        if job.get("_plan_review_resume_running") or job.get("_process_worker_running"):
+            return jsonify({"error": "Processing is already running for this job."}), 409
+
+        config = load_user_config()
+        job["_plan_review_resume_running"] = True
+        job["requires_review"] = False
+        job_manager.update_job_status(
+            job_id,
+            "processing",
+            "Accepted current output. Finishing the job…"
+            if action in accept_actions
+            else "Retrying the latest plan…",
+            "Processing",
+        )
+        threading.Thread(
+            target=_execute_plan_review_resume,
+            args=(job_id, pending_state, config),
+            daemon=True,
+        ).start()
+        return jsonify({
+            "success": True,
+            "checkpoint_id": checkpoint_id,
+            "action": action,
+            "status": "processing",
+            "job_id": job_id,
+            "message": (
+                "Accepted current output. Open Processing to watch progress."
+                if action in accept_actions
+                else "Retry started. Open Processing to watch progress."
+            ),
+        })
     
     logger.info(f"[HITL] Checkpoint {checkpoint_id} resolved: {action}")
     return jsonify({
@@ -5547,6 +6998,11 @@ def propose_demarcation_all(job_id):
             _decorate_demarcation_proposal_excel_ranges(prop)
 
         job["demarcation_batch_proposals"] = proposals_by_id
+        job["layout_complexity_by_source"] = {
+            str(sid): (prop or {}).get("layout_complexity")
+            for sid, prop in (proposals_by_id or {}).items()
+            if (prop or {}).get("layout_complexity")
+        }
         job["demarcation_batch_meta"] = {
             "shared_llm_error": shared_llm_error,
             **batch_meta,
@@ -5849,6 +7305,9 @@ def submit_demarcation(job_id):
 
     pending = job_manager.pending_demarcations.setdefault(job_id, {})
     pending["blocks"] = blocks
+    layout_complexity = data.get("layout_complexity")
+    if layout_complexity and job is not None and source_id:
+        job.setdefault("layout_complexity_by_source", {})[str(source_id)] = layout_complexity
     if sheet_name:
         pending["sheet_name"] = sheet_name
     if job is not None and source_id:
@@ -5859,6 +7318,8 @@ def submit_demarcation(job_id):
         merged_prop["source_id"] = source_id
         if sheet_name:
             merged_prop["sheet_name"] = sheet_name
+        if layout_complexity:
+            merged_prop["layout_complexity"] = layout_complexity
         job.setdefault("demarcation_batch_proposals", {})[source_id] = merged_prop
     if job is not None:
         job["scoped_source"] = build_scoped_source(
@@ -5879,9 +7340,13 @@ def submit_demarcation(job_id):
             # No treat-as-data Main Data blocks → semantic column mapping does not apply; treat as done.
             if main_kept == 0:
                 job_manager.mark_ux_source_mapping(job_id, str(source_id), True)
+                job["mapping_registry"] = [
+                    row for row in (job.get("mapping_registry") or [])
+                    if str(row.get("source_id")) != str(source_id)
+                ]
             else:
                 job_manager.mark_ux_source_mapping(job_id, str(source_id), False)
-    logger.info(f"[DEMARCATION] User submitted {len(blocks)} blocks for job {job_id}")
+            refresh_job_source_context_flags(job)
     if job is not None:
         _record_job_debug(
             job,
@@ -5896,6 +7361,9 @@ def submit_demarcation(job_id):
             metadata={"block_count": len(blocks), "source_id": source_id},
         )
 
+    if job is not None:
+        job_manager.sync_job(job_id)
+
     skip_semantic_mapping = False
     if job is not None and source_id:
         skip_semantic_mapping = not any(
@@ -5905,6 +7373,165 @@ def submit_demarcation(job_id):
         )
 
     return jsonify({"success": True, "skip_semantic_mapping": skip_semantic_mapping})
+
+
+def _layout_report_for_source(job: Dict[str, Any], source_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    sid = str(source_id or "")
+    report = (job.get("layout_complexity_by_source") or {}).get(sid)
+    if isinstance(report, dict) and report:
+        return report
+    prop = (job.get("demarcation_batch_proposals") or {}).get(sid) or {}
+    report = prop.get("layout_complexity") if isinstance(prop, dict) else None
+    return report if isinstance(report, dict) else None
+
+
+def _run_layout_standardize(
+    job: Dict[str, Any],
+    source: Dict[str, Any],
+    overrides: Optional[Dict[str, Any]] = None,
+) -> Tuple[pd.DataFrame, Dict[str, Any], Optional[Dict[str, Any]]]:
+    file_path = source.get("file_path") or job.get("file_path")
+    sheet_name = source.get("sheet_name")
+    grid_df = load_visual_grid_dataframe(str(file_path), sheet_name)
+    report = _layout_report_for_source(job, source.get("source_id"))
+    result = standardize_messy_layout(grid_df, report, overrides)
+    return grid_df, result, report
+
+
+@app.route('/api/layout/standardize/preview/<job_id>', methods=['GET'])
+def preview_layout_standardize(job_id):
+    """Propose Date / Dimension / Metric roles and a standard-table preview."""
+    job = job_manager.get_job(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    selected_sheet = request.args.get("sheet_name")
+    selected_source_id = request.args.get("source_id")
+    source = resolve_job_source(job, source_id=selected_source_id, sheet_name=selected_sheet)
+    if not source:
+        return jsonify({"error": "Source not found"}), 404
+    sid = str(source.get("source_id") or selected_source_id or "")
+    report = _layout_report_for_source(job, sid)
+    stored = get_standardize_meta(job, sid)
+    overrides = (stored or {}).get("assignment") if stored else None
+    try:
+        _grid, result, report = _run_layout_standardize(job, source, overrides)
+    except Exception as exc:
+        logger.exception("Layout standardize preview failed")
+        return jsonify({"error": str(exc)}), 500
+    if stored and stored.get("applied") and stored.get("preview"):
+        result["preview"] = stored.get("preview") or result.get("preview")
+        result["column_roles"] = stored.get("column_roles") or result.get("column_roles")
+        result["message"] = stored.get("message") or result.get("message")
+    return jsonify({
+        "job_id": job_id,
+        "source_id": sid,
+        "sheet_name": source.get("sheet_name"),
+        "needs_step": needs_standardize_step(report),
+        "classification": (report or {}).get("classification"),
+        "complexity_score": (report or {}).get("complexity_score"),
+        "reasons": (report or {}).get("reasons") or [],
+        "sheet_type": (report or {}).get("sheet_type"),
+        "applied": bool((stored or {}).get("applied")),
+        "ok": bool(result.get("ok")),
+        "message": result.get("message"),
+        "assignment": result.get("assignment"),
+        "roles": result.get("roles"),
+        "preview": result.get("preview"),
+        "column_roles": result.get("column_roles"),
+    })
+
+
+@app.route('/api/layout/standardize/<job_id>', methods=['POST'])
+def apply_layout_standardize(job_id):
+    """Regenerate or persist a standard Date / Dimension / Metric table."""
+    job = job_manager.get_job(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    data = request.json or {}
+    selected_sheet = data.get("sheet_name")
+    selected_source_id = data.get("source_id")
+    source = resolve_job_source(job, source_id=selected_source_id, sheet_name=selected_sheet)
+    if not source:
+        return jsonify({"error": "Source not found"}), 404
+    sid = str(source.get("source_id") or selected_source_id or "")
+    apply = bool(data.get("apply"))
+    overrides = data.get("assignment") if isinstance(data.get("assignment"), dict) else None
+    try:
+        _grid, result, report = _run_layout_standardize(job, source, overrides)
+    except Exception as exc:
+        logger.exception("Layout standardize failed")
+        return jsonify({"error": str(exc)}), 500
+
+    path = None
+    if apply and result.get("ok"):
+        tidy = result.get("dataframe")
+        if tidy is None or tidy.empty:
+            return jsonify({"error": result.get("message") or "Standard table is empty"}), 400
+        path = write_standardized_workbook(job_id, sid, tidy)
+        store_standardize_on_job(job, sid, result, path=path, applied=True)
+        job["mapping_registry"] = [
+            row for row in (job.get("mapping_registry") or [])
+            if str(row.get("source_id") or "") != sid
+        ]
+        if str(job.get("mapping_source_id") or "") == sid:
+            job_manager.pending_schema_mappings.pop(job_id, None)
+        job_manager.mark_ux_source_mapping(job_id, sid, False)
+        job_manager.sync_job(job_id)
+    else:
+        store_standardize_on_job(job, sid, result, path=None, applied=False)
+
+    return jsonify({
+        "job_id": job_id,
+        "source_id": sid,
+        "sheet_name": source.get("sheet_name"),
+        "needs_step": needs_standardize_step(report),
+        "classification": (report or {}).get("classification"),
+        "complexity_score": (report or {}).get("complexity_score"),
+        "reasons": (report or {}).get("reasons") or [],
+        "sheet_type": (report or {}).get("sheet_type"),
+        "applied": apply and bool(result.get("ok")),
+        "ok": bool(result.get("ok")),
+        "message": result.get("message"),
+        "assignment": result.get("assignment"),
+        "roles": result.get("roles"),
+        "preview": result.get("preview"),
+        "column_roles": result.get("column_roles"),
+    })
+
+
+_PREVIEW_NUMBER_FORMAT_CACHE: Dict[Tuple[str, str], Dict[Tuple[int, int], str]] = {}
+
+
+def _percent_number_formats(file_path: str, sheet_name: Optional[str]) -> Dict[Tuple[int, int], str]:
+    """Map (row, col) → Excel number format for percent-formatted cells."""
+    key = (str(file_path), str(sheet_name or ""))
+    cached = _PREVIEW_NUMBER_FORMAT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    out: Dict[Tuple[int, int], str] = {}
+    if str(file_path).lower().endswith(".csv"):
+        _PREVIEW_NUMBER_FORMAT_CACHE[key] = out
+        return out
+    wb = None
+    try:
+        wb = load_workbook(file_path, data_only=True, read_only=True)
+        ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else wb.active
+        for row in ws.iter_rows():
+            for cell in row:
+                fmt = str(getattr(cell, "number_format", "") or "")
+                if "%" not in fmt or cell.value is None:
+                    continue
+                out[(int(cell.row) - 1, int(cell.column) - 1)] = fmt
+    except Exception:
+        logger.warning("Could not read Excel number formats for preview", exc_info=True)
+    finally:
+        if wb is not None:
+            try:
+                wb.close()
+            except Exception:
+                pass
+    _PREVIEW_NUMBER_FORMAT_CACHE[key] = out
+    return out
 
 
 @app.route('/api/demarcation/preview/<job_id>', methods=['GET'])
@@ -5919,18 +7546,88 @@ def get_demarcation_preview(job_id):
     
     job = job_manager.get_job(job_id)
     if not job:
-        return jsonify({"error": "Job not found"}), 404
+        return jsonify({
+            "error": (
+                "Job not found (server may have restarted, or this tab has a stale job id). "
+                "Re-open the job from Upload / Results and re-run Layout Demarcation."
+            ),
+        }), 404
         
     try:
         source = resolve_job_source(job, source_id=source_id, sheet_name=sheet_name)
-        file_path = source.get("file_path") or job["file_path"]
-        # Load data
-        if str(file_path).endswith('.csv'):
+        if source_id and not source:
+            return jsonify({
+                "error": (
+                    f"Source {source_id!r} is not in this job's registry. "
+                    "Switch sheet/file in Guided Setup or re-scan."
+                ),
+            }), 404
+
+        file_path = source.get("file_path") or job.get("file_path")
+        sheet_for_read = source.get("sheet_name") or sheet_name
+        if not file_path:
+            return jsonify({"error": "No file path on this job/source for preview."}), 400
+
+        path_obj = Path(str(file_path))
+        if not path_obj.exists():
+            # CSV uploads delete the original after conversion to .xlsx; a stale
+            # path still ending in .csv almost always means the job metadata is old.
+            hint = (
+                " CSV uploads are converted to .xlsx at upload time — re-upload the file."
+                if str(file_path).lower().endswith(".csv")
+                else " Re-upload the file or restart Guided Setup for this job."
+            )
+            return jsonify({"error": f"Source file missing on disk: {path_obj.name}.{hint}"}), 404
+
+        # Load data — prefer registry sheet name (CSV conversion names the single tab).
+        if path_obj.suffix.lower() == ".csv":
             df = pd.read_csv(file_path, header=None)
         else:
-            df = pd.read_excel(file_path, sheet_name=sheet_name, header=None) if sheet_name else pd.read_excel(file_path, header=None)
+            df = (
+                pd.read_excel(file_path, sheet_name=sheet_for_read, header=None)
+                if sheet_for_read
+                else pd.read_excel(file_path, header=None)
+            )
         
         # Slice data (clipping to bounds) — full rectangle is authoritative; JSON body may be capped.
+        end_row = min(end_row, int(df.shape[0]) - 1)
+        end_col = min(end_col, int(df.shape[1]) - 1)
+        start_row = max(0, start_row)
+        start_col = max(0, start_col)
+        if end_row < start_row or end_col < start_col:
+            return jsonify({"error": "Requested preview range is empty."}), 400
+
+        sparse = str(request.args.get("sparse") or "").strip().lower() in {"1", "true", "yes"}
+        if sparse:
+            formats = _percent_number_formats(str(file_path), sheet_for_read)
+            cells = []
+            for r in range(start_row, end_row + 1):
+                for c in range(start_col, end_col + 1):
+                    val = df.iat[r, c]
+                    if val is None:
+                        continue
+                    try:
+                        if pd.isna(val):
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+                    text = format_cell_display(val, formats.get((r, c), ""))
+                    if not text:
+                        continue
+                    if len(text) > 48:
+                        text = text[:45] + "…"
+                    cells.append({"r": int(r), "c": int(c), "t": text})
+            return jsonify({
+                "job_id": job_id,
+                "sparse": True,
+                "cells": cells,
+                "count": len(cells),
+                "start_row": start_row,
+                "end_row": end_row,
+                "start_col": start_col,
+                "end_col": end_col,
+            })
+
         preview_df = df.iloc[start_row:end_row+1, start_col:end_col+1]
         range_row_count = int(len(preview_df.index))
         range_col_count = int(len(preview_df.columns))
@@ -5944,10 +7641,14 @@ def get_demarcation_preview(job_id):
 
         # Column keys must match preview record keys (stringified labels; often 0..N for header=None).
         preview_columns = [str(c) for c in preview_df.columns]
+        column_letters = [
+            index_to_excel_column(start_col + idx) for idx in range(len(preview_columns))
+        ]
         return jsonify({
             "job_id": job_id,
             "preview": preview_data,
             "columns": preview_columns,
+            "column_letters": column_letters,
             "excel_range": index_to_excel_range(start_row, end_row, start_col, end_col),
             "preview_truncated": truncated,
             "preview_row_count_returned": int(len(body_df.index)),
@@ -6012,22 +7713,23 @@ def get_source_inventory(job_id):
 
 
 def column_sets_by_source_from_job_mapping(job: Dict[str, Any]) -> Dict[str, List[str]]:
-    """Distinct raw source column names per ``source_id`` from ``mapping_registry``."""
+    """Distinct mapped template names per ``source_id`` from Keep mappings.
+
+    Union readiness compares what sources will share *after* rename
+    (``orderStartDate`` and ``Campaign End Date`` both count as ``date``),
+    not raw file headers. Exclude / No-match cards are omitted.
+    """
     out: Dict[str, List[str]] = {}
     for row in job.get("mapping_registry") or []:
         if not isinstance(row, dict):
             continue
         sid = str(row.get("source_id") or "").strip()
-        if not sid:
+        if not sid or mapping_is_excluded(row):
             continue
-        col = str(
-            row.get("source_column")
-            or row.get("column_name")
-            or row.get("raw_column")
-            or ""
-        ).strip()
-        if not col:
+        target = str(row.get("target_column") or "").strip()
+        if not target or is_no_match_target(target):
             continue
+        col = target
         bucket = out.setdefault(sid, [])
         if col not in bucket:
             bucket.append(col)
@@ -6036,7 +7738,7 @@ def column_sets_by_source_from_job_mapping(job: Dict[str, Any]) -> Dict[str, Lis
 
 @app.route('/api/jobs/<job_id>/validate-cross-source-union', methods=['GET'])
 def get_validate_cross_source_union(job_id):
-    """Union readiness from saved column mappings (read-only; safe to call before process-all)."""
+    """Union readiness from Keep mapping *targets* (read-only; safe before process-all)."""
     job = job_manager.get_job(job_id)
     if not job:
         return jsonify({"error": "Job not found"}), 404
@@ -6528,7 +8230,7 @@ def get_mapping_propose_progress(job_id):
 
 @app.route('/api/mapping/propose/<job_id>', methods=['GET'])
 def propose_mapping(job_id):
-    """Generate an AI-powered column mapping proposal."""
+    """Generate a synonym / heuristic column mapping proposal (no LLM)."""
     selected_sheet = request.args.get("sheet_name")
     selected_source_id = request.args.get("source_id")
     refresh_requested = request.args.get("refresh", "").lower() in {"1", "true", "yes"}
@@ -6553,6 +8255,20 @@ def propose_mapping(job_id):
         target_columns = load_target_columns_for_job(job)
         target_template = load_target_template_for_job(job)
         primary_targets = primary_target_columns(target_template)
+        from sia.agent.hierarchy_register import mapping_metric_targets as _metric_tgts
+        primary_targets = set(primary_targets) | {m["id"] for m in _metric_tgts()}
+        target_column_options = list(job.get("_mapping_target_options") or [])
+        # Ensure every target_columns entry has a labeled option
+        have = {str(o.get("id")) for o in target_column_options if isinstance(o, dict)}
+        for cid in target_columns:
+            if cid and cid not in have:
+                target_column_options.append({
+                    "id": cid,
+                    "name": cid.replace("_", " ").title(),
+                    "kind": "dimension",
+                    "supports_currency": cid in ("spends", "spend"),
+                })
+                have.add(cid)
 
         resolved_sid = str(source.get("source_id") or selected_source_id or "")
 
@@ -6570,13 +8286,31 @@ def propose_mapping(job_id):
 
         multi_block_sheet = should_process_main_blocks_separately(job, resolved_sid)
         main_blocks_for_mapping = get_main_blocks_for_source(job, resolved_sid) if multi_block_sheet else []
+        standardized_df = try_load_standardized_dataframe(job, resolved_sid)
+        if standardized_df is not None and not standardized_df.empty:
+            # Messy sheet was already converted to Date / Dimensions / Metrics.
+            multi_block_sheet = False
+            main_blocks_for_mapping = []
 
         if not refresh_requested and resolved_sid:
+            from sia.agent.column_shaping_expand import (
+                get_column_shaping_splits,
+                mapping_rows_stale_vs_shaping,
+            )
+            shaping_splits_early = get_column_shaping_splits(job, resolved_sid)
             registry_rows = [
                 r
                 for r in (job.get("mapping_registry") or [])
                 if str(r.get("source_id") or "") == resolved_sid
             ]
+            if registry_rows and mapping_rows_stale_vs_shaping(registry_rows, shaping_splits_early):
+                # Column shaping split orderName → Country/Brand/…; discard stale packed mapping
+                registry_rows = []
+                job["mapping_registry"] = [
+                    x for x in (job.get("mapping_registry") or [])
+                    if str(x.get("source_id") or "") != resolved_sid
+                ]
+                job_manager.pending_schema_mappings.pop(job_id, None)
             if registry_rows and multi_block_sheet and any(
                 str(r.get("block_id") or "").strip() for r in registry_rows
             ):
@@ -6621,6 +8355,7 @@ def propose_mapping(job_id):
                         "mapping_blocks": sections,
                         "mapping": ui_mapping,
                         "target_columns": target_columns,
+                        "target_column_options": target_column_options,
                         "primary_target_columns": sorted(primary_targets),
                         "unmatched_target_columns": unmatched_targets,
                         "filename": source.get("file_name") or job["filename"],
@@ -6664,6 +8399,7 @@ def propose_mapping(job_id):
                         "job_id": job_id,
                         "mapping": ui_mapping,
                         "target_columns": target_columns,
+                        "target_column_options": target_column_options,
                         "primary_target_columns": sorted(primary_targets),
                         "unmatched_target_columns": unmatched_targets,
                         "filename": source.get("file_name") or job["filename"],
@@ -6677,6 +8413,16 @@ def propose_mapping(job_id):
         saved_mapping = job_manager.pending_schema_mappings.get(job_id)
         saved_mapping_sheet = job.get("mapping_sheet")
         saved_mapping_source_id = job.get("mapping_source_id")
+        from sia.agent.column_shaping_expand import (
+            get_column_shaping_splits as _get_shaping_splits,
+            mapping_rows_stale_vs_shaping as _mapping_stale,
+        )
+        if saved_mapping and _mapping_stale(
+            saved_mapping,
+            _get_shaping_splits(job, str(resolved_sid or "")),
+        ):
+            saved_mapping = None
+            job_manager.pending_schema_mappings.pop(job_id, None)
         saved_ok_for_multi_block = saved_mapping and any(
             isinstance(m, dict) and str(m.get("block_id") or "").strip()
             for m in (saved_mapping or [])
@@ -6717,6 +8463,7 @@ def propose_mapping(job_id):
                 "job_id": job_id,
                 "mapping": saved_mapping,
                 "target_columns": target_columns,
+                "target_column_options": target_column_options,
                 "primary_target_columns": sorted(primary_targets),
                 "unmatched_target_columns": unmatched_targets,
                 "filename": source.get("file_name") or job["filename"],
@@ -6738,48 +8485,58 @@ def propose_mapping(job_id):
         if not blocks:
             blocks = existing_scope.get("main_blocks") or []
 
-        config = load_user_config()
-        verify = verify_llm_credentials(config)
-        if not verify.get("ok"):
-            _set_mapping_propose_progress(
-                job_id,
-                verify.get("message") or "LLM not configured",
-                phase="error",
-                done=True,
-                error=verify.get("message"),
-                sheet_name=str(selected_sheet or ""),
-                source_id=progress_src,
-            )
-            return jsonify({
-                "error": verify.get("message"),
-                "redirect_settings": True,
-            }), 503
+        # Synonym / heuristic mapping only — no LLM call on Guided Setup mapping.
+        from sia.agent.column_shaping_expand import (
+            apply_shaping_targets_and_aliases,
+            attribute_label_by_id,
+            get_column_shaping_splits,
+            materialize_column_shaping,
+            source_suffix_index,
+        )
+        from sia.agent.hierarchy_register import get_accepted_combined_fields_for_source
 
-        agent = _build_agent_from_config(config)
-        if not agent.llm_client:
-            msg = getattr(agent, "init_error", None) or "LLM client could not be initialized."
-            return jsonify({"error": msg, "redirect_settings": True}), 503
-        from sia.debug.llm_observer import init_observer
-        init_observer(run_id=f"mapping_{job_id}", model_id=getattr(agent, "model_name", "") or "")
-        ai_mapper = SchemaMapper(llm_client=agent.llm_client, prompts_dir="prompts")
-
-        import asyncio
+        ai_mapper = SchemaMapper(llm_client=None, prompts_dir="prompts")
+        source_index = source_suffix_index(job, str(selected_source_id or resolved_sid or ""))
+        shaping_splits = get_column_shaping_splits(job, str(selected_source_id or resolved_sid or ""))
+        combined_field_hints = get_accepted_combined_fields_for_source(
+            job, str(selected_source_id or resolved_sid or "")
+        )
+        shaping_labels = attribute_label_by_id()
 
         def _run_propose_on_df(df_block):
+            import asyncio
+
+            df_use, expand_meta = materialize_column_shaping(
+                df_block,
+                shaping_splits,
+                label_by_id=shaping_labels,
+            )
             loop = asyncio.new_event_loop()
             try:
                 asyncio.set_event_loop(loop)
-                return loop.run_until_complete(
+                mapping_rows = loop.run_until_complete(
                     ai_mapper.propose_mapping(
-                        df_block,
+                        df_use,
                         target_columns=target_columns,
-                        allow_heuristic_fallback=False,
+                        allow_heuristic_fallback=True,
                         primary_targets=primary_targets,
+                        # Packed columns are already expanded; skip re-applying packed hints
+                        # unless nothing was expanded (keep-as-single / no splits).
+                        combined_field_hints=(
+                            [] if expand_meta.get("part_rows") or expand_meta.get("packed_dropped")
+                            else combined_field_hints
+                        ),
                     )
                 )
             finally:
                 loop.close()
                 asyncio.set_event_loop(None)
+            return apply_shaping_targets_and_aliases(
+                mapping_rows,
+                expand_meta,
+                source_index=source_index,
+                primary_targets=set(primary_targets or []),
+            )
 
         if multi_block_sheet and len(main_blocks_for_mapping) >= 2:
             mapping_blocks_sections: List[Dict[str, Any]] = []
@@ -6812,8 +8569,8 @@ def propose_mapping(job_id):
                 )
                 _set_mapping_propose_progress(
                     job_id,
-                    f"Block {i + 1}/{len(main_blocks_for_mapping)}: {n_rows:,} rows × {n_cols} cols — AI mapping…",
-                    phase="llm",
+                    f"Block {i + 1}/{len(main_blocks_for_mapping)}: {n_rows:,} rows × {n_cols} cols — synonym matching…",
+                    phase="heuristic",
                     sheet_name=str(selected_sheet or ""),
                     source_id=progress_src,
                 )
@@ -6852,7 +8609,7 @@ def propose_mapping(job_id):
             }
             unmatched_targets = [t for t in target_columns if t not in matched_targets]
             job_manager.update_job_status(
-                job_id, "mapping_ready", "Per-block semantic mapping generated", "Schema Mapping"
+                job_id, "mapping_ready", "Per-block synonym column mapping generated", "Schema Mapping"
             )
             _reuse_meta = apply_same_sheet_name_mapping_reuse(
                 job,
@@ -6871,7 +8628,7 @@ def propose_mapping(job_id):
             )
             _set_mapping_propose_progress(
                 job_id,
-                f"Semantic mapping ready ({len(main_blocks_for_mapping)} blocks, {len(all_flat)} columns).",
+                f"Column mapping ready ({len(main_blocks_for_mapping)} blocks, {len(all_flat)} columns).",
                 phase="complete",
                 done=True,
                 sheet_name=str(selected_sheet or ""),
@@ -6884,6 +8641,7 @@ def propose_mapping(job_id):
                 "mapping": all_flat,
                 "mapping_reuse": _reuse_meta or {},
                 "target_columns": target_columns,
+                "target_column_options": target_column_options,
                 "primary_target_columns": sorted(primary_targets),
                 "unmatched_target_columns": unmatched_targets,
                 "filename": source.get("file_name") or job["filename"],
@@ -6894,27 +8652,42 @@ def propose_mapping(job_id):
                 "date_hints": date_hints,
             })
 
-        scoped_source = build_scoped_source(
-            sheet_name=selected_sheet,
-            blocks=blocks,
-            user_selected_header_row=job.get("user_selected_header_row"),
-        )
-        context_blocks = scoped_source.get("context_blocks", [])
-        job["context_metadata_blocks"] = context_blocks
-        df_to_map, resolved_scope = load_scoped_dataframe(
-            str(file_path),
-            selected_sheet,
-            scoped_source,
-        )
-        job["scoped_source"] = resolved_scope
-        job["mapping_header_derivation"] = resolved_scope.get("header_derivation") or {"derived": False}
+        if standardized_df is not None and not standardized_df.empty:
+            df_to_map = standardized_df
+            resolved_scope = scoped_source_for_materialized_workbook(
+                "Standard",
+                int(len(df_to_map)),
+                int(len(df_to_map.columns)),
+            )
+            resolved_scope["standardized"] = True
+            job["scoped_source"] = resolved_scope
+            job["mapping_header_derivation"] = {
+                "derived": False,
+                "format": "standardized_table",
+                "message": "Column mapping uses the standard Date / Dimensions / Metrics table from the tidy-up step.",
+            }
+        else:
+            scoped_source = build_scoped_source(
+                sheet_name=selected_sheet,
+                blocks=blocks,
+                user_selected_header_row=job.get("user_selected_header_row"),
+            )
+            context_blocks = scoped_source.get("context_blocks", [])
+            job["context_metadata_blocks"] = context_blocks
+            df_to_map, resolved_scope = load_scoped_dataframe(
+                str(file_path),
+                selected_sheet,
+                scoped_source,
+            )
+            job["scoped_source"] = resolved_scope
+            job["mapping_header_derivation"] = resolved_scope.get("header_derivation") or {"derived": False}
         if source.get("source_id"):
             job.setdefault("source_scope_registry", {})[source["source_id"]] = resolved_scope
 
         n_rows, n_cols = (len(df_to_map), len(df_to_map.columns)) if df_to_map is not None else (0, 0)
         _set_mapping_propose_progress(
             job_id,
-            f"Loaded scoped data ({n_rows:,} rows × {n_cols} columns). Building prompts and initializing the mapping model…",
+            f"Loaded scoped data ({n_rows:,} rows × {n_cols} columns). Applying column shaping + synonym matching…",
             phase="prepare",
             sheet_name=str(selected_sheet or ""),
             source_id=progress_src,
@@ -6922,27 +8695,26 @@ def propose_mapping(job_id):
 
         _set_mapping_propose_progress(
             job_id,
-            "Waiting for AI column-mapping response (model latency can be several minutes on large sheets)…",
-            phase="llm",
+            "Matching columns by synonyms and column-shaping names (no AI call)…",
+            phase="heuristic",
             sheet_name=str(selected_sheet or ""),
             source_id=progress_src,
         )
         mapping = _run_propose_on_df(df_to_map)
         _set_mapping_propose_progress(
             job_id,
-            "AI mapping response received; validating and merging with column samples…",
+            "Synonym mapping ready; attaching samples…",
             phase="merge",
             sheet_name=str(selected_sheet or ""),
             source_id=progress_src,
         )
-        capture_llm_metadata(job_id)
         matched_targets = {
             m.get("target_column")
             for m in mapping
             if m.get("target_column") and m.get("target_column") != "No match"
         }
         unmatched_targets = [t for t in target_columns if t not in matched_targets]
-        job_manager.update_job_status(job_id, "mapping_ready", "Semantic column mapping generated", "Schema Mapping")
+        job_manager.update_job_status(job_id, "mapping_ready", "Synonym column mapping generated", "Schema Mapping")
 
         _reuse_meta = apply_same_sheet_name_mapping_reuse(
             job,
@@ -6965,7 +8737,7 @@ def propose_mapping(job_id):
 
         _set_mapping_propose_progress(
             job_id,
-            f"Semantic mapping ready ({len(mapping)} source columns).",
+            f"Column mapping ready ({len(mapping)} source columns).",
             phase="complete",
             done=True,
             sheet_name=str(selected_sheet or ""),
@@ -6976,6 +8748,7 @@ def propose_mapping(job_id):
             "mapping": mapping,
             "mapping_reuse": _reuse_meta or {},
             "target_columns": target_columns,
+            "target_column_options": target_column_options,
             "primary_target_columns": sorted(primary_targets),
             "unmatched_target_columns": unmatched_targets,
             "filename": source.get("file_name") or job["filename"],
@@ -7005,6 +8778,43 @@ def propose_mapping(job_id):
             clear_observer()
         except Exception:
             pass
+
+
+@app.route('/api/mapping/custom-metric/<job_id>', methods=['POST'])
+def add_custom_mapping_metric(job_id):
+    """Register an additional metric target for this job (shown in semantic mapping dropdown)."""
+    job = job_manager.get_job(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "name required"}), 400
+    mid = str(data.get("id") or "").strip()
+    if not mid:
+        mid = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or "custom_metric"
+    supports_currency = bool(data.get("supports_currency"))
+    customs = list(job.get("custom_mapping_metrics") or [])
+    if any(str(c.get("id")) == mid for c in customs if isinstance(c, dict)):
+        return jsonify({"success": True, "metric": next(c for c in customs if str(c.get("id")) == mid)})
+    entry = {
+        "id": mid,
+        "name": name,
+        "kind": "metric",
+        "supports_currency": supports_currency,
+        "group": "custom",
+    }
+    customs.append(entry)
+    job["custom_mapping_metrics"] = customs
+    # Refresh option cache
+    load_target_columns_for_job(job)
+    job_manager._sync_job(job_id)
+    return jsonify({
+        "success": True,
+        "metric": entry,
+        "target_columns": load_target_columns_for_job(job),
+        "target_column_options": list(job.get("_mapping_target_options") or []),
+    })
 
 
 @app.route('/api/mapping/submit/<job_id>', methods=['POST'])
@@ -7062,6 +8872,291 @@ def submit_mapping(job_id):
         "success": True,
         "message": "Mapping saved. The shared pipeline will use these rules during the native mapping stage."
     })
+
+
+@app.route('/api/hierarchy/catalog', methods=['GET'])
+def hierarchy_catalog():
+    """Publisher hierarchies + standard fields for Upload registration UI."""
+    from sia.agent.hierarchy_register import catalog_for_api
+
+    return jsonify({"success": True, **catalog_for_api()})
+
+
+@app.route('/api/hierarchy/catalog', methods=['PUT', 'POST'])
+def hierarchy_catalog_save():
+    """Save media hierarchy catalog (Settings dashboard editor)."""
+    from sia.agent.hierarchy_register import catalog_for_api, save_catalog
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "JSON body required"}), 400
+    # Allow wrapping under "catalog" key
+    payload = data.get("catalog") if isinstance(data.get("catalog"), dict) else data
+    # Strip API-only success fields if client posted a GET response back
+    for drop in ("success",):
+        payload.pop(drop, None)
+    try:
+        # Rebuild publishers dict if client sent list form
+        pubs = payload.get("publishers")
+        if isinstance(pubs, list):
+            payload = dict(payload)
+            payload["publishers"] = {
+                str(p.get("id")): p for p in pubs if isinstance(p, dict) and p.get("id")
+            }
+        saved = save_catalog(payload)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        logging.getLogger(__name__).exception("Failed to save hierarchy catalog")
+        return jsonify({"error": f"Failed to save catalog: {exc}"}), 500
+    return jsonify({"success": True, "message": "Media hierarchy catalog saved.", **catalog_for_api()})
+
+
+@app.route('/api/hierarchy/propose/<job_id>', methods=['GET'])
+def hierarchy_propose(job_id):
+    """Propose publisher, grain, and combined-field mappings for all main-data sources."""
+    from sia.agent.hierarchy_register import propose_for_job
+
+    job = job_manager.get_job(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+
+    template_uid = []
+    try:
+        tpl = load_target_template_for_job(job)
+        if isinstance(tpl, dict):
+            scope = tpl.get("x_scope") or {}
+            template_uid = list(scope.get("uid_hierarchy") or scope.get("uid") or [])
+    except Exception:
+        template_uid = []
+
+    proposal = propose_for_job(job, template_uid_hierarchy=template_uid)
+    return jsonify({"success": True, "job_id": job_id, **proposal})
+
+
+@app.route('/api/hierarchy/register/<job_id>', methods=['POST'])
+def hierarchy_register(job_id):
+    """Save analyst hierarchy registration decisions and gate Guided Setup."""
+    from sia.agent.hierarchy_register import (
+        apply_registry_to_source_metadata,
+        compare_hierarchies,
+        normalize_enterprise_info,
+        normalize_registration_payload,
+        registration_is_complete,
+    )
+
+    job = job_manager.get_job(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+
+    data = request.get_json(silent=True) or {}
+    entries = data.get("sources") or data.get("hierarchy_registry") or []
+    if not isinstance(entries, list):
+        return jsonify({"error": "sources must be a list"}), 400
+
+    enterprise_info = normalize_enterprise_info(data.get("enterprise_info"))
+    normalized = normalize_registration_payload(entries, job)
+    mixed_ack = data.get("mixed_grain_acknowledged")
+    if mixed_ack is None:
+        mixed_ack = bool(job.get("mixed_grain_acknowledged"))
+
+    template_uid = []
+    try:
+        tpl = load_target_template_for_job(job)
+        if isinstance(tpl, dict):
+            scope = tpl.get("x_scope") or {}
+            template_uid = list(scope.get("uid_hierarchy") or scope.get("uid") or [])
+    except Exception:
+        template_uid = []
+
+    comparison = compare_hierarchies(normalized, template_uid)
+    complete, reasons = registration_is_complete(
+        normalized,
+        job.get("source_registry") or [],
+        mixed_grain_acknowledged=bool(mixed_ack),
+        enterprise_info=enterprise_info,
+    )
+
+    force_complete = data.get("mark_complete")
+    if force_complete is False:
+        complete = False
+    elif force_complete is True and reasons:
+        return jsonify({
+            "success": False,
+            "error": "Hierarchy registration incomplete",
+            "reasons": reasons,
+            "comparison": comparison,
+        }), 400
+
+    saved = job_manager.save_hierarchy_registry(
+        job_id,
+        normalized,
+        mixed_grain_acknowledged=bool(mixed_ack),
+        mark_complete=complete,
+        enterprise_info=enterprise_info,
+    )
+    if saved is None:
+        return jsonify({"error": "Failed to save hierarchy registry"}), 400
+
+    try:
+        apply_registry_to_source_metadata(job_manager, job_id, normalized)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("apply_registry_to_source_metadata failed: %s", exc)
+
+    job = job_manager.get_job(job_id) or job
+    return jsonify({
+        "success": True,
+        "hierarchy_registry": saved.get("hierarchy_registry"),
+        "enterprise_info": saved.get("enterprise_info"),
+        "hierarchy_register_complete": bool(saved.get("hierarchy_register_complete")),
+        "mixed_grain_acknowledged": bool(saved.get("mixed_grain_acknowledged")),
+        "comparison": comparison,
+        "reasons": reasons,
+        "ux_stepper_summary": job_manager.build_ux_stepper_summary(job),
+    })
+
+
+@app.route('/api/column-standardize/propose/<job_id>', methods=['GET'])
+def column_standardize_propose(job_id):
+    """Propose multipart column split/combine for the Column shaping step."""
+    from sia.agent.hierarchy_register import (
+        detect_combined_fields,
+        load_catalog,
+        mapping_attribute_target_options,
+        mapping_attribute_targets,
+        media_hierarchy_levels,
+        read_source_sample,
+    )
+
+    job = job_manager.get_job(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    source_id = request.args.get("source_id") or ""
+    source = resolve_job_source(job, source_id=source_id) if source_id else {}
+    if not source:
+        return jsonify({"error": "source_id required / not found"}), 400
+
+    cat = load_catalog()
+    columns, sample_df, _vals = read_source_sample(
+        str(source.get("file_path") or ""),
+        source.get("sheet_name"),
+    )
+    splits = detect_combined_fields(sample_df, columns, cat)
+    existing = next(
+        (
+            r for r in (job.get("column_standardize_registry") or [])
+            if isinstance(r, dict) and str(r.get("source_id")) == str(source_id)
+        ),
+        None,
+    )
+    if existing and isinstance(existing.get("splits"), list) and existing["splits"]:
+        by_col = {str(s.get("source_column")): s for s in existing["splits"] if isinstance(s, dict)}
+        merged = []
+        for prop in splits:
+            prev = by_col.get(str(prop.get("source_column")))
+            merged.append({**prop, **(prev or {})} if prev else prop)
+        splits = merged
+
+    attr_targets = mapping_attribute_targets(cat)
+    attr_options = mapping_attribute_target_options(cat)
+    return jsonify({
+        "success": True,
+        "source_id": source_id,
+        "columns": columns,
+        "splits": splits,
+        "combines": list((existing or {}).get("combines") or []),
+        "destination_grain_columns": list((existing or {}).get("destination_grain_columns") or [
+            lv["id"] for lv in media_hierarchy_levels(cat)
+        ]),
+        "attribute_targets": attr_targets,
+        "attribute_options": attr_options,
+        "media_hierarchy": media_hierarchy_levels(cat),
+        "common_attributes": list(cat.get("common_attributes") or []),
+    })
+
+
+@app.route('/api/column-standardize/save/<job_id>', methods=['POST'])
+def column_standardize_save(job_id):
+    """Persist column shaping (multipart split/combine) decisions for a source.
+
+    Also marks layout complete and ensures a full-sheet scoped source so Schema
+    Mapping can proceed without the legacy Layout Demarcation step.
+    """
+    try:
+        job = job_manager.get_job(job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+        data = request.get_json(silent=True) or {}
+        source_id = str(data.get("source_id") or "")
+        if not source_id:
+            return jsonify({"error": "source_id required"}), 400
+
+        source = resolve_job_source(job, source_id=source_id) or {}
+        sheet_name = str(source.get("sheet_name") or data.get("sheet_name") or "") or None
+
+        existing_entry = next(
+            (
+                r for r in (job.get("column_standardize_registry") or [])
+                if isinstance(r, dict) and str(r.get("source_id")) == source_id
+            ),
+            None,
+        )
+        # Soft drafts (complete=false) keep a prior complete flag so autosave / nav
+        # flush does not wipe "layout ready" after Save & map.
+        want_complete = bool(data.get("complete", False))
+        if not want_complete and existing_entry and existing_entry.get("complete"):
+            want_complete = True
+
+        row = {
+            "source_id": source_id,
+            "splits": list(data.get("splits") or []),
+            "combines": list(data.get("combines") or []),
+            "destination_grain_columns": list(data.get("destination_grain_columns") or []),
+            "complete": want_complete,
+        }
+        registry = [
+            r for r in (job.get("column_standardize_registry") or [])
+            if isinstance(r, dict) and str(r.get("source_id")) != source_id
+        ]
+        registry.append(row)
+        job["column_standardize_registry"] = registry
+
+        # Full-sheet scope when demarcation was skipped
+        existing_scope = dict((job.get("source_scope_registry") or {}).get(source_id) or {})
+        if not existing_scope.get("main_blocks") and not existing_scope.get("scope_type"):
+            scoped = build_scoped_source(
+                sheet_name=sheet_name,
+                blocks=None,
+                user_selected_header_row=job.get("user_selected_header_row"),
+            )
+            job["scoped_source"] = scoped
+            job.setdefault("source_scope_registry", {})[source_id] = scoped
+
+        uxp = job.setdefault("ux_source_progress", {})
+        entry = uxp.setdefault(source_id, {"layout_complete": False, "mapping_complete": False})
+        entry["column_standardize_complete"] = bool(row["complete"])
+        if row["complete"]:
+            job_manager.mark_ux_source_layout(job_id, source_id, True)
+            entry["layout_complete"] = True
+            entry["mapping_complete"] = False
+            # Drop stale mapping for this source so the next propose expands split names
+            job["mapping_registry"] = [
+                x for x in (job.get("mapping_registry") or [])
+                if str(x.get("source_id") or "") != source_id
+            ]
+            if str(job.get("mapping_source_id") or "") == source_id:
+                job_manager.pending_schema_mappings.pop(job_id, None)
+                job.pop("mapping_sheet", None)
+                job.pop("mapping_source_id", None)
+        job_manager._sync_job(job_id)
+        return jsonify({
+            "success": True,
+            "entry": row,
+            "ux_stepper_summary": job_manager.build_ux_stepper_summary(job),
+        })
+    except Exception as exc:
+        logger.exception("column_standardize_save failed for job %s", job_id)
+        return jsonify({"error": f"Column shaping save failed: {exc}"}), 500
 
 
 @app.route('/api/context/source/<job_id>', methods=['POST'])

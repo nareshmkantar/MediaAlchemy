@@ -4596,8 +4596,15 @@ class TransformationTools:
             if id_cols is not None:
                 id_resolved, _ = TransformationTools._resolve_columns(work, id_cols)
             else:
-                reserved = {date_name, *resolved_values}
-                id_resolved = [c for c in work.columns if c not in reserved]
+                id_resolved = []
+            # Daily rows are rebuilt from scratch, so anything not carried here is lost.
+            # A partial id_cols list from the planner must not silently drop template
+            # columns added upstream (publisher/channel defaults etc.).
+            reserved = {date_name, *resolved_values}
+            id_resolved = id_resolved + [
+                c for c in work.columns if c not in reserved and c not in id_resolved
+            ]
+            id_resolved = [c for c in id_resolved if c in work.columns and c not in reserved]
 
             parsed_date = pd.to_datetime(work[date_name], errors="coerce").dt.normalize()
             valid_mask = parsed_date.notna()
@@ -4745,8 +4752,12 @@ class TransformationTools:
             if id_cols is not None:
                 id_resolved, _ = TransformationTools._resolve_columns(work, id_cols)
             else:
-                reserved = {date_name, *resolved_values}
-                id_resolved = [c for c in work.columns if c not in reserved]
+                id_resolved = []
+            reserved = {date_name, *resolved_values}
+            id_resolved = id_resolved + [
+                c for c in work.columns if c not in reserved and c not in id_resolved
+            ]
+            id_resolved = [c for c in id_resolved if c in work.columns and c not in reserved]
 
             profile = infer_date_cadence_fast(work[date_name], date_name)
             cadence = str(profile.get("inferred_cadence") or "").strip().lower()
@@ -5276,6 +5287,57 @@ class TransformationTools:
             return ToolResult(success=False, data=df, message=f"Error in aggregate_weekly: {e}")
 
     @staticmethod
+    def scale_columns(
+        df: pd.DataFrame,
+        scales: Optional[Dict[str, float]] = None,
+        columns: Optional[Dict[str, float]] = None,
+    ) -> ToolResult:
+        """
+        Multiply numeric columns by denomination factors (e.g. thousands → ×1000).
+
+        Args:
+            df: DataFrame to modify
+            scales: {column_name: factor} after rename
+            columns: alias for scales (validator compatibility)
+        """
+        try:
+            scale_map = dict(scales or columns or {})
+            if not scale_map:
+                return ToolResult(success=True, data=df, message="No scale factors provided")
+
+            result_df = df.copy()
+            applied: List[str] = []
+            for col, raw_factor in scale_map.items():
+                try:
+                    factor = float(raw_factor)
+                except (TypeError, ValueError):
+                    continue
+                if factor in (0.0, 1.0):
+                    continue
+                try:
+                    resolved_col, _ = TransformationTools._fuzzy_find_column(result_df, str(col))
+                except ValueError:
+                    applied.append(f"SKIP '{col}' (not found)")
+                    continue
+                numeric = pd.to_numeric(result_df[resolved_col], errors="coerce")
+                if numeric.notna().sum() == 0:
+                    applied.append(f"SKIP '{resolved_col}' (non-numeric)")
+                    continue
+                result_df[resolved_col] = numeric * factor
+                applied.append(f"{resolved_col}×{factor:g}")
+
+            if not applied:
+                return ToolResult(success=True, data=result_df, message="No columns scaled")
+            return ToolResult(
+                success=True,
+                data=result_df,
+                message=f"Scaled columns: {', '.join(applied)}",
+                changes_made={"scaled_columns": applied, "scales": scale_map},
+            )
+        except Exception as e:
+            return ToolResult(success=False, data=df, message=f"Error in scale_columns: {e}")
+
+    @staticmethod
     def format_columns(df: pd.DataFrame,
                        format_map: Dict[str, str]) -> ToolResult:
         """
@@ -5440,22 +5502,59 @@ class TransformationTools:
                             "detail": f"Invalid values: {list(invalid)[:5]}. Allowed: {list(allowed)}"
                         })
 
-                # 5. Min/Max check
-                if "minimum" in col_spec:
+                # 5. Min/Max check (MEDIUM — surfaced as Review-style HITL)
+                if "minimum" in col_spec or "maximum" in col_spec:
                     numeric_series = pd.to_numeric(series, errors='coerce')
-                    below = (numeric_series < col_spec["minimum"]).sum()
-                    if below > 0:
-                        issues.append({
-                            "column": col_key,
-                            "severity": "LOW",
-                            "issue": "MIN_VIOLATION",
-                            "detail": f"{below} values below minimum ({col_spec['minimum']})"
-                        })
+                    if "minimum" in col_spec:
+                        bound = col_spec["minimum"]
+                        below_mask = numeric_series.notna() & (numeric_series < bound)
+                        below = int(below_mask.sum())
+                        if below > 0:
+                            samples = [
+                                float(v) if pd.notna(v) else None
+                                for v in numeric_series[below_mask].head(5).tolist()
+                            ]
+                            issues.append({
+                                "column": col_key,
+                                "severity": "MEDIUM",
+                                "issue": "MIN_VIOLATION",
+                                "bound": bound,
+                                "minimum": bound,
+                                "count": below,
+                                "violation_count": below,
+                                "sample_values": samples,
+                                "detail": f"{below} values below minimum ({bound})",
+                            })
+                    if "maximum" in col_spec:
+                        bound = col_spec["maximum"]
+                        above_mask = numeric_series.notna() & (numeric_series > bound)
+                        above = int(above_mask.sum())
+                        if above > 0:
+                            samples = [
+                                float(v) if pd.notna(v) else None
+                                for v in numeric_series[above_mask].head(5).tolist()
+                            ]
+                            issues.append({
+                                "column": col_key,
+                                "severity": "MEDIUM",
+                                "issue": "MAX_VIOLATION",
+                                "bound": bound,
+                                "maximum": bound,
+                                "count": above,
+                                "violation_count": above,
+                                "sample_values": samples,
+                                "detail": f"{above} values above maximum ({bound})",
+                            })
 
             # Build report
             high_count = sum(1 for i in issues if i["severity"] == "HIGH")
             med_count = sum(1 for i in issues if i["severity"] == "MEDIUM")
-            is_valid = high_count == 0
+            low_count = sum(1 for i in issues if i["severity"] == "LOW")
+            constraint_count = sum(
+                1 for i in issues if i.get("issue") in ("MIN_VIOLATION", "MAX_VIOLATION")
+            )
+            # Constraint breaches fail validation (Review HITL pauses the job).
+            is_valid = high_count == 0 and constraint_count == 0
 
             report = {
                 "valid": is_valid,
@@ -5465,8 +5564,12 @@ class TransformationTools:
                     if (s.get("x_requirement", "mandatory") == "mandatory")
                 ]),
                 "issues": issues,
+                "constraint_violation_count": constraint_count,
                 "summary": f"{'PASS' if is_valid else 'FAIL'}: "
-                           f"{high_count} HIGH, {med_count} MEDIUM issues"
+                           f"{high_count} HIGH, {med_count} MEDIUM"
+                           + (f", {low_count} LOW" if low_count else "")
+                           + " issues"
+                           + (f" ({constraint_count} constraint)" if constraint_count else ""),
             }
 
             import json
@@ -5538,13 +5641,25 @@ DESTRUCTIVE_TOOLS = {
 
 def is_tool_destructive(tool_name: str) -> bool:
     """Check if a tool is destructive (modifies/deletes data).
-    Handles both MCP names (xls.data.*) and Python method names.
+    Handles MCP names, Python method names, and planner canonical names (transform.*).
     """
+    if not tool_name:
+        return False
     if tool_name in DESTRUCTIVE_TOOLS:
         return True
-    # Also check the last segment (e.g. 'xls.data.drop_blank_columns' -> 'drop_blank_columns')
     short_name = tool_name.rsplit(".", 1)[-1] if "." in tool_name else tool_name
-    return short_name in DESTRUCTIVE_TOOLS
+    if short_name in DESTRUCTIVE_TOOLS:
+        return True
+    try:
+        from sia.tools.tool_validator import TOOL_SCHEMAS, normalize_tool_name
+
+        normalized, _ = normalize_tool_name(tool_name)
+        schema = TOOL_SCHEMAS.get(normalized)
+        if schema is not None:
+            return bool(schema.destructive)
+    except Exception:
+        pass
+    return False
 
 
 def generate_deletion_preview(df: pd.DataFrame, tool_call: Dict[str, Any]) -> Optional[DeletionPreview]:

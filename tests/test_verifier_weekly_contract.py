@@ -1,6 +1,7 @@
 """Tests for deterministic weekly rollup contract in output verifier."""
 
 import pandas as pd
+import pytest
 
 from sia.agent.verifier import deterministic_weekly_contract_issues
 
@@ -84,3 +85,37 @@ def test_merge_weekly_contract_skipped_when_deferred_flag():
     )
     assert merged.is_flat is True
     assert merged.issues == []
+
+
+def test_verify_timeout_continues_as_flat_instead_of_replan():
+    from unittest.mock import MagicMock
+
+    from sia.agent.verifier import OutputVerifier
+
+    v = OutputVerifier(MagicMock())
+
+    def _hang(*_args, **_kwargs):
+        raise TimeoutError("OutputVerifier timed out after 45s")
+
+    v._generate_with_timeout = _hang
+    result = v.verify(pd.DataFrame({"date": ["2024-01-01"], "spends": [1.0]}))
+    assert result.is_flat is True
+    assert result.issues
+    assert result.issues[0]["issue_type"] == "verification_timeout"
+
+
+def test_generate_with_timeout_raises_when_llm_hangs():
+    import time
+
+    from sia.agent.verifier import OutputVerifier
+
+    class _SlowClient:
+        def generate_content(self, *_args, **_kwargs):
+            time.sleep(2)
+            return type("R", (), {"text": "{}"})()
+
+    v = OutputVerifier(_SlowClient())
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="OutputVerifier timed out"):
+        v._generate_with_timeout("ping", timeout_sec=0.2)
+    assert time.monotonic() - started < 1.0

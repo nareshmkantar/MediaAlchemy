@@ -9,12 +9,25 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import pandas as pd
 from .llm_handler import robust_json_parse
+from .value_scale import enrich_mapping_value_scale
 from ..debug.llm_observer import get_observer
 
 logger = logging.getLogger(__name__)
 
-# Mapping only needs representative profiles; scanning millions of rows per column dominates latency.
-_MAX_ROWS_FOR_COLUMN_PROFILE = 50_000
+# Mapping only needs representative profiles; avoid full-sheet scans during schema mapping.
+_PROFILE_HEAD_ROWS = 500
+_PROFILE_TAIL_ROWS = 500
+_PROFILE_MAX_ROWS = _PROFILE_HEAD_ROWS + _PROFILE_TAIL_ROWS
+
+
+def _dataframe_for_column_profile(df: pd.DataFrame) -> pd.DataFrame:
+    """Sample rows for mapping-time profiling: first N + last N when the sheet is large."""
+    n = len(df.index)
+    if n <= _PROFILE_MAX_ROWS:
+        return df
+    head = df.iloc[:_PROFILE_HEAD_ROWS]
+    tail = df.iloc[-_PROFILE_TAIL_ROWS:]
+    return pd.concat([head, tail], ignore_index=True)
 
 
 @lru_cache(maxsize=1)
@@ -60,6 +73,7 @@ class SchemaMapper:
         target_columns: Optional[List[str]] = None,
         allow_heuristic_fallback: bool = True,
         primary_targets: Optional[Iterable[str]] = None,
+        combined_field_hints: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Analyze columns and propose a classification for each.
@@ -74,6 +88,12 @@ class SchemaMapper:
         heuristic_mappings = self._heuristic_mapping(
             df,
             samples_meta,
+            target_columns=target_columns,
+            primary_targets=primary_targets_set,
+        )
+        heuristic_mappings = self._apply_combined_field_hints(
+            heuristic_mappings,
+            combined_field_hints or [],
             target_columns=target_columns,
             primary_targets=primary_targets_set,
         )
@@ -191,7 +211,7 @@ class SchemaMapper:
                     decision = "Discard"
                     reasoning = fallback.get("reasoning", "Column is completely blank and should be excluded.")
                 
-                final_mappings.append({
+                final_mappings.append(enrich_mapping_value_scale({
                     "column_name": col,
                     "classification": classification,
                     "decision": decision,
@@ -208,7 +228,7 @@ class SchemaMapper:
                     **target_suggestion,
                     "unique_values": meta.get("unique_values", []),
                     "stats": meta.get("stats", {})
-                })
+                }))
             return final_mappings
 
         except Exception as e:
@@ -498,15 +518,16 @@ class SchemaMapper:
         """Get top-10 unique samples and descriptive statistics for each column."""
         meta = {}
         n_full = len(df.index)
-        if n_full > _MAX_ROWS_FOR_COLUMN_PROFILE:
+        profile_df = _dataframe_for_column_profile(df)
+        if n_full > _PROFILE_MAX_ROWS:
             logger.info(
-                "Column mapping profile: using first %s of %s rows (avoid full-sheet scans)",
-                f"{_MAX_ROWS_FOR_COLUMN_PROFILE:,}",
+                "Column mapping profile: using first %s + last %s of %s rows",
+                f"{_PROFILE_HEAD_ROWS:,}",
+                f"{_PROFILE_TAIL_ROWS:,}",
                 f"{n_full:,}",
             )
-            df = df.iloc[:_MAX_ROWS_FOR_COLUMN_PROFILE]
-        for col in df.columns:
-            series = df[col]
+        for col in profile_df.columns:
+            series = profile_df[col]
             normalized = series.map(self._normalize_blankish)
             non_blank = normalized.dropna()
             blank_count = int(len(series) - len(non_blank))
@@ -522,6 +543,7 @@ class SchemaMapper:
                 "unique_values": [str(val) for val in non_blank.unique()[:10]],  # Restrict to top 10
                 "non_null_count": int(len(non_blank)),
                 "total_count": len(series),
+                "sheet_row_count": n_full,
                 "blank_count": blank_count,
                 "blank_ratio": round(blank_ratio, 4),
                 "numeric_ratio": round(numeric_ratio, 4),
@@ -565,7 +587,7 @@ class SchemaMapper:
         columns = df.columns
         delivery_keywords = ['imps', 'impressions', 'spend', 'cost', 'clicks', 'taps', 'reach', 'revenue', 'conv', 'paid impressions', 'frequency']
         ratio_keywords = ['cpm', 'cpc', 'ctr', 'rate', 'ratio']
-        structural_keywords = ['campaign', 'ad', 'group', 'id', 'name', 'publisher', 'site', 'channel', 'region', 'creative']
+        structural_keywords = ['campaign', 'ad', 'group', 'id', 'name', 'publisher', 'site', 'channel', 'region', 'market', 'creative']
         state_keywords = ['status', 'active', 'paused', 'date', 'start', 'end', 'time']
         
         mappings = []
@@ -602,8 +624,18 @@ class SchemaMapper:
                 classification = "State / Governance"
                 decision = "Keep"
                 reasoning = "Heuristic matched state/temporal metadata."
+
+            matched_target = str(target_suggestion.get("target_column") or "").strip()
+            primary_set = set(primary_targets or [])
+            if matched_target and matched_target.lower() != "no match" and matched_target in primary_set:
+                if decision == "Discard":
+                    classification = "Structural Metadata"
+                    decision = "Keep"
+                    reasoning = (
+                        f"Source column matched primary template field '{matched_target}'."
+                    )
             
-            mappings.append({
+            mappings.append(enrich_mapping_value_scale({
                 "column_name": col_name,
                 "classification": classification,
                 "decision": decision,
@@ -620,8 +652,77 @@ class SchemaMapper:
                 **target_suggestion,
                 "unique_values": samples,
                 "stats": meta.get("stats", {})
-            })
+            }))
         return mappings
+
+    def _apply_combined_field_hints(
+        self,
+        mappings: List[Dict[str, Any]],
+        combined_field_hints: List[Dict[str, Any]],
+        target_columns: Optional[List[str]] = None,
+        primary_targets: Optional[set] = None,
+    ) -> List[Dict[str, Any]]:
+        """Boost mapping proposals using Upload-page accepted packed-column splits."""
+        if not combined_field_hints or not mappings:
+            return mappings
+        by_col = {
+            str(h.get("source_column")): h
+            for h in combined_field_hints
+            if isinstance(h, dict) and h.get("source_column") and h.get("accepted") and not h.get("single_dimension")
+        }
+        if not by_col:
+            return mappings
+        target_lookup = {self._normalize_name(t): t for t in (target_columns or [])}
+        primary_set = set(primary_targets or [])
+        out = []
+        for row in mappings:
+            col = str(row.get("column_name") or "")
+            hint = by_col.get(col)
+            if not hint:
+                out.append(row)
+                continue
+            dims = [str(d) for d in (hint.get("target_dimensions") or []) if d]
+            # Prefer first dimension that exists on the target template
+            chosen = None
+            for d in dims:
+                dn = self._normalize_name(d)
+                if dn in target_lookup:
+                    chosen = target_lookup[dn]
+                    break
+                # common alias spends/spend
+                if d in ("spend", "spends") and "spends" in target_lookup:
+                    chosen = target_lookup["spends"]
+                    break
+            updated = dict(row)
+            delim = hint.get("delimiter") or "_"
+            note = (
+                f"Upload hierarchy: packed field splits on {delim!r} into "
+                f"{', '.join(dims) or 'dimensions'} (planner may emit transform.split_column)."
+            )
+            updated["combined_field_hint"] = {
+                "delimiter": delim,
+                "target_dimensions": dims,
+                "samples": list(hint.get("samples") or [])[:6],
+            }
+            if chosen:
+                prev = str(updated.get("target_column") or "").strip().lower()
+                if prev in ("", "no match", "nomatch", "no-match"):
+                    updated["target_column"] = chosen
+                    updated["target_match_confidence"] = max(
+                        float(updated.get("target_match_confidence") or 0),
+                        0.9,
+                    )
+                    updated["target_match_method"] = "hierarchy_combined_field"
+                    updated["decision"] = "Keep"
+                    updated["classification"] = updated.get("classification") or "Structural Metadata"
+                    updated["confidence"] = max(float(updated.get("confidence") or 0), 0.85)
+                    if chosen in primary_set:
+                        updated["role"] = "primary"
+                updated["reasoning"] = f"{updated.get('reasoning') or ''} {note}".strip()
+            else:
+                updated["reasoning"] = f"{updated.get('reasoning') or ''} {note}".strip()
+            out.append(updated)
+        return out
 
     @staticmethod
     def infer_column_role(
@@ -655,13 +756,13 @@ class SchemaMapper:
             or "metric" in cls
         )
 
-        if dec == "discard" or ctype == "blank" or "blank" in cls or "derived" in cls:
-            return "exclude"
-
         matched_target = str(target_column or "").strip()
         if matched_target and matched_target.lower() != "no match":
             if primary_targets and matched_target in set(primary_targets):
                 return "primary"
+
+        if dec == "discard" or ctype == "blank" or "blank" in cls or "derived" in cls:
+            return "exclude"
 
         if is_metric_like:
             return "exclude"

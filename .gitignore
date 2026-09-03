@@ -24,6 +24,7 @@ runtime/uploads/
 runtime/outputs/
 runtime/snapshots/
 runtime/logs/
+runtime/artifacts/
 output/
 uploads/
 

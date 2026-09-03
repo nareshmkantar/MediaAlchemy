@@ -31,6 +31,8 @@
                         <button class="btn-secondary btn-sm" role="menuitem" id="downloadPreTransformBtn" type="button" title="Mapped + pruned sheet view before planner tools run">🧩 Pre-transform</button>
                         <button class="btn-secondary btn-sm" role="menuitem" id="downloadPostTransformBtn" type="button" title="Final transformed grid as a separate workbook when available">🧾 Post-transform</button>
                         <button class="btn-secondary btn-sm" role="menuitem" id="downloadArtifactsZipBtn" type="button" title="Zip of pre-transform file(s) plus post-transform if present">🗂️ Artifact bundle</button>
+                        <button class="btn-secondary btn-sm" role="menuitem" id="downloadDebugJsonBtn" type="button" title="Debug support bundle with context diff trail and processing log">🧭 Debug JSON</button>
+                        <button class="btn-secondary btn-sm" role="menuitem" id="downloadProcessingLogBtn" type="button" title="Processing log written under runtime/logs">📄 Processing log</button>
                     </div>
                 </div>
             </div>
@@ -50,6 +52,10 @@
                 <button class="debug-tab" data-step="4" type="button">
                     <span class="tab-icon">🧠</span>
                     <span class="tab-label">State</span>
+                </button>
+                <button class="debug-tab" data-step="5" type="button">
+                    <span class="tab-icon">🛡️</span>
+                    <span class="tab-label">Pipeline Evals</span>
                 </button>
             </div>
         </header>
@@ -166,6 +172,13 @@
                     <div class="empty-state">No state snapshots recorded yet.</div>
                 </div>
             </div>
+
+            <!-- Tab 5: Pipeline Evals scorecard (context trail mounts inside #pipelineEvalsContent) -->
+            <div class="debug-panel" id="panel-5">
+                <div class="panel-body" id="pipelineEvalsContent" style="padding: 20px; overflow-y: auto;">
+                    <div class="empty-state">No pipeline evals recorded yet.</div>
+                </div>
+            </div>
         </div>
     </main>
 
@@ -188,6 +201,8 @@
     <div class="toast-container" id="toastContainer"></div>
 
     <script src="/js/common.js"></script>
+    <script src="/js/pipeline-evals-render.js"></script>
+    <script src="/js/context-briefing-ui.js"></script>
     <script src="/js/debug.js"></script>
 </body>
 

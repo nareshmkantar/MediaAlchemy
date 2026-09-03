@@ -99,6 +99,14 @@ def append_job_debug_event(
     events = list(job.get("job_debug_events") or [])
     events.append(event)
     job["job_debug_events"] = events
+    job_id = str(job.get("id") or "").strip()
+    if job_id:
+        try:
+            from sia.debug.processing_log import append_debug_event
+
+            append_debug_event(job_id, event)
+        except Exception:
+            pass
 
 
 _COLLAPSE_SAVE_LABELS = frozenset({"Demarcation saved", "Schema mapping saved"})
@@ -161,6 +169,18 @@ def _mapping_table_for_source(job: Dict[str, Any], source_id: Optional[str]) -> 
     return rows
 
 
+def _effective_layout_block_role(row: Dict[str, Any]) -> str:
+    """Human role for Debug UI — decision overrides AI block_category."""
+    from sia.agent.context_packet import _layout_registry_block_role
+
+    role = _layout_registry_block_role(row)
+    if role == "main":
+        return "Main Data"
+    if role == "context":
+        return "Metadata"
+    return "Ignored"
+
+
 def _layout_blocks_for_source(job: Dict[str, Any], source_id: Optional[str]) -> List[Dict[str, Any]]:
     if not source_id:
         return []
@@ -171,7 +191,9 @@ def _layout_blocks_for_source(job: Dict[str, Any], source_id: Optional[str]) -> 
         blocks.append(
             {
                 "block_label": row.get("block_label") or row.get("block_id"),
-                "category": row.get("block_category") or row.get("category"),
+                "category": _effective_layout_block_role(row),
+                "ai_category": row.get("block_category") or row.get("category"),
+                "decision": row.get("decision"),
                 "start_row": row.get("start_row"),
                 "end_row": row.get("end_row"),
                 "start_col": row.get("start_col"),
@@ -229,7 +251,9 @@ def _enrich_event_from_registries(job: Dict[str, Any], event: Dict[str, Any]) ->
                     {
                         "source_id": row.get("source_id"),
                         "block_label": row.get("block_label") or row.get("block_id"),
-                        "category": row.get("block_category") or row.get("category"),
+                        "category": _effective_layout_block_role(row),
+                        "ai_category": row.get("block_category") or row.get("category"),
+                        "decision": row.get("decision"),
                         "start_row": row.get("start_row"),
                         "end_row": row.get("end_row"),
                         "start_col": row.get("start_col"),
@@ -540,13 +564,19 @@ def job_setup_summary(job: Dict[str, Any]) -> Dict[str, Any]:
     layout_reg = list(job.get("layout_registry") or [])
     mapping_reg = list(job.get("mapping_registry") or [])
     ux = job.get("ux_source_progress") or {}
+    if not isinstance(ux, dict):
+        ux = {}
 
     per_source = []
     for src in registry:
+        if not isinstance(src, dict):
+            continue
         sid = str(src.get("source_id") or "")
-        layouts = [r for r in layout_reg if str(r.get("source_id")) == sid]
-        maps = [r for r in mapping_reg if str(r.get("source_id")) == sid]
-        prog = ux.get(sid) if isinstance(ux, dict) else {}
+        layouts = [r for r in layout_reg if isinstance(r, dict) and str(r.get("source_id")) == sid]
+        maps = [r for r in mapping_reg if isinstance(r, dict) and str(r.get("source_id")) == sid]
+        prog = ux.get(sid)
+        if not isinstance(prog, dict):
+            prog = {}
         per_source.append(
             {
                 "source_id": sid,

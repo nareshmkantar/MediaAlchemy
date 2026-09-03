@@ -162,8 +162,14 @@ Apply all `business_logic.column_rules` from the target template (same as runtim
 ### transform.calculate
 Create or overwrite a column using **simple arithmetic** on **existing** columns only (`+`, `-`, `*`, `/`).
 - **params**: `target_column` (str), `expression` (str), `source_columns` (list, optional)
-- **Rule**: Use when the target metric requires conversion (e.g., "Impressions * 1000", "Gross_Spend * 0.85").
-- **⚠️ RULE**: Never use `if`, `else`, `null`, or SQL-style expressions. Never use calculate to invent a missing `publisher` / UID column — use `transform.add_column` or `transform.apply_column_rules`.
+- **Rule**: Use when the target metric requires conversion (e.g., "Gross_Spend * 0.85").
+- **⚠️ RULE**: Do not use for header thousands ('000) when `transform.scale_values` is already planned — avoid double-scaling.
+
+### transform.scale_values
+Multiply numeric columns by denomination factors from header hints (e.g. `Spends in '000` → `scales: {spends: 1000}`).
+- **params**: `scales` (dict of `{column_name: factor}`) — use **post-rename** template column names
+- **When to use**: When mapping summary lists **Header denomination** notes, or headers say in '000 / in thousands / (000).
+- **Placement**: Immediately after `transform.rename` / `transform.type_cast`, before expand/aggregate.
 
 ### transform.format
 Apply specific formatting to columns.

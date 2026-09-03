@@ -58,3 +58,77 @@ def test_enrich_adds_grouped_rows_hierarchy():
     )
     assert out["metric_layout_signals"]["grouped_rows_likely"] is True
     assert out["tables"][0].get("hierarchy", {}).get("type") == "grouped_rows"
+
+
+def _build_flat_daily_grid() -> VisualGrid:
+    """CP-07 style: one date per row, publisher + spend + impressions all filled."""
+    header = ["Date", "Publisher", "Spend", "Impressions"]
+    rows = [header]
+    publishers = ["SiteA", "SiteB", "SiteC"]
+    for i in range(18):
+        rows.append(
+            [
+                f"2025-03-{i + 1:02d}",
+                publishers[i % 3],
+                str(100 + i * 10),
+                str(1000 + i * 100),
+            ]
+        )
+    cells = [
+        [Cell(value=row[c], row=r, col=c, style=CellStyle()) for c in range(len(row))]
+        for r, row in enumerate(rows)
+    ]
+    return VisualGrid(
+        cells=cells,
+        sheet_name="Digital_UK",
+        total_rows=len(rows),
+        total_cols=len(header),
+    )
+
+
+def test_publisher_not_flagged_sparse_on_flat_daily_grid():
+    grid = _build_flat_daily_grid()
+    signals = detect_metric_layout_from_grid(grid)
+    sparse_labels = [
+        str(d.get("column_label") or "") for d in signals.get("sparse_dimension_columns") or []
+    ]
+    assert "Publisher" not in sparse_labels
+    assert not signals.get("block_sparse_metrics")
+    assert signals.get("grouped_rows_likely") is False
+
+
+def _build_flat_monthly_grid_with_zero_revenue() -> VisualGrid:
+    """Pinterest-style flat file: repeated Month keys, many revenue cells are numeric 0."""
+    header = ["Month", "advertiser_name", "user_country", "revenue", "impressions"]
+    rows = [header]
+    for i in range(12):
+        rows.append(
+            [
+                "2025-01",
+                f"Advertiser {i % 3}",
+                "DE",
+                0 if i % 2 else 1200.5 + i,  # real zeros, not blanks
+                1000 + i * 10,
+            ]
+        )
+    cells = [
+        [Cell(value=row[c], row=r, col=c, style=CellStyle()) for c in range(len(row))]
+        for r, row in enumerate(rows)
+    ]
+    return VisualGrid(
+        cells=cells,
+        sheet_name="Clean",
+        total_rows=len(rows),
+        total_cols=len(header),
+    )
+
+
+def test_numeric_zero_revenue_is_not_block_sparse():
+    """Regression: ``0 or ''`` used to treat zeros as blanks and invent block spend."""
+    from sia.agent.metric_layout_signals import _cell_text
+
+    grid = _build_flat_monthly_grid_with_zero_revenue()
+    assert _cell_text(grid, 2, 3) == "0"  # first zero row (i=1)
+    signals = detect_metric_layout_from_grid(grid)
+    assert not signals.get("block_sparse_metrics")
+    assert signals.get("grouped_rows_likely") is False

@@ -6,10 +6,13 @@ import json
 from typing import Dict, List, Any, Optional
 import pandas as pd
 from .base import VerificationResult, load_prompt_from_file
-from .llm_handler import LLMCallWrapper, RetryConfig, robust_json_parse
+from .llm_handler import LLMCallWrapper, RetryConfig, robust_json_parse, run_with_timeout
 from ..debug.llm_observer import get_observer
 
 logger = logging.getLogger(__name__)
+
+# verify_output must not block the job if Gemini hangs after schema already passed.
+VERIFIER_LLM_TIMEOUT_SEC = 45
 
 # Tools that actually change grain toward weekly output (planner obligation).
 _WEEKLY_ROLLUP_TOOLS = frozenset(
@@ -122,6 +125,14 @@ class OutputVerifier:
         if not self.SYSTEM_PROMPT:
             self.SYSTEM_PROMPT = "You are a data quality validator checking if a table is properly flattened."
             self.PROMPT_VERSION = "0.0"
+
+    def _generate_with_timeout(self, prompt: str, timeout_sec: float = VERIFIER_LLM_TIMEOUT_SEC):
+        """Call the verifier LLM with a hard timeout so the graph cannot hang indefinitely."""
+        return run_with_timeout(
+            lambda: self.llm_wrapper.generate_content(prompt),
+            timeout_sec,
+            label="OutputVerifier",
+        )
     
     def verify(
         self, 
@@ -322,8 +333,8 @@ Respond with JSON indicating if the table is flat and any issues found."""
                     }
                     
                     try:
-                        # Use wrapper with retry logic
-                        response = self.llm_wrapper.generate_content(t.full_prompt)
+                        # Use wrapper with retry logic and a hard timeout
+                        response = self._generate_with_timeout(t.full_prompt)
                         response_text = response.text
                         t.raw_response = response_text
                         
@@ -367,7 +378,7 @@ Respond with JSON indicating if the table is flat and any issues found."""
                         t.confidence_score = float(merged.confidence or 0.0)
                     return merged
             else:
-                response = self.llm_wrapper.generate_content(
+                response = self._generate_with_timeout(
                     f"{self.SYSTEM_PROMPT}\n\n{user_prompt}"
                 )
                 parsed = self._parse_verification_response(response.text)
@@ -378,7 +389,24 @@ Respond with JSON indicating if the table is flat and any issues found."""
                     df,
                     skip_weekly_grain_contract=skip_weekly_grain_contract,
                 )
-                
+
+        except TimeoutError as e:
+            # Schema already ran; do not force replan (another LLM call) on a hung verifier.
+            logger.warning("Output verification timed out; continuing without LLM verdict: %s", e)
+            return VerificationResult(
+                is_flat=True,
+                confidence=0.6,
+                issues=[{
+                    "issue_type": "verification_timeout",
+                    "description": str(e),
+                    "severity": "low",
+                }],
+                rule_issues=[],
+                summary=(
+                    f"Verifier timed out after {VERIFIER_LLM_TIMEOUT_SEC}s; "
+                    "schema checks already passed so processing continues."
+                ),
+            )
         except Exception as e:
             logger.error(f"Output verification failed: {e}")
             return VerificationResult(

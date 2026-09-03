@@ -1075,6 +1075,14 @@ async function loadConfig() {
         // Load debug mode setting
         if (elements.debugModeToggle) {
             elements.debugModeToggle.checked = config.debug_enabled || false;
+            if (config.debug_locked) {
+                elements.debugModeToggle.disabled = true;
+                elements.debugModeToggle.title =
+                    'Debug mode is controlled by SIA_DEBUG_ENABLED on the server (off in production).';
+            } else {
+                elements.debugModeToggle.disabled = false;
+                elements.debugModeToggle.title = '';
+            }
         }
 
         if (elements.enableLlmJudgeToggle) {

@@ -56,18 +56,10 @@ def drop_discarded_mapping_columns(
     still refers to original ``source_column`` names, and ``resolve_mapping`` applies
     the full mapping context again when the graph runs on this workbook.
     """
-    result = df.copy()
-    discards: List[str] = []
-    for mapping in approved_mappings or []:
-        if not isinstance(mapping, dict):
-            continue
-        decision = str(mapping.get("decision", "")).strip().lower()
-        source_column = mapping.get("source_column")
-        if decision == "discard" and source_column and source_column in result.columns:
-            discards.append(str(source_column))
-    if discards:
-        result = result.drop(columns=discards, errors="ignore")
-    return result
+    from sia.agent.context_packet import drop_excluded_mapping_columns
+
+    result, _dropped = drop_excluded_mapping_columns(df.copy(), approved_mappings)
+    return result if result is not None else df
 
 
 def build_clean_dataframe(
@@ -142,12 +134,22 @@ def materialize_one_source(job: Dict[str, Any], job_id: str, source_id: str) -> 
 
     scoped = _scoped_source_for_job(job, source_id)
 
-    df, _resolved = build_clean_dataframe(
-        file_path,
-        sheet_name,
-        scoped,
-        mappings,
-    )
+    from sia.agent.layout_standardize import try_load_standardized_dataframe
+
+    std_df = try_load_standardized_dataframe(job, source_id)
+    if std_df is not None and not std_df.empty:
+        cleaned = drop_discarded_mapping_columns(std_df, mappings)
+        df = cleaned if cleaned is not None and not cleaned.empty else std_df
+        _resolved = scoped_source_for_materialized_workbook(
+            MATERIALIZED_SHEET_NAME, int(len(df)), int(len(df.columns))
+        )
+    else:
+        df, _resolved = build_clean_dataframe(
+            file_path,
+            sheet_name,
+            scoped,
+            mappings,
+        )
     if df is None or df.empty:
         logger.warning("Materialize: empty dataframe for %s", source_id)
         return None

@@ -6,6 +6,7 @@ for human intervention in the agentic workflow.
 """
 import logging
 import json
+import uuid
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass, field, asdict
@@ -28,6 +29,7 @@ class CheckpointType(Enum):
     CHECKSUM_FAILURE = "checksum_failure"     # verify_checksum detected integrity issues
     COLUMN_DECISION = "column_decision"       # Human needs to decide Keep/Discard for columns
     FILE_RELATIONSHIP_REVIEW = "file_relationship_review"  # Review AI-proposed multi-file relationships
+    CONTEXT_AMBIGUITY_REVIEW = "context_ambiguity_review"  # Low-confidence context before dimension stamp
 
 
 @dataclass
@@ -107,7 +109,7 @@ class HITLDecisionConfig:
     enable_destructive_warnings: bool = True
     enable_verification_stall: bool = True
     enable_low_confidence: bool = True
-    enable_schema_mismatch: bool = False
+    enable_schema_mismatch: bool = True
     enable_structural_review: bool = True
     enable_checksum_review: bool = True
 
@@ -208,15 +210,18 @@ class HITLManager:
     ) -> HITLCheckpoint:
         """Create a checkpoint manually."""
         self.checkpoint_counter += 1
-        checkpoint_id = f"hitl_{self.checkpoint_counter:04d}"
-        
+        checkpoint_id = f"hitl_{uuid.uuid4().hex[:12]}"
+        confidence = kwargs.pop("confidence", None)
+        if confidence is None:
+            confidence = self._calculate_overall_confidence(state)
+
         checkpoint = HITLCheckpoint(
             checkpoint_id=checkpoint_id,
             checkpoint_type=checkpoint_type,
             trigger_reason=reason,
             current_step=state.get("current_step", "unknown"),
             iteration=state.get("iteration", 0),
-            confidence=self._calculate_overall_confidence(state),
+            confidence=float(confidence),
             **kwargs
         )
         
@@ -334,6 +339,8 @@ class HITLManager:
         
         return len(set(issue_types)) == 1 and len(issue_types) >= self.config.max_same_issue_count
     
+    STALL_REVIEW_ACTIONS = ["accept_as_is", "retry", "cancel"]
+
     def _create_verification_stall_checkpoint(self, state: Dict) -> HITLCheckpoint:
         """Create checkpoint for verification stall."""
         issues_history = state.get("issues_history", [])
@@ -346,8 +353,8 @@ class HITLManager:
             title="Verification Stalled",
             description=f"The verification step has found the same issue multiple times. The automated fix may not be working correctly.",
             severity="high",
-            available_actions=["fix_manually", "skip_verification", "retry_with_different_tools", "accept_as_is"],
-            recommended_action="fix_manually",
+            available_actions=list(self.STALL_REVIEW_ACTIONS),
+            recommended_action="accept_as_is",
             trigger_data={
                 "repeated_issue": repeated_issue,
                 "iteration": state.get("iteration", 0)
@@ -540,9 +547,14 @@ class HITLManager:
         """Import checkpoints from persistence."""
         self.checkpoints = [HITLCheckpoint.from_dict(d) for d in data]
         if self.checkpoints:
-            # Update counter to avoid ID conflicts
-            max_id = max(int(cp.checkpoint_id.split("_")[1]) for cp in self.checkpoints)
-            self.checkpoint_counter = max_id
+            # Legacy numeric suffixes only; UUID ids do not use this counter.
+            numeric_ids = []
+            for cp in self.checkpoints:
+                parts = str(cp.checkpoint_id or "").split("_", 1)
+                if len(parts) == 2 and parts[1].isdigit():
+                    numeric_ids.append(int(parts[1]))
+            if numeric_ids:
+                self.checkpoint_counter = max(numeric_ids)
 
 
 # ===== Utility Functions =====

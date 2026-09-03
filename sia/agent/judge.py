@@ -12,6 +12,9 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
+# Finalize must not block the job if Gemini hangs on the optional judge calls.
+JUDGE_LLM_TIMEOUT_SEC = 45
+
 
 def _load_system_prompt(name: str) -> str:
     """Load a markdown prompt file and strip frontmatter when present."""
@@ -64,6 +67,18 @@ class LLMJudge:
     def __init__(self, llm_client):
         self.llm = llm_client
         self.system_prompt = _load_system_prompt("llm_judge")
+
+    def _generate_json(self, prompt: str, timeout_sec: float = JUDGE_LLM_TIMEOUT_SEC):
+        """Call the LLM with a hard timeout so finalize cannot hang indefinitely."""
+        from .llm_handler import run_with_timeout
+
+        return run_with_timeout(
+            lambda: self.llm.generate_content(
+                prompt, generation_config={"response_mime_type": "application/json"}
+            ),
+            timeout_sec,
+            label="LLMJudge",
+        )
 
     def evaluate_trace(self, trace_steps: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -122,8 +137,7 @@ class LLMJudge:
                 "LLMJudge: starting trace evaluation (%s trace steps)",
                 len(trace_steps),
             )
-            # CALL SYNC WRAPPER
-            response = self.llm.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
+            response = self._generate_json(prompt)
             # Handle response object (has .text attribute)
             raw = response.text if hasattr(response, "text") else str(response)
             logger.info("LLMJudge: trace evaluation response received (%s chars)", len(raw or ""))
@@ -138,7 +152,8 @@ class LLMJudge:
                        input_sample: str, 
                        output_df: pd.DataFrame, 
                        schema: Dict[str, Any],
-                       trace: List[Dict[str, Any]]) -> JudgeScore:
+                       trace: List[Dict[str, Any]],
+                       pipeline_evals_summary: str = "") -> JudgeScore:
         """
         Produce a quality report for the processing result.
         """
@@ -171,6 +186,13 @@ class LLMJudge:
                     temp_df.columns = new_cols
                 output_sample = temp_df.head(10).to_json(orient='records')
             
+            pipeline_block = ""
+            if pipeline_evals_summary:
+                pipeline_block = f"""
+            DETERMINISTIC PIPELINE EVALS (Tier 1 — treat critical gate failures as hard integrity issues):
+            {pipeline_evals_summary}
+            """
+
             prompt = f"""
             You are a Senior Data Auditor evaluating the output of an Agentic Structure Inference system.
             
@@ -182,7 +204,7 @@ class LLMJudge:
             
             INFERRED SCHEMA:
             {json.dumps(schema, indent=2, default=safe_serialize)}
-            
+            {pipeline_block}
             CRITERIA:
             1. FIDELITY: Are all values in the output derived from the input? (No hallucination).
             2. INTEGRITY: Does the output data match the types and roles defined in the schema?
@@ -210,8 +232,7 @@ class LLMJudge:
                         len(output_df) if isinstance(output_df, pd.DataFrame) else 0,
                         len(output_df.columns) if isinstance(output_df, pd.DataFrame) else 0,
                     )
-                    # CALL SYNC WRAPPER
-                    response = self.llm.generate_content(full_prompt, generation_config={"response_mime_type": "application/json"})
+                    response = self._generate_json(full_prompt)
                     t.raw_response = response.text
                     logger.info(
                         "LLMJudge: output critique response received (%s chars)",
@@ -247,7 +268,7 @@ class LLMJudge:
                     len(output_df) if isinstance(output_df, pd.DataFrame) else 0,
                     len(output_df.columns) if isinstance(output_df, pd.DataFrame) else 0,
                 )
-                response = self.llm.generate_content(full_prompt, generation_config={"response_mime_type": "application/json"})
+                response = self._generate_json(full_prompt)
                 logger.info(
                     "LLMJudge: output critique response received (%s chars)",
                     len(response.text or "") if hasattr(response, "text") else 0,

@@ -659,6 +659,19 @@ class MetadataStore:
             )
         return record
 
+    @staticmethod
+    def _row_to_hitl_checkpoint(row: sqlite3.Row) -> HITLCheckpointRecord:
+        return HITLCheckpointRecord(
+            checkpoint_id=row["checkpoint_id"],
+            job_id=row["job_id"],
+            source_id=row["source_id"],
+            stage=row["stage"],
+            status=row["status"],
+            payload=_loads(row["payload_json"]) or {},
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
     def list_hitl_checkpoints(self, job_id: str) -> List[HITLCheckpointRecord]:
         with self._cursor() as cur:
             cur.execute(
@@ -666,16 +679,17 @@ class MetadataStore:
                 (job_id,),
             )
             rows = cur.fetchall()
-        return [
-            HITLCheckpointRecord(
-                checkpoint_id=row["checkpoint_id"],
-                job_id=row["job_id"],
-                source_id=row["source_id"],
-                stage=row["stage"],
-                status=row["status"],
-                payload=_loads(row["payload_json"]) or {},
-                created_at=row["created_at"],
-                updated_at=row["updated_at"],
+        return [self._row_to_hitl_checkpoint(row) for row in rows]
+
+    def list_pending_hitl_checkpoints(self) -> List[HITLCheckpointRecord]:
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT * FROM hitl_checkpoints WHERE status = ? ORDER BY created_at",
+                ("pending",),
             )
-            for row in rows
-        ]
+            rows = cur.fetchall()
+        return [self._row_to_hitl_checkpoint(row) for row in rows]
+
+    def delete_hitl_checkpoint(self, checkpoint_id: str) -> None:
+        with self._cursor() as cur:
+            cur.execute("DELETE FROM hitl_checkpoints WHERE checkpoint_id = ?", (str(checkpoint_id),))

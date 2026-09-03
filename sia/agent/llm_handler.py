@@ -217,6 +217,24 @@ def robust_json_parse(text: str) -> Dict[str, Any]:
     logger.error(f"Failed to parse JSON even with robust strategies. Raw response:\n{text}")
     raise JSONParseError("Failed to parse JSON from LLM response", details={"raw_text": text})
 
+
+def run_with_timeout(fn: Callable[[], Any], timeout_sec: float, *, label: str = "LLM call") -> Any:
+    """Run ``fn`` with a deadline and do not wait for a hung worker on exit.
+
+    ``ThreadPoolExecutor`` context-manager shutdown waits for the running call, which
+    would re-block the job after ``future.result(timeout=...)`` fires. Leave the
+    worker detached so verify/finalize can continue.
+    """
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        return pool.submit(fn).result(timeout=timeout_sec)
+    except FuturesTimeout as exc:
+        raise TimeoutError(f"{label} timed out after {int(timeout_sec)}s") from exc
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
 class LLMCallWrapper:
     """
     Wrapper for LLM calls with retry logic and observer integration.

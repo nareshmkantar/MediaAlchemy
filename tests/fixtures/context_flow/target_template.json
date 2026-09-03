@@ -1,0 +1,27 @@
+{
+  "x_scope": {
+    "variable_type": "Paid Media impressions",
+    "uid_hierarchy": ["date_paid_media", "channel_paid_media"],
+    "metrics": ["total_cost_paid_media", "impressions_paid_media", "clicks_paid_media"],
+    "supporting_columns": ["publisher_paid_media"],
+    "date_granularity": "daily"
+  },
+  "business_logic": {
+    "column_rules": []
+  },
+  "aggregation_logic": {
+    "metric_rules": {
+      "impressions_paid_media": "sum",
+      "total_cost_paid_media": "sum",
+      "clicks_paid_media": "sum"
+    }
+  },
+  "properties": {
+    "date_paid_media": {"type": "string", "format": "date"},
+    "channel_paid_media": {"type": "string"},
+    "publisher_paid_media": {"type": "string"},
+    "total_cost_paid_media": {"type": "number"},
+    "impressions_paid_media": {"type": "integer"},
+    "clicks_paid_media": {"type": "integer"}
+  }
+}

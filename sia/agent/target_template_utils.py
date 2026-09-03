@@ -259,6 +259,36 @@ def final_output_column_order(template: Dict[str, Any]) -> List[str]:
     return collation_merge_column_key_order(template)
 
 
+def template_union_grain_columns(template: Optional[Dict[str, Any]]) -> List[str]:
+    """UID + supporting dimension names for union join-key inference (excludes metrics)."""
+    template = normalize_target_template(template or {})
+    if not isinstance(template, dict) or not template:
+        return []
+    scope = template.get("x_scope") if isinstance(template.get("x_scope"), dict) else {}
+    props = template.get("properties") if isinstance(template.get("properties"), dict) else {}
+    uh = [str(x) for x in (scope.get("uid_hierarchy") or []) if x is not None]
+    sup = [str(x) for x in (scope.get("supporting_columns") or []) if x is not None]
+
+    date_keys: List[str] = []
+    uid_rest: List[str] = []
+    for k in uh:
+        p = props.get(k)
+        if _is_date_scope_key(k, p):
+            date_keys.append(k)
+        else:
+            uid_rest.append(k)
+
+    out: List[str] = []
+    seen: Set[str] = set()
+    for block in (date_keys, uid_rest, sup):
+        for x in block:
+            if x in seen:
+                continue
+            seen.add(x)
+            out.append(x)
+    return out
+
+
 def weekly_aggregate_group_by_columns(
     template: Optional[Dict[str, Any]],
     date_col: Optional[Any] = None,
@@ -664,19 +694,21 @@ MAPPING_KEEP_DECISIONS = frozenset(
 def build_rename_mapping_from_approved_mappings(
     approved_mappings: Optional[List[Dict[str, Any]]],
 ) -> Dict[str, str]:
-    """Physical source → template target for columns that need an actual rename (not No match)."""
+    """Physical source → template / collation name (prefers Primary/Supporting ``output_alias``)."""
     mapping: Dict[str, str] = {}
     for item in approved_mappings or []:
         if not isinstance(item, dict):
             continue
         decision = str(item.get("decision", "")).strip().lower()
-        source_col = str(item.get("source_column") or "").strip()
+        source_col = str(item.get("source_column") or item.get("column_name") or "").strip()
+        if decision not in MAPPING_KEEP_DECISIONS or not source_col:
+            continue
+        alias = str(item.get("output_alias") or "").strip()
         target_col = str(item.get("target_column") or "").strip()
-        if decision not in MAPPING_KEEP_DECISIONS or not source_col or not target_col:
+        dest = alias or target_col
+        if not dest or is_no_match_target(dest) or source_col == dest:
             continue
-        if is_no_match_target(target_col) or source_col == target_col:
-            continue
-        mapping.setdefault(source_col, target_col)
+        mapping.setdefault(source_col, dest)
     return sanitize_rename_mapping(mapping)
 
 

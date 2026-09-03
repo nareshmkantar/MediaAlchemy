@@ -50,14 +50,36 @@
                         <button type="button" class="btn-secondary btn-setup-skip-compact" id="skipProcessBtn" title="Saves this sheet’s mapping draft if you are on mapping, opens Processing, and starts the run. Always available; incomplete jobs may error or pause for review.">Skip Set up &amp; Process</button>
                     </div>
                 </div>
-                <div id="demarcationToolbarStickyRow" class="section-toolbar section-toolbar--demarcation-compact section-toolbar--sticky-row">
+                <!-- Legacy layout/standardize toolbars kept hidden (no longer in Guided Setup path) -->
+                <div id="demarcationToolbarStickyRow" class="section-toolbar section-toolbar--demarcation-compact section-toolbar--sticky-row hidden" hidden>
                     <div class="toolbar-left">
                         <h2>Layout Demarcation</h2>
-                        <span class="status-badge scanning" id="demarcationStatus">Scanning...</span>
+                        <span class="status-badge" id="demarcationStatus">Hidden</span>
                     </div>
                     <div class="toolbar-right demarcation-toolbar-actions">
-                        <button class="btn-secondary btn-sm" id="reScanBtn" type="button" title="Re-run layout detection for all sheets (new propose-all). Clears cached proposals. Uncertain regions still use the LLM when needed.">🔄 Re-Scan</button>
-                        <button type="button" class="btn-primary btn-sm btn-confirm-layout" id="confirmLayoutMapSheetBtn" title="Save this sheet’s layout and open column mapping for the same sheet">Confirm &amp; map →</button>
+                        <button class="btn-secondary btn-sm" id="reScanBtn" type="button">🔄 Re-Scan</button>
+                        <button type="button" class="btn-primary btn-sm btn-confirm-layout" id="confirmLayoutMapSheetBtn">Confirm &amp; map →</button>
+                    </div>
+                </div>
+                <div id="standardizeToolbarStickyRow" class="section-toolbar section-toolbar--standardize-compact section-toolbar--sticky-row hidden" aria-label="Standardize messy layout" hidden>
+                    <div class="toolbar-left">
+                        <h2 class="mapping-toolbar-heading">Standardize messy layout</h2>
+                        <span class="status-badge" id="standardizeStatus">Pending</span>
+                    </div>
+                    <div class="toolbar-right demarcation-toolbar-actions">
+                        <button type="button" class="btn-secondary btn-sm" id="backToLayoutFromStdBtn">← Layout</button>
+                        <button type="button" class="btn-secondary btn-sm" id="regenerateStandardTableBtn">↻ Generate table</button>
+                        <button type="button" class="btn-primary btn-sm btn-confirm-layout" id="confirmStandardizeMapBtn">Use table &amp; continue →</button>
+                    </div>
+                </div>
+                <div id="columnStdToolbarStickyRow" class="section-toolbar section-toolbar--column-std-compact section-toolbar--sticky-row" aria-label="Column shaping">
+                    <div class="toolbar-left">
+                        <h2 class="mapping-toolbar-heading">Column shaping</h2>
+                        <span class="status-badge" id="columnStdStatus">Pending</span>
+                    </div>
+                    <div class="toolbar-right demarcation-toolbar-actions">
+                        <button type="button" class="btn-secondary btn-sm hidden" id="backFromColumnStdBtn" title="Return to previous step" hidden>← Back</button>
+                        <button type="button" class="btn-primary btn-sm btn-confirm-layout" id="confirmColumnStdBtn" title="Save split/combine decisions and open schema mapping">Save &amp; map →</button>
                     </div>
                 </div>
                 <div id="mappingToolbarStickyRow" class="section-toolbar section-toolbar--mapping-compact section-toolbar--sticky-row hidden" aria-label="Semantic column mapping actions">
@@ -66,18 +88,26 @@
                         <span class="status-badge" id="mappingStatus">Pending</span>
                     </div>
                     <div class="toolbar-right demarcation-toolbar-actions mapping-toolbar-actions">
-                        <button type="button" class="btn-secondary btn-sm" id="backToLayoutBtn" title="Return to layout demarcation for this sheet">← Layout</button>
+                        <button type="button" class="btn-secondary btn-sm" id="backToLayoutBtn" title="Return to column shaping">← Column shaping</button>
                         <button type="button" class="btn-primary btn-sm btn-confirm-layout btn-confirm-mapping" id="saveMappingNextSheetBtn" title="Save mappings for this sheet and go to the next sheet">Save mapping &amp; next sheet →</button>
                     </div>
                 </div>
             </div>
-            <!-- Step 1: Demarcation Workspace -->
-            <div id="demarcationSection" class="section-container">
-                <div class="demarcation-workspace" id="demarcationWorkspace">
-                    <!-- Cards will be injected here -->
+            <!-- Legacy demarcation (hidden) -->
+            <div id="demarcationSection" class="section-container hidden" hidden>
+                <div class="demarcation-workspace" id="demarcationWorkspace"></div>
+            </div>
+
+            <div id="standardizeSection" class="section-container hidden" hidden>
+                <div id="standardizeWorkspace" class="standardize-workspace"></div>
+            </div>
+
+            <!-- Step 1: Column shaping (multipart split / combine → media dimensions) -->
+            <div id="columnStdSection" class="section-container">
+                <div id="columnStdWorkspace" class="column-std-workspace">
                     <div class="empty-state">
                         <span class="spinner"></span>
-                        <p>Analyzing spreadsheet layout patterns...</p>
+                        <p>Detecting multipart columns…</p>
                     </div>
                 </div>
             </div>
@@ -87,9 +117,8 @@
                 <p id="mappingProposeLive" class="demarcation-scan-live mapping-propose-live" role="status" aria-live="polite" aria-atomic="true"></p>
 
                 <div class="mapping-grid" id="mappingGrid">
-                    <!-- Mapping cards will be injected here -->
                     <div class="empty-state">
-                        <p>Waiting for layout confirmation...</p>
+                        <p>Waiting for column shaping…</p>
                     </div>
                 </div>
             </div>

@@ -20,3 +20,5 @@ httpx>=0.25.0
 mcp>=1.0.0,<2
 pytest>=7.0.0
 pytest-asyncio>=0.23.0
+# Optional — agentic eval metrics (Task Completion via GEval). App degrades gracefully without it.
+deepeval>=2.0.0

@@ -37,6 +37,9 @@ from .target_template_utils import (
     template_column_rules_summary,
     weekly_aggregate_group_by_columns,
 )
+from sia.context.planner_prompt import build_planner_prompt_result, context_available_columns
+from sia.agent.value_scale import build_target_scales_from_mappings
+from sia.agent.summary_row_signals import sheet_likely_has_summary_rows
 from sia.tools.transformation_tools import TransformationTools
 
 logger = logging.getLogger(__name__)
@@ -56,6 +59,7 @@ _COLUMN_TYPING_BEFORE_EXPAND = frozenset(
         "transform.type_cast",
         "transform.add_column",
         "transform.apply_column_rules",
+        "transform.scale_values",
     }
 )
 
@@ -66,23 +70,6 @@ _DEFAULT_SUMMARY_FILTER_KEYWORDS = [
     "Grand Total",
     "Totals",
 ]
-
-_TEMPLATE_ENRICHMENT_TOOL_ORDER = """
-## Fixed enrichment tool order (target template jobs)
-Emit explicit tool calls in this order; skip steps that do not apply to this workbook:
-1. **Extract / reshape**: `layout.extract` or `layout.stack` only (no `fill_merged` before rename when using expand — see step 4)
-2. **Flat-table cleanup (required when sheet may have subtotals)**: `transform.filter_summaries` immediately after extract — removes Total/Subtotal/Grand Total rows **before** rename, merge fill, or block expand (avoids double-counting).
-3. **Align names & types**: `transform.rename`, `transform.type_cast` (required before expand so `impressions`, `spends`, `channel` exist)
-4. **Grouped blocks (preferred)**: `transform.expand_grouped_block` **after rename/type_cast** — segment on sparse headers, forward-fill **dimensions only**, split block-level metrics. Replaces `fill_merged` + `allocate_block_metric` on the same layout.
-5. **Template UID defaults (explicit)**: `transform.apply_column_rules` or `transform.add_column` for each entry in **Column gaps → suggested_add_columns** — never `transform.calculate` for literals
-6. **Grain / calendar**: expand/infer/date-range tools when date_granularity alignment requires them
-7. **`transform.drop_columns`**: only for columns **not** in `block_start_columns` and **not** needed for allocate — run **after** block metric tools when step 4 ran; never drop `Name`/`Ref`/section ids before `allocate_block_metric`
-8. **Rollup**: `transform.aggregate_weekly` when target is weekly (with explicit `metric_rules` for every template metric)
-9. **Final layout**: `transform.reorder_columns` then `transform.sort_rows` (template column order + uid sort) immediately before verify
-10. **Verify**: `verify.schema` as the final step
-
-Every enrichment must appear as a tool call in the plan. Do not assume hidden executor behavior.
-"""
 
 KEEP_DECISIONS = {"keep", "approved", "primary", "supporting", "metadata", "context", "use as context"}
 
@@ -104,6 +91,8 @@ def finalize_extraction_plan(
     structure_analysis: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """Re-run deterministic plan post-processors (HITL approve, resume, tests)."""
+    from sia.integrity.context_isolation import context_packet_source_id
+
     generator = PlanGenerator(llm_client=None)
     if isinstance(plan, dict):
         working = ExtractionPlan(
@@ -129,6 +118,8 @@ def finalize_extraction_plan(
         plan["confidence"] = finalized.confidence
         plan["requires_human_review"] = finalized.requires_human_review
         plan["review_reason"] = finalized.review_reason
+        if context_packet_source_id(context_packet):
+            plan["source_id"] = context_packet_source_id(context_packet)
         return plan
     return generator.finalize_plan(plan, context_packet, target_template, structure_analysis)
 
@@ -156,6 +147,20 @@ class PlanGenerator:
             self.SYSTEM_PROMPT = "You are an expert data engineer creating extraction plans."
             self.PROMPT_VERSION = "0.0"
 
+    @staticmethod
+    def _job_from_context_packet(context_packet: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        cp = context_packet if isinstance(context_packet, dict) else {}
+        job_id = str(cp.get("job_id") or "").strip()
+        if not job_id:
+            return None
+        try:
+            from sia.agent.job_manager import job_manager
+
+            job = job_manager.get_job(job_id)
+            return job if isinstance(job, dict) else None
+        except Exception:
+            return None
+
     def finalize_plan(
         self,
         plan: ExtractionPlan,
@@ -168,10 +173,13 @@ class PlanGenerator:
             return plan
         plan = self._align_plan_to_approved_mappings(plan, context_packet, target_template)
         plan = self._ensure_rename_from_mappings(plan, context_packet)
+        plan = self._ensure_value_scale_from_mappings(plan, context_packet)
         plan = self._collapse_plan_rename_tools(plan)
         plan = self._sanitize_plan_rename_tools(plan)
         plan = self._ensure_layout_stack_in_plan(plan, context_packet, structure_analysis)
-        plan = self._ensure_filter_summaries_after_extract(plan, context_packet, target_template)
+        plan = self._ensure_filter_summaries_after_extract(
+            plan, context_packet, target_template, structure_analysis
+        )
         plan = self._prefer_expand_grouped_block(plan, context_packet, target_template, structure_analysis)
         plan = self._ensure_expand_after_column_typing(plan, context_packet)
         plan = self._ensure_expand_grouped_block_for_merged_layout(plan, context_packet)
@@ -195,6 +203,48 @@ class PlanGenerator:
         plan = self._finalize_merged_layout_expand_params(
             plan, context_packet, target_template
         )
+        plan = self._reconcile_destructive_plan_review(plan)
+        plan = self._rebind_source_local_literals(plan, context_packet)
+        return plan
+
+    def _rebind_source_local_literals(
+        self,
+        plan: ExtractionPlan,
+        context_packet: Optional[Dict[str, Any]] = None,
+    ) -> ExtractionPlan:
+        """Ensure add_column literals for channel/market/etc. match this source's local context."""
+        if not isinstance(plan, ExtractionPlan):
+            return plan
+        from sia.integrity.context_isolation import (
+            context_packet_source_id,
+            rebind_source_local_plan_literals,
+        )
+
+        rebound, actions = rebind_source_local_plan_literals(
+            plan.tool_calls,
+            context_packet,
+            job=self._job_from_context_packet(context_packet),
+        )
+        if rebound:
+            plan.tool_calls = rebound
+        sid = context_packet_source_id(context_packet)
+        if sid:
+            plan.source_id = sid
+            job = self._job_from_context_packet(context_packet)
+            if job:
+                from sia.context.diff_log import log_value_change
+
+                log_value_change(
+                    job,
+                    stage="plan_generate",
+                    source_id=sid,
+                    field="plan.source_id",
+                    before=None,
+                    after=sid,
+                    reason="plan bound to active source",
+                )
+        for note in actions[:6]:
+            logger.info("Plan rebind (source-local): %s", note)
         return plan
 
     def _ensure_final_layout_tools(
@@ -1374,45 +1424,104 @@ class PlanGenerator:
         plan: ExtractionPlan,
         context_packet: Optional[Dict[str, Any]] = None,
         target_template: Optional[Dict[str, Any]] = None,
+        structure_analysis: Optional[Dict[str, Any]] = None,
     ) -> ExtractionPlan:
         """
-        Inject transform.filter_summaries right after layout.extract/stack so Subtotal/Total
-        rows are removed before rename, fill_merged, expand_grouped_block, or weekly rollup.
+        Add or remove transform.filter_summaries after layout.extract/stack.
+
+        Only keeps the step when structure analysis or a scoped preview suggests
+        Total/Subtotal/Grand Total rows exist (avoids pointless per-sheet plan review).
         """
         if not isinstance(plan, ExtractionPlan):
             return plan
         tools = [dict(t) for t in (plan.tool_calls or []) if isinstance(t, dict)]
         if not tools:
             return plan
-        if any(
-            normalize_tool_name(str(t.get("tool") or "").strip())[0]
-            == "transform.filter_summaries"
-            for t in tools
+
+        likely_summaries = sheet_likely_has_summary_rows(structure_analysis, context_packet)
+        kept: List[Dict[str, Any]] = []
+        removed_filter = False
+        for tool in tools:
+            norm, _ = normalize_tool_name(str(tool.get("tool") or "").strip())
+            if norm == "transform.filter_summaries" and not likely_summaries:
+                removed_filter = True
+                continue
+            kept.append(tool)
+
+        if likely_summaries and not any(
+            normalize_tool_name(str(t.get("tool") or "").strip())[0] == "transform.filter_summaries"
+            for t in kept
         ):
+            insert_at = self._insert_index_after_layout_extract(kept)
+            if insert_at is not None:
+                filter_step = {
+                    "tool": "transform.filter_summaries",
+                    "params": {
+                        "keywords": list(_DEFAULT_SUMMARY_FILTER_KEYWORDS),
+                        "use_structural_detection": True,
+                    },
+                    "description": (
+                        "Remove Total/Subtotal/Grand Total rows after extract, before rename and "
+                        "block metric tools (flat-table cleanup)."
+                    ),
+                }
+                kept.insert(insert_at, filter_step)
+                note = (
+                    "Inserted transform.filter_summaries after layout extract for flat-table cleanup."
+                )
+                if note not in (plan.reasoning or ""):
+                    plan.reasoning = f"{(plan.reasoning or '').strip()} {note}".strip()
+
+        if removed_filter:
+            prune_note = (
+                "Omitted transform.filter_summaries — no Total/Subtotal rows detected on this sheet."
+            )
+            if prune_note not in (plan.reasoning or ""):
+                plan.reasoning = f"{(plan.reasoning or '').strip()} {prune_note}".strip()
+
+        if kept != tools:
+            for step_idx, tool in enumerate(kept, start=1):
+                tool["step"] = step_idx
+            plan.tool_calls = kept
+        return plan
+
+    def _reconcile_destructive_plan_review(self, plan: ExtractionPlan) -> ExtractionPlan:
+        """Drop plan-review pause when the only destructive step is a no-op filter_summaries."""
+        if not isinstance(plan, ExtractionPlan):
             return plan
-        insert_at = self._insert_index_after_layout_extract(tools)
-        if insert_at is None:
-            return plan
-        filter_step = {
-            "tool": "transform.filter_summaries",
-            "params": {
-                "keywords": list(_DEFAULT_SUMMARY_FILTER_KEYWORDS),
-                "use_structural_detection": True,
-            },
-            "description": (
-                "Remove Total/Subtotal/Grand Total rows after extract, before rename and "
-                "block metric tools (flat-table cleanup)."
-            ),
+
+        destructive = get_destructive_tools(list(plan.tool_calls or []))
+        norm_destructive = {
+            normalize_tool_name(str(name or "").strip())[0] for name in destructive
         }
-        tools.insert(insert_at, filter_step)
-        for step_idx, tool in enumerate(tools, start=1):
-            tool["step"] = step_idx
-        plan.tool_calls = tools
-        note = (
-            "Inserted transform.filter_summaries after layout extract for flat-table cleanup."
-        )
-        if note not in (plan.reasoning or ""):
-            plan.reasoning = f"{(plan.reasoning or '').strip()} {note}".strip()
+        destructive_only_filter = norm_destructive and norm_destructive <= {"transform.filter_summaries"}
+        reason = str(plan.review_reason or "").strip()
+        destructive_reason = reason.startswith("Plan includes destructive tools")
+
+        if destructive_only_filter and destructive_reason:
+            if plan.approval_items:
+                plan.review_reason = (
+                    f"Plan has {len(plan.approval_items)} approval items that need analyst review"
+                )
+                plan.requires_human_review = True
+            elif plan.confidence >= 0.7:
+                plan.requires_human_review = False
+                plan.review_reason = ""
+            else:
+                plan.review_reason = (
+                    f"Plan confidence ({plan.confidence:.1%}) is below threshold (70%)"
+                )
+
+        if not destructive and destructive_reason:
+            if plan.approval_items:
+                plan.review_reason = (
+                    f"Plan has {len(plan.approval_items)} approval items that need analyst review"
+                )
+                plan.requires_human_review = True
+            elif plan.confidence >= 0.7:
+                plan.requires_human_review = False
+                plan.review_reason = ""
+
         return plan
 
     def _insert_index_after_column_typing(self, tools: List[Dict[str, Any]]) -> int:
@@ -1965,61 +2074,90 @@ class PlanGenerator:
             plan.reasoning = f"{(plan.reasoning or '').strip()} {note}".strip()
         return plan
 
-    def _context_available_columns(self, context_packet: Optional[Dict[str, Any]]) -> Tuple[List[str], Dict[str, str]]:
-        approved_mappings = list((context_packet or {}).get("approved_mappings") or [])
-        business_rules = list((context_packet or {}).get("business_rules") or [])
-        source_summary = ((context_packet or {}).get("planning_summary") or {}).get("source_summary") or {}
-        prepared_columns = [str(col) for col in (source_summary.get("prepared_columns") or []) if str(col).strip()]
+    def _plan_already_scales_column(self, tools: List[Dict[str, Any]], column: str) -> bool:
+        """True if calculate/scale_values already adjusts this target column."""
+        col_l = str(column or "").strip().lower()
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            norm, _ = normalize_tool_name(str(tool.get("tool") or "").strip())
+            params = dict(tool.get("params") or {})
+            if norm == "transform.scale_values":
+                scales = params.get("scales") or params.get("columns") or {}
+                if isinstance(scales, dict):
+                    for key in scales:
+                        if str(key).strip().lower() == col_l:
+                            return True
+            if norm == "transform.calculate":
+                target = str(params.get("target_column") or "").strip().lower()
+                expr = str(params.get("expression") or "").lower()
+                if target == col_l and ("* 1000" in expr or "*1000" in expr):
+                    return True
+        return False
 
-        discard_columns = {
-            str(item.get("source_column") or "").strip()
-            for item in approved_mappings
-            if isinstance(item, dict) and str(item.get("decision", "")).strip().lower() == "discard"
+    def _ensure_value_scale_from_mappings(
+        self,
+        plan: ExtractionPlan,
+        context_packet: Optional[Dict[str, Any]],
+    ) -> ExtractionPlan:
+        """Insert ``transform.scale_values`` after rename/type_cast when mappings carry header scale."""
+        if not isinstance(plan, ExtractionPlan):
+            return plan
+
+        scales = build_target_scales_from_mappings(
+            list((context_packet or {}).get("approved_mappings") or [])
+        )
+        if not scales:
+            return plan
+
+        tool_calls: List[Dict[str, Any]] = [
+            dict(t) for t in (plan.tool_calls or []) if isinstance(t, dict)
+        ]
+        pending = {
+            col: factor
+            for col, factor in scales.items()
+            if not self._plan_already_scales_column(tool_calls, col)
         }
-        keep_decisions = {"keep", "approved", "primary", "supporting", "metadata", "context", "use as context"}
+        if not pending:
+            return plan
 
-        available_columns: List[str] = [col for col in prepared_columns if col and col not in discard_columns]
-        alias_lookup: Dict[str, str] = {}
+        insert_at = self._insert_index_after_column_typing(tool_calls)
+        existing = tool_calls[insert_at] if insert_at < len(tool_calls) else None
+        existing_norm = ""
+        if isinstance(existing, dict):
+            existing_norm, _ = normalize_tool_name(str(existing.get("tool") or "").strip())
 
-        for item in approved_mappings:
-            if not isinstance(item, dict):
-                continue
-            decision = str(item.get("decision", "")).strip().lower()
-            source_col = str(item.get("source_column") or "").strip()
-            target_col = str(item.get("target_column") or "").strip()
-            if decision not in keep_decisions or not source_col:
-                continue
+        note = ""
+        if existing_norm == "transform.scale_values":
+            params = dict(existing.get("params") or {})
+            merged = dict(params.get("scales") or params.get("columns") or {})
+            merged.update(pending)
+            params["scales"] = merged
+            existing["params"] = params
+            note = f"Merged value-scale factors for {len(pending)} column(s) into transform.scale_values."
+        else:
+            scale_step = {
+                "tool": "transform.scale_values",
+                "params": {"scales": dict(pending)},
+                "description": "Apply header denomination factors from approved mappings (e.g. thousands).",
+            }
+            tool_calls.insert(insert_at, scale_step)
+            parts = [f"{c}×{f:g}" for c, f in list(pending.items())[:6]]
+            note = (
+                f"Inserted transform.scale_values for header denomination: {', '.join(parts)}"
+                + ("..." if len(pending) > 6 else "")
+                + "."
+            )
 
-            resolved_name = source_col
-            if target_col and target_col != "No match":
-                resolved_name = target_col
-                if source_col in available_columns:
-                    available_columns = [resolved_name if col == source_col else col for col in available_columns]
-                elif resolved_name not in available_columns:
-                    available_columns.append(resolved_name)
-            elif source_col not in available_columns:
-                available_columns.append(source_col)
+        for step_idx, tool in enumerate(tool_calls, start=1):
+            tool["step"] = step_idx
+        plan.tool_calls = tool_calls
+        if note and note not in (plan.reasoning or ""):
+            plan.reasoning = f"{(plan.reasoning or '').strip()} {note}".strip()
+        return plan
 
-            for alias in {source_col, target_col, resolved_name}:
-                if alias and alias != "No match":
-                    alias_lookup[alias] = resolved_name
-
-        for rule in business_rules:
-            if not isinstance(rule, dict):
-                continue
-            dest = str(rule.get("target_column") or rule.get("destination_column") or "").strip()
-            if dest and dest not in available_columns:
-                available_columns.append(dest)
-            if dest:
-                alias_lookup[dest] = dest
-
-        deduped_columns: List[str] = []
-        seen = set()
-        for col in available_columns:
-            if col and col not in seen:
-                seen.add(col)
-                deduped_columns.append(col)
-        return deduped_columns, alias_lookup
+    def _context_available_columns(self, context_packet: Optional[Dict[str, Any]]) -> Tuple[List[str], Dict[str, str]]:
+        return context_available_columns(context_packet)
 
     def _resolve_plan_column_name(
         self,
@@ -2262,660 +2400,141 @@ class PlanGenerator:
             ExtractionPlan with tool_calls sequence and confidence
         """
         observer = get_observer()
-        
-        # Build examples text
-        examples_text = ""
-        if examples:
-            examples_text = "Similar examples from database:\n" + \
-                           "\n".join([f"- {e.get('description', 'Example')}" for e in examples[:3]])
-        
-        # Prepare column analysis list safely
-        col_analysis = structure_analysis.get('column_analysis', [])
-        if isinstance(col_analysis, dict):
-            # If LLM returned a dict, convert values to list
-            col_analysis = list(col_analysis.values())
-        elif not isinstance(col_analysis, list):
-            col_analysis = []
-        
-        # Build tables summary for multi-block awareness
-        tables = structure_analysis.get('tables', [])
-        tables_summary = ""
-        if len(tables) > 1:
-            tables_summary = f"""
-## IMPORTANT: Multiple Tables Detected ({len(tables)} tables)
-This spreadsheet contains {len(tables)} separate data blocks with similar schema placed side-by-side.
-You MUST use the `merge_blocks` tool to combine them into a single dataset.
-
-Tables detected:
-"""
-            for i, t in enumerate(tables):
-                if isinstance(t, dict):
-                    coords = t.get('coordinates', t)
-                    label = t.get('label', f'Table {i+1}')
-                    c_start = coords.get('col_start', coords.get('start_col', 0))
-                    c_end = coords.get('col_end', coords.get('end_col', 0))
-                    tables_summary += f"- {label}: cols {c_start}-{c_end}\n"
-        elif len(tables) == 1:
-            t = tables[0]
-            if isinstance(t, dict):
-                coords = t.get('coordinates', t)
-                label = t.get('label', 'Main data')
-                r_start = coords.get('data_start_row', coords.get('start_row', 0))
-                r_end = coords.get('data_end_row', coords.get('end_row', 0))
-                c_start = coords.get('col_start', coords.get('start_col', 0))
-                c_end = coords.get('col_end', coords.get('end_col', 0))
-                tables_summary = f"""
-## Single Table Detected
-- {label}: rows {r_start}-{r_end}, cols {c_start}-{c_end}
-"""
-        
-        # Build a SUMMARIZED structure analysis to avoid overloading the LLM context
-        summarized_analysis = {
-            "overall_structure": structure_analysis.get("overall_structure", "unknown"),
-            "confidence": structure_analysis.get("confidence", 0),
-            "tables": [
-                {
-                    "label": t.get("label", f"Table_{i}") if isinstance(t, dict) else f"Table_{i}",
-                    "coordinates": t.get("coordinates", {}) if isinstance(t, dict) else {},
-                    "table_shape": t.get("table_shape", "flat") if isinstance(t, dict) else "flat",
-                    "column_pattern": t.get("column_pattern", {}) if isinstance(t, dict) else {} # RESTORE: Crucial for stacking
-                }
-                for i, t in enumerate(structure_analysis.get("tables", []))
-            ],
-            "visual_patterns": structure_analysis.get("visual_patterns", {}), # RESTORE: Crucial for physical anchoring
-            "column_summary": [
-                {"col": c.get("col"), "name": c.get("name", f"col_{c.get('col')}"), "type": c.get("type", "unknown"), "is_blank": c.get("is_blank", False)}
-                for c in (col_analysis[:15] if len(col_analysis) > 15 else col_analysis)  # Limit to 15 columns
-                if isinstance(c, dict)
-            ],
-            "reasoning": structure_analysis.get("reasoning", "")[:500]  # Truncate reasoning
-        }
-        
-        # Identify if unpivot is likely needed (temporal columns present)
-        temporal_cols = [
-            c.get('name', f"col_{c.get('col')}") 
-            for c in col_analysis 
-            if isinstance(c, dict) and c.get('type') == 'temporal'
-        ]
-        unpivot_hint = ""
-        has_repetitions = any(
-            (t.get('column_pattern', {}).get('repetitions', 1) > 1) 
-            for t in (structure_analysis.get('tables') or [])
-            if isinstance(t, dict)
-        )
-        
-        if temporal_cols and not has_repetitions:
-            unpivot_hint = f"\n**Note:** Temporal columns detected ({', '.join(temporal_cols[:5])}). Consider using `transform.unpivot` to melt these into rows.\n"
-        elif has_repetitions:
-            unpivot_hint = (
-                "\n**Note:** Repeating column pattern detected (side-by-side blocks). "
-                "Use `layout.stack` only with explicit per-block `col_start`/`col_end` from demarcation "
-                "or structure `tables`, after headers align across blocks. Do NOT stack the full sheet "
-                "width as one block — extract each block separately if boundaries are unclear.\n"
-            )
             
         context_summary = (context_packet or {}).get("planning_summary", {})
-        approved_mapping_summary = context_summary.get("mapping_summary", {})
-        layout_summary = context_summary.get("layout_summary", {})
-        context_block_snippets = list((context_packet or {}).get("context_block_snippets") or [])
-        interpreted_context = dict(context_summary.get("interpreted_context") or {})
-        rules_summary = context_summary.get("rules_summary", [])
-        source_summary = context_summary.get("source_summary", {})
-        notes_summary = context_summary.get("user_notes", [])
-        excluded_columns = approved_mapping_summary.get("excluded_columns", [])
+        if not isinstance(context_summary, dict):
+            context_summary = {}
+        approved_mapping_summary = context_summary.get("mapping_summary", {}) or {}
+        rules_summary = list(context_summary.get("rules_summary") or [])
 
-        # Create user prompt with SUMMARIZED structure analysis
-        cols_context_list = [
-            c.get('name', f"col_{c.get('col', i)}") 
-            for i, c in enumerate(col_analysis[:8])
-            if isinstance(c, dict)
-        ]
-        user_prompt = f"""Given this spreadsheet structure analysis, create a sequence of tool calls to transform the data into a flat, normalized table.
-
-## Structure Analysis (Summary)
-{json_safe_dumps(summarized_analysis, indent=2)}
-{unpivot_hint}
-{examples_text}
-{tables_summary}
-
-## Important Context
-- Columns include: {', '.join(cols_context_list)}
-- Overall structure: {structure_analysis.get('overall_structure', 'Unknown')}
-
-## Your Task
-Create a JSON response with this priority order:
-1. `confidence` - Your confidence in this plan (0.0 to 1.0)
-2. `tool_calls` - Ordered list of transformations to apply
-3. `business_rule_actions` - Explicit actions for defaults, formatting, fill-blank rules, or cross-field checks
-4. `approval_items` - **Sparse** human decisions only when the plan is ambiguous or confidence is weaker: default to `[]`. Prefer objects with `question` + `options` (2–4 `{{id,label}}` choices that pick a branch). Avoid long lists of Yes/No trivia—see system prompt **4A** (max ~3 items, no routine column-definition checks).
-5. `expected_schema` - The column names you expect in the final output (list of strings)
-
-Respond with JSON only, no markdown formatting."""
-
-        if source_summary:
-            uid = source_summary.get("uid") or []
-            aggregation_logic = source_summary.get("aggregation_logic") or ""
-            prepared_columns = source_summary.get("prepared_columns") or []
-            header_derivation = source_summary.get("header_derivation") or {}
-            sparse_dimension_columns = source_summary.get("sparse_dimension_columns") or []
-            user_prompt += f"""
-
-## Source Metadata
-- File: {source_summary.get('file_name')}
-- Sheet: {source_summary.get('sheet_name')}
-- Variable type: {source_summary.get('variable_type') or source_summary.get('source_type') or 'not specified'}
-- Modeling period start: {source_summary.get('modeling_period_start') or 'not specified'}
-- Modeling period end: {source_summary.get('modeling_period_end') or 'not specified'}
-- UID: {', '.join(uid) if isinstance(uid, list) and uid else 'not specified'}
-- Date granularity: {source_summary.get('date_granularity') or 'not specified'}
-- Aggregation logic: {aggregation_logic or 'not specified'}
-"""
-            if prepared_columns:
-                user_prompt += "\n- Prepared columns after scoped/header preprocessing: " + ", ".join(prepared_columns[:20]) + "\n"
-            if isinstance(header_derivation, dict) and header_derivation.get("derived"):
-                user_prompt += f"- Header derivation: {header_derivation.get('message') or 'multi-row headers were merged before mapping/planning'}\n"
-            if sparse_dimension_columns:
-                sparse_text = ", ".join(
-                    f"{item.get('source_column')} ({round(float(item.get('blank_ratio') or 0.0) * 100)}% blank)"
-                    for item in sparse_dimension_columns[:6]
-                    if isinstance(item, dict) and item.get("source_column")
-                )
-                if sparse_text:
-                    user_prompt += f"- Sparse dimension columns detected: {sparse_text}\n"
-
-        gran_align = (context_summary or {}).get("date_granularity_alignment") or {}
-        if not gran_align.get("planner_obligation") and isinstance(target_template, dict):
-            xs = target_template.get("x_scope")
-            xs = xs if isinstance(xs, dict) else {}
-            gran_align = compute_date_granularity_alignment(
-                str((source_summary or {}).get("date_granularity") or ""),
-                effective_target_date_granularity(xs),
-                source_date_shape=str((source_summary or {}).get("date_shape") or ""),
-            )
-        if gran_align.get("planner_obligation"):
-            rec = gran_align.get("recommended_primary_tool") or ""
-            rec_line = f"\n- **Preferred tool path (after union when deferred)**: {rec}" if rec else ""
-            defer_union = bool((context_packet or {}).get("defer_weekly_rollups_to_post_union"))
-            if defer_union:
-                user_prompt += f"""
-
-## Date granularity (multi-source batch — per-source plan only)
-- Source vs template: **{gran_align.get('source_date_granularity') or gran_align.get('normalized_source') or 'not specified'}** → **{gran_align.get('target_date_granularity') or gran_align.get('normalized_target') or 'not specified'}**.
-- **Collation duplicate_check runs on the stacked frame before any deferred grain tools.** Include required grain tools (`transform.aggregate_weekly`, `infer_granularity_expand_to_daily`, `expand_period_to_daily`, `date_range_to_weekly`, …) in `tool_calls` when the final combined output needs them; the executor will defer them until after duplicate_check. On **this workbook alone**:
-  - **Do not** rely on these grain tools having executed before per-source verification; they are post-collate intent, not per-source execution.
-  - **Do not** use `transform.rename` to fabricate a `week_start` column before that column exists.
-  - Keep the mapped **physical** date column (often `date` or `calendar_date`); type_cast/format as needed.
-  - **Still required per source (not deferred):** `transform.filter_summaries`, then `transform.expand_grouped_block` or dimension-only `transform.fill_merged` when sparse/merged layout columns exist.{rec_line}
-"""
-            else:
-                user_prompt += f"""
-
-## Date granularity alignment (REQUIRED — honor in tool_calls)
-Analysts set **source** grain in Guided Setup; the template sets **target** grain. Your plan must satisfy the obligation (do not skip rollup solely because structure analysis looks “flat enough”).
-- **Source (job / Guided Setup)**: {gran_align.get('source_date_granularity') or gran_align.get('normalized_source') or 'not specified'}
-- **Target (template x_scope)**: {gran_align.get('target_date_granularity') or gran_align.get('normalized_target') or 'not specified'}
-- **Planner obligation**: {gran_align.get('planner_obligation')}{rec_line}
-"""
-
-        obs_cols = (source_summary or {}).get("date_column_observations") or []
-        obs_summary = (source_summary or {}).get("date_cadence_summary") or ""
-        obs_mismatch = (source_summary or {}).get("date_granularity_mismatch_note") or ""
-        obs_agg_conf = (source_summary or {}).get("date_cadence_aggregate_confidence")
-        if obs_cols or obs_summary or obs_mismatch:
-            user_prompt += "\n## Observed date cadence from prepared data (sample-based)\n"
-            user_prompt += (
-                "Textual **start–end** cells are split and parsed; **period starts** drive row-to-row spacing "
-                "(median day gap across sorted unique starts). Range span length is summarized as "
-                "`median_window_days` when both endpoints parse.\n"
-                "Each column includes a heuristic `confidence` (0–1). Low values should appear as "
-                "`approval_items` in the review UI — do not override those without analyst confirmation.\n"
-                "Use together with Guided Setup `date_granularity`: if they conflict, choose tools that match the "
-                "**actual parsed pattern** and record the conflict in `reasoning` or `approval_items`.\n"
-            )
-            if obs_agg_conf is not None:
-                user_prompt += f"- **Aggregate confidence (min across mapped date columns)**: {obs_agg_conf}\n"
-            if obs_summary:
-                user_prompt += f"- **Summary**: {obs_summary}\n"
-            if obs_mismatch:
-                user_prompt += f"- **Conflict note**: {obs_mismatch}\n"
-            for item in obs_cols[:8]:
-                if isinstance(item, dict):
-                    user_prompt += f"- {json_safe_dumps(item)}\n"
-            pair_hint = (source_summary or {}).get("inferred_date_range_pair")
-            if isinstance(pair_hint, dict) and pair_hint.get("start_date_col") and pair_hint.get("end_date_col"):
-                user_prompt += (
-                    "\n### Inferred two-column date range (from mapped date targets)\n"
-                    f"- **Likely start column**: `{pair_hint.get('start_date_col')}`\n"
-                    f"- **Likely end column**: `{pair_hint.get('end_date_col')}`\n"
-                    f"- **Heuristic confidence**: {pair_hint.get('confidence')} "
-                    f"(median inclusive span ≈ {pair_hint.get('median_span_days')} days)\n"
-                    "- When the target template is **weekly**, prefer "
-                    "`transform.date_range_to_weekly` with `granularity='daily'` then "
-                    "`transform.aggregate_weekly` on `calendar_date` (not a single mixed date column).\n"
-                )
-
-        if layout_summary:
-            context_labels = layout_summary.get("context_block_labels") or []
-            user_prompt += f"""
-
-## Approved Layout Scope
-- Scope type: {layout_summary.get('scope_type') or 'not specified'}
-- Header row: {layout_summary.get('header_row')}
-- Analysis bounds: {json_safe_dumps(layout_summary.get('analysis_bounds') or {})}
-- Main blocks approved: {layout_summary.get('main_blocks_count', 0)}
-- Context blocks approved: {layout_summary.get('context_blocks_count', 0)}
-"""
-            if context_labels:
-                user_prompt += "- Context block labels: " + ", ".join(context_labels) + "\n"
-
-        if context_block_snippets:
-            user_prompt += """
-
-## Approved Context Block Snippets
-These snippets come from blocks the user explicitly approved as context/metadata.
-- Use them as semantic guidance for interpretation, mapping, date logic, aggregation logic, and planner assumptions.
-- Do NOT treat them as main metric rows to transform.
-"""
-            for idx, snippet in enumerate(context_block_snippets[:5], start=1):
-                label = snippet.get("block_label") or snippet.get("block_id") or f"context_block_{idx}"
-                summary = snippet.get("summary") or ""
-                text_preview = snippet.get("text_preview") or []
-                non_empty_cells = snippet.get("non_empty_cells") or []
-                user_prompt += f"""
-- Context block {idx}: {label}
-  - Summary: {summary or 'n/a'}
-  - Text preview: {json_safe_dumps(text_preview[:4])}
-  - Non-empty cells: {json_safe_dumps(non_empty_cells[:8])}
-"""
-
-        if interpreted_context:
-            user_prompt += """
-
-## Interpreted Context
-This metadata was deterministically inferred from approved context blocks.
-- Prefer these inferred fields over raw snippet guessing when they help with date logic, rollups, source meaning, and planner assumptions.
-"""
-            if interpreted_context.get("fields"):
-                user_prompt += "\n- Inferred fields: " + json_safe_dumps(interpreted_context.get("fields")) + "\n"
-            if interpreted_context.get("assumptions"):
-                user_prompt += "- Assumptions / notes: " + json_safe_dumps(interpreted_context.get("assumptions")[:8]) + "\n"
-            if interpreted_context.get("evidence"):
-                user_prompt += "- Evidence: " + json_safe_dumps(interpreted_context.get("evidence")[:8]) + "\n"
-
-        source_graph_view = (context_packet or {}).get("source_graph_view") or context_summary.get("source_graph_view")
-        relationship_context = context_summary.get("relationship_context") or {}
-        if source_graph_view or relationship_context.get("approved"):
-            user_prompt += """
-
-## Source Graph
-Approved relationships between sources and the columns available on each source.
-- Treat this as the ONLY trusted topology for cross-source references.
-- Never invent joins that are not listed here.
-- When a derived field requires a column from another source, confirm an edge with explicit `join_keys` exists.
-"""
-            if isinstance(source_graph_view, dict):
-                nodes_preview = source_graph_view.get("nodes") or []
-                edges_preview = source_graph_view.get("edges") or []
-                if nodes_preview:
-                    user_prompt += "\n- Nodes: " + json_safe_dumps(nodes_preview[:8]) + "\n"
-                if edges_preview:
-                    user_prompt += "- Edges: " + json_safe_dumps(edges_preview[:8]) + "\n"
-            elif relationship_context.get("approved"):
-                user_prompt += "\n- Approved relationships: " + json_safe_dumps(
-                    list(relationship_context.get("approved") or [])[:8]
-                ) + "\n"
-
-        if (
-            isinstance(context_packet, dict)
-            and len(context_packet.get("available_source_summaries") or []) >= 2
-        ):
-            fc = context_packet.get("file_relationships")
-            if not (isinstance(fc, list) and len(fc) > 0):
-                user_prompt += """
-
-## Optional tool: cross-source relationships
-When **two or more** uploaded sources appear in ``available_source_summaries`` and **file relationships are not yet approved**, you may include an early tool call (typically before heavy layout transforms):
-``{"tool": "discovery.propose_file_relationships", "params": {}}``
-It records union/join proposals for review and may pause the run. Skip if relationships are already approved or the job defers relationship review to the web layer.
-"""
-
-        resolved_decisions_block = format_resolved_decisions_for_prompt(
-            list((context_packet or {}).get("resolved_planner_decisions") or [])
+        prompt_result = build_planner_prompt_result(
+            structure_analysis,
+            context_packet,
+            target_template,
+            examples=examples,
         )
-        if resolved_decisions_block:
-            user_prompt += resolved_decisions_block
-
-        dup_targets = (context_packet or {}).get("duplicate_target_mappings") or {}
-        if isinstance(dup_targets, dict) and dup_targets:
-            user_prompt += "\n## Multiple source columns → same template target\n"
-            user_prompt += (
-                "The analyst already mapped more than one physical column to the same template field. "
-                "If `resolved_planner_decisions` specifies a strategy, follow it; do not invent "
-                "`spends_1` / `spends_2` stub names in `transform.calculate`.\n"
-            )
-            for tgt, srcs in list(dup_targets.items())[:8]:
-                user_prompt += f"- `{tgt}` ← {', '.join(repr(s) for s in srcs)}\n"
-
-        if approved_mapping_summary.get("mapped_columns"):
-            user_prompt += """
-
-## Approved Column Mappings
-These mappings were approved upstream. Prefer them over semantic guesses.
-- Use the exact approved source column names when emitting `transform.rename`.
-- Do NOT invent new rename pairs for template targets that are still `No match` upstream.
-"""
-            user_prompt += "\n" + "\n".join(
-                f"- {item}" for item in approved_mapping_summary.get("mapped_columns", [])
-            )
-
-        if excluded_columns:
-            user_prompt += """
-
-## Approved Exclusions
-These source columns were explicitly marked `Discard` upstream and are already removed from the working dataframe.
-- Do NOT include them in rename mappings
-- Do NOT include them in `expected_schema`
-- Do NOT create business rules for them
-"""
-            user_prompt += "\n" + "\n".join(f"- {item}" for item in excluded_columns)
-
-        user_prompt += """
-
-## Empty-Row Filtering Guardrail
-- `xls.data.filter_empty` is ONLY for genuinely blank / incomplete rows.
-- Numeric zero values (for example `0` spend or `0` impressions) are valid populated metrics, NOT blanks.
-- Do NOT add `xls.data.filter_empty` unless the analyzer/context shows actual empty rows, spacer rows, or rows with missing metric cells.
-"""
-
-        if rules_summary:
-            user_prompt += """
-
-## Approved Business Rules
-Apply these rules deterministically in the plan where relevant.
-"""
-            user_prompt += "\n" + "\n".join(f"- {item}" for item in rules_summary)
-
-        if notes_summary:
-            user_prompt += """
-
-## User Notes
-"""
-            user_prompt += "\n" + "\n".join(f"- {item}" for item in notes_summary)
-
-        # Inject target template context if available
-        if target_template and target_template.get("properties"):
-            template_cols = list(target_template["properties"].keys())
-            mandatory = list(template_cols)
-            pre_cols = pre_transform_target_columns(target_template)
-            template_scope = target_template.get("x_scope") if isinstance(target_template.get("x_scope"), dict) else {}
-            template_scope = template_scope or {}
-            contract = (context_packet or {}).get("template_contract") or build_template_contract(target_template)
-            column_gaps = (context_packet or {}).get("column_gaps")
-            if not column_gaps:
-                available_columns, _ = self._context_available_columns(context_packet)
-                column_gaps = compute_column_gaps(
-                    target_template,
-                    available_columns,
-                    approved_mappings=list((context_packet or {}).get("approved_mappings") or []),
-                )
-            uid_line = ", ".join(contract.get("uid_hierarchy") or template_scope.get("uid_hierarchy") or []) or "not specified"
-            metrics_line = ", ".join(contract.get("metrics") or template_scope.get("metrics") or []) or "not specified"
-            supporting_line = ", ".join(contract.get("supporting_columns") or template_scope.get("supporting_columns") or []) or "not specified"
-            rules_lines = contract.get("column_rule_summary") or template_column_rules_summary(target_template)
-            rules_block = "\n".join(f"  - {r}" for r in rules_lines) if rules_lines else "  - (none)"
-            gaps_block = json_safe_dumps(column_gaps, indent=2) if column_gaps else "{}"
-            suggested_adds = column_gaps.get("suggested_add_columns") if isinstance(column_gaps, dict) else []
-            if suggested_adds:
-                add_steps = "\n".join(
-                    f"  - `{s.get('target_column')}` = {s.get('value')!r} "
-                    f"(rule {s.get('rule_id') or 'template'}; use transform.add_column or one transform.apply_column_rules)"
-                    for s in suggested_adds
-                    if isinstance(s, dict) and s.get("target_column")
-                )
-            else:
-                add_steps = "  - (none — all rule-backed UID columns present or no column_rules)"
-            aggregation_scope = target_template.get("aggregation_logic") or template_scope.get("aggregation_logic")
-            if isinstance(aggregation_scope, dict):
-                metric_rules = aggregation_scope.get("metric_rules") or {}
-                pmi_rules = aggregation_scope.get("pmi_safe_rules") or []
-                aggregation_scope_text = ", ".join(
-                    [f"{metric}={rule}" for metric, rule in metric_rules.items()] + [str(rule) for rule in pmi_rules]
-                )
-            elif isinstance(aggregation_scope, list):
-                aggregation_scope_text = ", ".join(str(item) for item in aggregation_scope)
-            else:
-                aggregation_scope_text = str(aggregation_scope or "")
-            mp = template_scope.get("modeling_period") or {}
-            if isinstance(mp, dict):
-                mps, mpe = mp.get("start_date"), mp.get("end_date")
-            else:
-                mps, mpe = None, None
-            template_section = f"""
-
-## Target Template (Enrichment Phase)
-The output MUST align with this schema. After extraction and reshaping, add enrichment steps:
-- **Final output columns (all required in verify.schema)**: {', '.join(mandatory)}
-- **Pre-transform / mapping column order**: {', '.join(pre_cols)}
-- **UID hierarchy (grain)**: {uid_line}
-- **Metrics**: {metrics_line}
-- **Supporting columns**: {supporting_line}
-- **Variable type**: {template_scope.get('variable_type') or 'not specified'}
-- **Modeling period start**: {mps or 'not specified'}
-- **Modeling period end**: {mpe or 'not specified'}
-- **Target date granularity**: {effective_target_date_granularity(template_scope) or 'not specified'}
-- **PMI-safe aggregation**: {aggregation_scope_text or 'sum additive metrics at duplicate UID rows; never average impressions'}
-- **Template column rules (emit as explicit tool steps — `transform.apply_column_rules` or `transform.add_column`)**:
-{rules_block}
-- **Suggested add-column steps from column_gaps**:
-{add_steps}
-- Use `transform.rename` to match column names to the template.
-- Use `transform.map_values` if any column has enum constraints.
-- Use `transform.format` for date/number formatting.
-- Treat the UID hierarchy as the deduplication and aggregation grain for the final output.
-- When multiple rows exist at the same UID, SUM metrics per aggregation_logic and never average impressions.
-
-## Column gaps (prepared dataframe vs template contract)
-```json
-{gaps_block}
-```
-
-{_TEMPLATE_ENRICHMENT_TOOL_ORDER}
-"""
-            target_granularity = str(effective_target_date_granularity(template_scope) or "").strip().lower()
-            source_granularity = str((source_summary or {}).get("date_granularity") or "").strip().lower()
-            if target_granularity in ("weekly", "week"):
-                metrics_list = template_scope.get("metrics") or []
-                available_columns, _alias_lookup = self._context_available_columns(context_packet)
-                resolved_metrics = [str(metric) for metric in metrics_list if str(metric) in available_columns]
-                metrics_for_weekly_tools = resolved_metrics or [str(metric) for metric in metrics_list]
-                metric_rule_map: Dict[str, str] = {}
-                if isinstance(aggregation_scope, dict):
-                    raw_rules = aggregation_scope.get("metric_rules") or {}
-                    if isinstance(raw_rules, dict):
-                        for metric_name, rule in raw_rules.items():
-                            metric_name = str(metric_name)
-                            if metric_name in metrics_for_weekly_tools:
-                                metric_rule_map[metric_name] = str(rule or "sum").lower()
-                for metric_name in metrics_for_weekly_tools:
-                    metric_rule_map.setdefault(str(metric_name), "sum")
-                metric_rules_text = ", ".join(f"{m}={r}" for m, r in metric_rule_map.items()) or "sum for every template metric"
-                preprocessing_guidance = (
-                    "- If the date is split across parts (for example year/month/day or year/quarter), "
-                    "first use `transform.build_date_from_parts` to create one real date column.\n"
-                )
-
-                sparse_note = ""
-                sparse_dims = source_summary.get("sparse_dimension_columns") or []
-                structured = structure_analysis.get("tables") if isinstance(structure_analysis, dict) else None
-                hierarchies = []
-                if isinstance(structured, list):
-                    for tbl in structured:
-                        if isinstance(tbl, dict) and isinstance(tbl.get("hierarchy"), dict):
-                            htype = str((tbl["hierarchy"] or {}).get("type") or "").strip().lower()
-                            if htype == "grouped_rows":
-                                hierarchies.append(htype)
-                grouped_rows_sheet = bool(hierarchies)
-                mls = (
-                    structure_analysis.get("metric_layout_signals")
-                    if isinstance(structure_analysis, dict)
-                    else None
-                )
-                if isinstance(mls, dict) and mls.get("grouped_rows_likely"):
-                    grouped_rows_sheet = True
-
-                if isinstance(sparse_dims, list):
-                    for entry in sparse_dims:
-                        if isinstance(entry, dict):
-                            br = entry.get("blank_ratio") or entry.get("blank_ratio_approx")
-                            try:
-                                pct = float(br) * 100 if br is not None and float(br) <= 1 else float(br or 0)
-                            except (TypeError, ValueError):
-                                pct = 0.0
-                            if pct >= 40.0:
-                                sparse_note += (
-                                    "- Block-style layout detected: some columns are sparse (e.g. dimensions with "
-                                    "high blank rate). If **spend/budget** is only populated on the parent row of each "
-                                    "section, after `rename`/`type_cast` you may **`transform.infer_block_boundary_columns`** "
-                                    "(if noisy ids were dropped), then **`transform.classify_metric_level`** "
-                                    "with inferred or confirmed `block_start_columns`, then **`transform.allocate_block_metric`** "
-                                    "**(equal: row_spend = block_total / rows_in_block; weighted: multiply by impressions share "
-                                    "within block)** with `metric_col` = spend and realistic boundaries (e.g. `Ref`, `Name`). "
-                                    "Do **not** `transform.fill_merged` on spend. Then **`transform.aggregate_weekly`** "
-                                    "with explicit `metric_rules` for every template metric (e.g. `spends`, `impressions`).\n"
-                                )
-                                break
-                elif grouped_rows_sheet:
-                    sparse_note += (
-                        "- Structure analysis suggests **grouped_rows** hierarchies; if mapped spend/budget is "
-                        "sparse on continuation rows, optionally **`transform.classify_metric_level`** then "
-                        "**`transform.allocate_block_metric`** (equal vs weighted-by-impressions) before weekly rollup "
-                        "and **`transform.aggregate_weekly`** with explicit `metric_rules`; avoid `fill_merged` "
-                        "on spend/budget.\n"
-                    )
-
-                preprocessing_guidance = preprocessing_guidance + sparse_note if sparse_note else preprocessing_guidance
-
-                if source_granularity in ("range", "date_range", "daterange", "flight", "flighting"):
-                    tool_guidance = "Use `transform.date_range_to_weekly` with the start/end date columns and `value_cols` set to the template metrics."
-                elif source_granularity in ("month", "monthly", "quarter", "quarterly"):
-                    tool_guidance = (
-                        "Use `transform.expand_period_to_daily` first with the period date column, "
-                        "`input_granularity` set to the source grain, and `value_cols` set to the template metrics; "
-                        "then use `transform.aggregate_weekly` on the emitted daily date column with "
-                        f"`metric_rules` = {{{metric_rules_text}}}."
-                    )
-                else:
-                    tool_guidance = (
-                        "Use `transform.aggregate_weekly` with `date_col` set to the (renamed) date column, "
-                        "`group_by_cols` set to the UID hierarchy + supporting columns, and `metric_rules` = "
-                        f"{{{metric_rules_text}}}."
-                    )
-
-                template_section += f"""
-### Weekly Rollup (MANDATORY)
-Target granularity is **weekly** and the source granularity is `{source_granularity or 'unspecified'}`.
-- {preprocessing_guidance.strip()}
-- {tool_guidance}
-- Prefer resolved metric columns only: {', '.join(metrics_for_weekly_tools) if metrics_for_weekly_tools else 'none resolved yet'}.
-- If supporting or hierarchy dimension columns are sparse within a block (for example `Market` or `Publisher` only appears on the first row of each section), add `transform.fill_merged` on **those dimension columns only** BEFORE weekly aggregation so those dimensions are populated on every metric row.
-- If **spend/budget** (or any template metric) appears only on the **parent row** of each block and is blank on post rows, add `transform.allocate_block_metric` after `rename`/`type_cast` on that metric column (with `block_start_columns` such as `Ref` or `Name`). **Do not** use `transform.fill_merged` on spend/budget metrics—that duplicates contract totals when you SUM in `aggregate_weekly`.
-- Always pass explicit `metric_rules` for **every** template metric in `transform.aggregate_weekly` (e.g. `{{spends: sum, impressions: sum}}`) so sparse numeric columns are not dropped by inference.
-- Place the weekly aggregation step AFTER rename/type_cast/format and BEFORE `verify.schema`.
-- After aggregation the output MUST contain a single Monday-aligned weekly date column. Use the template date field as `date_col` (e.g. `date` or `calendar_date`); **do not** pass `week_start_col` unless the template uid date is literally `week_start` or you need a second date column alongside the daily one. Do NOT require a separate `week_end` column unless a human explicitly asks for it.
-"""
-
-            user_prompt += template_section
+        user_prompt = prompt_result["user_prompt"]
+        context_briefing = prompt_result.get("briefing") or {}
 
         if observer:
-            with observer.trace("plan_generator") as t:
-                t.system_prompt = self.SYSTEM_PROMPT
-                t.user_prompt = user_prompt
-                t.full_prompt = f"{augment_system_prompt_with_catalog(self.SYSTEM_PROMPT)}\n\n{user_prompt}"
-                t.prompt_version = self.PROMPT_VERSION
-                t.retrieved_examples = examples or []
-                t.input_context = {
-                    "tables_count": len(structure_analysis.get("tables", [])),
-                    "columns_count": len(structure_analysis.get("column_analysis", [])),
-                    "approved_mappings_count": len(approved_mapping_summary.get("mapped_columns", [])),
-                    "business_rules_count": len(rules_summary),
-                }
-                
-                try:
-                    # Configuration-driven generation config
-                    # IMPORTANT: Always ensure sufficient max_output_tokens for complex responses
-                    gen_config = {"max_output_tokens": 8192, "temperature": 0.0}  # Increased default
-                    
-                    # MERGE with client config if available (don't replace!)
-                    if hasattr(self.llm_client, 'generation_config') and self.llm_client.generation_config:
-                        client_config = self.llm_client.generation_config
-                        if isinstance(client_config, dict):
-                            if client_config.get('max_output_tokens', 0) > gen_config['max_output_tokens']:
-                                gen_config['max_output_tokens'] = client_config['max_output_tokens']
-                            if 'temperature' in client_config:
-                                gen_config['temperature'] = client_config['temperature']
-                         
-                    response = self.llm_wrapper.generate_content(t.full_prompt, generation_config=gen_config)
-                    response_text = response.text
-                    t.raw_response = response_text
-                    
-                    if hasattr(self.llm_client, 'model_name'):
-                         t.model_id = self.llm_client.model_name.replace('models/', '')
-                         
-                    logger.info(f"Captured LLM response for plan_generator: {len(response_text)} chars")
-                except Exception as e:
-                    logger.error(f"PlanGenerator unexpected error: {e}")
-                    t.error_message = str(e)
-                    t.success = False
-                    if not t.raw_response:
-                        t.raw_response = f"Unexpected Error: {e}"
-                    response = type('obj', (object,), {'text': ''})  # Mock empty response
-                
-                try:
-                    plan = self._parse_plan(
-                        response.text, structure_analysis, context_packet=context_packet
-                    )
-                    plan = self.finalize_plan(
-                        plan, context_packet, target_template, structure_analysis
-                    )
-                    t.success = True
-                except Exception as e:
-                    logger.error(f"Failed to parse plan: {e}")
-                    plan = ExtractionPlan(
-                        tool_calls=[],
-                        confidence=0.0,
-                        reasoning=f"Parsing Error: {str(e)}",
-                        requires_human_review=True,
-                        review_reason="AI failed to generate a valid plan JSON."
-                    )
-                    t.success = False
-                    t.error_message = str(e)
-                
-                t.parsed_output = {
-                    "tool_calls": plan.tool_calls,
-                    "business_rule_actions": plan.business_rule_actions,
-                    "approval_items": plan.approval_items,
-                    "expected_columns": plan.expected_columns,
-                    "confidence": plan.confidence,
-                    "reasoning": plan.reasoning
-                }
-                t.confidence_score = float(plan.confidence)
-                
-                return plan
-        else:
-            full_prompt = f"{augment_system_prompt_with_catalog(self.SYSTEM_PROMPT)}\n\n{user_prompt}"
+            return self._generate_with_observer(
+                observer,
+                user_prompt,
+                context_briefing,
+                structure_analysis,
+                context_packet,
+                    target_template,
+                examples,
+                approved_mapping_summary,
+                rules_summary,
+            )
+
+        full_prompt = f"{augment_system_prompt_with_catalog(self.SYSTEM_PROMPT)}\n\n{user_prompt}"
+        try:
+            response = self.llm_wrapper.generate_content(full_prompt)
+            response_text = response.text
+        except Exception as e:
+            logger.error(f"PlanGenerator LLM call failed: {e}")
+            response_text = ""
+
+        plan = self._parse_plan(
+            response_text, structure_analysis, context_packet=context_packet
+        )
+        plan.raw_tool_calls = [
+            dict(t) for t in (plan.tool_calls or []) if isinstance(t, dict)
+        ]
+        return self.finalize_plan(
+            plan, context_packet, target_template, structure_analysis
+        )
+
+    def _generate_with_observer(
+        self,
+        observer,
+        user_prompt: str,
+        context_briefing: Dict[str, Any],
+        structure_analysis: Dict,
+        context_packet: Optional[Dict[str, Any]],
+        target_template: Optional[Dict[str, Any]],
+        examples: Optional[List[Dict]],
+        approved_mapping_summary: Dict[str, Any],
+        rules_summary: List[str],
+    ) -> ExtractionPlan:
+        with observer.trace("plan_generator") as t:
+            t.system_prompt = self.SYSTEM_PROMPT
+            t.user_prompt = user_prompt
+            t.full_prompt = f"{augment_system_prompt_with_catalog(self.SYSTEM_PROMPT)}\n\n{user_prompt}"
+            t.prompt_version = self.PROMPT_VERSION
+            t.retrieved_examples = examples or []
+            t.input_context = {
+                "tables_count": len(structure_analysis.get("tables", [])),
+                "columns_count": len(structure_analysis.get("column_analysis", [])),
+                "approved_mappings_count": len(approved_mapping_summary.get("mapped_columns", [])),
+                "business_rules_count": len(rules_summary),
+                "context_briefing": context_briefing,
+            }
+
             try:
-                response = self.llm_wrapper.generate_content(full_prompt)
+                gen_config = {"max_output_tokens": 8192, "temperature": 0.0}
+                if hasattr(self.llm_client, "generation_config") and self.llm_client.generation_config:
+                    client_config = self.llm_client.generation_config
+                    if isinstance(client_config, dict):
+                        if client_config.get("max_output_tokens", 0) > gen_config["max_output_tokens"]:
+                            gen_config["max_output_tokens"] = client_config["max_output_tokens"]
+                        if "temperature" in client_config:
+                            gen_config["temperature"] = client_config["temperature"]
+
+                response = self.llm_wrapper.generate_content(t.full_prompt, generation_config=gen_config)
                 response_text = response.text
+                t.raw_response = response_text
+
+                if hasattr(self.llm_client, "model_name"):
+                    t.model_id = self.llm_client.model_name.replace("models/", "")
+
+                logger.info(
+                    "Captured LLM response for plan_generator: %s chars",
+                    len(response_text),
+                )
             except Exception as e:
-                logger.error(f"PlanGenerator LLM call failed: {e}")
-                response_text = ""
-                
-            plan = self._parse_plan(
-                response_text, structure_analysis, context_packet=context_packet
-            )
-            return self.finalize_plan(
-                plan, context_packet, target_template, structure_analysis
-            )
+                logger.error(f"PlanGenerator unexpected error: {e}")
+                t.error_message = str(e)
+                t.success = False
+                if not t.raw_response:
+                    t.raw_response = f"Unexpected Error: {e}"
+                response = type("obj", (object,), {"text": ""})()
+
+            try:
+                plan = self._parse_plan(
+                    response.text, structure_analysis, context_packet=context_packet
+                )
+                plan.raw_tool_calls = [
+                    dict(item) for item in (plan.tool_calls or []) if isinstance(item, dict)
+                ]
+                plan = self.finalize_plan(
+                    plan, context_packet, target_template, structure_analysis
+                )
+                t.success = True
+            except Exception as e:
+                logger.error(f"Failed to parse plan: {e}")
+                plan = ExtractionPlan(
+                    tool_calls=[],
+                    confidence=0.0,
+                    reasoning=f"Parsing Error: {str(e)}",
+                    requires_human_review=True,
+                    review_reason="AI failed to generate a valid plan JSON.",
+                )
+                t.success = False
+                t.error_message = str(e)
+
+            t.parsed_output = {
+                "tool_calls": plan.tool_calls,
+                "business_rule_actions": plan.business_rule_actions,
+                "approval_items": plan.approval_items,
+                "expected_columns": plan.expected_columns,
+                "confidence": plan.confidence,
+                "reasoning": plan.reasoning,
+            }
+            t.confidence_score = float(plan.confidence)
+            return plan
     
     def _parse_plan(
         self,

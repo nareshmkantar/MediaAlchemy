@@ -1,0 +1,17 @@
+# Render Blueprint — SchemaAgent web UI
+# Docs: https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: schema-agent
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn web_server:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
+    envVars:
+      - key: SIA_LLM_MODEL
+        value: azure-gpt-5.3-chat
+      - key: SIA_DEBUG_ENABLED
+        value: "false"
+      - key: PYTHON_VERSION
+        value: "3.12.0"
+      # Set in Render dashboard (secrets — do not commit):
+      # AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_VERSION, AZURE_OPENAI_DEPLOYMENT

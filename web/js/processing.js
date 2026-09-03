@@ -199,6 +199,9 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     document.getElementById('jobId').textContent = jobId;
+    document.getElementById('downloadProcessingLog')?.addEventListener('click', (event) => {
+        event.stopPropagation();
+    });
 
     try {
         if (sessionStorage.getItem('schemaAgentAutostartProcess') === '1') {
@@ -232,10 +235,6 @@ async function pollJobTick(jobId) {
         clearInterval(pollInterval);
         pollInterval = null;
         if (typeof updateNavStatus === 'function') updateNavStatus();
-
-        if (data.status === 'completed' && data.requires_review && !onReviewPage) {
-            navigateTo('review');
-        }
     }
 }
 
@@ -281,7 +280,7 @@ async function runDataPreparationPipeline(jobId) {
         if (out.async && out.status === 'processing') {
             showToast('Run started — log updates below.', 'info');
             await pollJobTick(jobId);
-        } else if (out.status === 'awaiting_review' || out.status === 'awaiting_approval' || out.requires_review) {
+        } else if (out.status === 'awaiting_review' || out.status === 'awaiting_approval') {
             showToast('Paused for human review.', 'warning');
             routeJobByState(out);
         } else {
@@ -301,6 +300,22 @@ async function runDataPreparationPipeline(jobId) {
     }
 }
 
+function updateActiveContextChip(data) {
+    const chip = document.getElementById('activeContextChip');
+    if (!chip) return;
+    const scope = data?.active_context_scope;
+    const text = scope?.chip || '';
+    if (data?.status === 'processing' && text) {
+        chip.hidden = false;
+        chip.textContent = text;
+        chip.title = scope?.source_id ? `Active source: ${scope.source_id}` : '';
+    } else {
+        chip.hidden = true;
+        chip.textContent = '';
+        chip.removeAttribute('title');
+    }
+}
+
 function updateUI(data, jobIdOpt) {
     const jobId = jobIdOpt || (getCurrentJob() && getCurrentJob().jobId);
     const steps = buildProcessingLogSteps(data);
@@ -308,6 +323,7 @@ function updateUI(data, jobIdOpt) {
 
     const panel = document.getElementById('statusPanel');
     panel.classList.remove('success', 'error', 'warning');
+    updateActiveContextChip(data);
     const icon = panel.querySelector('.status-icon');
     const title = panel.querySelector('.status-title');
     const content = panel.querySelector('.status-content');
@@ -321,25 +337,19 @@ function updateUI(data, jobIdOpt) {
             logDetails.open = true;
         }
     }
+    const downloadLog = document.getElementById('downloadProcessingLog');
+    if (downloadLog && jobId) {
+        const hasLog = Boolean(data?._download_availability?.processing_log) || steps.length > 0;
+        downloadLog.hidden = !hasLog;
+        downloadLog.href = `/api/download/${encodeURIComponent(jobId)}/processing-log`;
+    }
 
     if (status === 'completed') {
-        if (data.requires_review) {
-            panel.classList.add('warning');
-            icon.textContent = '👁️';
-            title.textContent = 'Review Required';
-            content.innerHTML = `
-                <p>${data.review_reason || 'This result requires human validation.'}</p>
-                <div style="margin-top: 12px;">
-                    <button class="btn-primary" onclick="window.location.href='/pages/review.html'">Go to Review Queue</button>
-                </div>
-            `;
-        } else {
-            panel.classList.add('success');
-            icon.textContent = '✅';
-            title.textContent = 'Run Complete';
-            content.innerHTML = `<p>Processed ${data.total_rows || 0} rows with ${(data.schema?.fields || []).length} fields.</p>
-                <p class="status-results-hint">Downloads are on <strong>4 · Results</strong>.</p>`;
-        }
+        panel.classList.add('success');
+        icon.textContent = '✅';
+        title.textContent = 'Run Complete';
+        content.innerHTML = `<p>Processed ${data.total_rows || 0} rows with ${(data.schema?.fields || []).length} fields.</p>
+            <p class="status-results-hint">Downloads are on <strong>4 · Results</strong>.</p>`;
     } else if (status === 'awaiting_review' || status === 'awaiting_approval') {
         panel.classList.add('warning');
         icon.textContent = '🧑';

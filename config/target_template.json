@@ -22,7 +22,9 @@
 
     "metrics": [
       "spends",
-      "impressions"
+      "impressions",
+      "clicks",
+      "roas"
     ],
 
     "supporting_columns": [
@@ -52,7 +54,9 @@
   "aggregation_logic": {
     "metric_rules": {
       "impressions": "sum",
-      "spends": "sum"
+      "spends": "sum",
+      "clicks": "sum",
+      "roas": "weighted_avg"
     },
     "pmi_safe_rules": [
       "When multiple rows exist for the same UID, sum impressions.",
@@ -95,6 +99,18 @@
       "type": "integer",
       "minimum": 0,
       "description": "Actual impressions delivered (raw counts, not in thousands)."
+    },
+
+    "clicks": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total clicks."
+    },
+
+    "roas": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Return on ad spend (Campaign KPI)."
     }
   }
 }

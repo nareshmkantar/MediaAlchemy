@@ -2,7 +2,23 @@ import asyncio
 
 import pandas as pd
 
-from sia.agent.schema_mapper import SchemaMapper
+from sia.agent.schema_mapper import SchemaMapper, _dataframe_for_column_profile
+
+
+def test_dataframe_for_column_profile_uses_full_frame_when_small():
+    df = pd.DataFrame({"a": range(800)})
+    out = _dataframe_for_column_profile(df)
+    assert len(out) == 800
+
+
+def test_dataframe_for_column_profile_head_tail_when_large():
+    df = pd.DataFrame({"a": range(5000)})
+    out = _dataframe_for_column_profile(df)
+    assert len(out) == 1000
+    assert out["a"].iloc[0] == 0
+    assert out["a"].iloc[499] == 499
+    assert out["a"].iloc[500] == 4500
+    assert out["a"].iloc[-1] == 4999
 
 
 class _FakeMappingResponse:
@@ -154,3 +170,28 @@ def test_propose_mapping_calls_llm_when_any_non_blank_column_unresolved():
 
     assert llm.calls == 1
     assert len(rows) == 2
+
+
+def test_infer_column_role_primary_target_wins_over_derived_classification():
+    role = SchemaMapper.infer_column_role(
+        "Derived",
+        "Discard",
+        "Dimension",
+        target_column="market",
+        primary_targets={"date", "channel", "market", "publisher", "spends", "impressions"},
+    )
+    assert role == "primary"
+
+
+def test_heuristic_mapping_market_maps_to_primary_not_exclude():
+    mapper = SchemaMapper(llm_client=None, prompts_dir="does-not-exist")
+    meta = {"unique_values": ["CA", "US"], "inferred_type": "Dimension"}
+    rows = mapper._heuristic_mapping(
+        pd.DataFrame({"Market": ["CA", "US"]}),
+        {"Market": meta},
+        target_columns=["date", "channel", "market", "publisher", "spends", "impressions"],
+        primary_targets={"date", "channel", "market", "publisher", "spends", "impressions"},
+    )
+    assert rows[0]["target_column"] == "market"
+    assert rows[0]["role"] == "primary"
+    assert rows[0]["decision"] == "Keep"

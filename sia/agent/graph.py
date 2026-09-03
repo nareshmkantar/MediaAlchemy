@@ -107,6 +107,14 @@ def should_pause_after_plan(state: AgentState) -> str:
     return "execute_tools"
 
 
+def should_pause_after_replan(state: AgentState) -> str:
+    """Stop a no-progress or explicitly escalated replan before re-execution."""
+    if state.get("hitl_pending_approval", False):
+        print("[GRAPH] HITL Pause triggered after replanning.", flush=True)
+        return "hitl_pause"
+    return "execute_tools"
+
+
 def should_pause_after_mapping(state: AgentState) -> str:
     """Pause after mapping when file-relationship review is already pending (e.g. resume)."""
     if state.get("hitl_pending_approval", False) and state.get("hitl_pause_type") == "file_relationship_review":
@@ -176,8 +184,14 @@ def create_graph():
         }
     )
     
-    # Replan feeds into execute_tools
-    workflow.add_edge("replan", "execute_tools")
+    workflow.add_conditional_edges(
+        "replan",
+        should_pause_after_replan,
+        {
+            "hitl_pause": END,
+            "execute_tools": "execute_tools",
+        },
+    )
     
     workflow.add_edge("finalize", END)
 
@@ -188,6 +202,7 @@ def create_graph():
             "load_file": "load_file",
             "generate_plan": "generate_plan",
             "execute_tools": "execute_tools",
+            "finalize": "finalize",
         },
     )
 

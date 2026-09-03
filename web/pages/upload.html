@@ -18,64 +18,76 @@
     <main class="page-container upload-page">
         <h1 class="upload-page-sr-only">Upload</h1>
 
-        <div class="upload-grid-container">
-            <div class="upload-grid">
-                <!-- Data File Zone -->
-                <div class="upload-column">
-                    <h3>1. Data Files (Required)</h3>
-                    <div class="upload-zone" id="dropZoneData">
-                        <div class="upload-icon">📊</div>
-                        <p>Drag Excel/CSV files here</p>
-                        <input type="file" id="fileInputData" accept=".xlsx,.xls,.csv" multiple hidden>
-                        <span class="upload-hint">Supports: .xlsx, .xls, .csv</span>
-                    </div>
-                    <div class="file-info hidden" id="fileInfoData" style="margin-top: 16px;">
-                        <div id="sourceSelectorContainer" class="upload-sources-panel sheet-selector-container hidden" style="margin-top: 16px;">
-                            <div id="sheetTabList" class="upload-sources-tree" role="region" aria-label="Uploaded workbooks and sheets"></div>
-                            <div id="sheetDropdownContainer" class="sheet-dropdown-container hidden">
-                                <label for="sheetDropdown" class="sheet-dropdown-label">All sheets (compact)</label>
-                                <select id="sheetDropdown" class="sheet-dropdown"></select>
+        <div class="upload-workspace">
+            <div class="upload-workspace-main">
+                <div class="upload-grid-container">
+                    <div class="upload-grid upload-grid--single">
+                        <div class="upload-column">
+                            <h3>1. Data Files (Required)</h3>
+                            <div class="upload-zone" id="dropZoneData">
+                                <div class="upload-icon">📊</div>
+                                <p>Drag Excel/CSV files here</p>
+                                <input type="file" id="fileInputData" accept=".xlsx,.xls,.csv" multiple hidden>
+                                <span class="upload-hint">Supports: .xlsx, .xls, .csv</span>
                             </div>
-                            <input type="hidden" id="sheetSelect">
-                            <input type="hidden" id="sourceSelect">
+                            <div class="file-info hidden" id="fileInfoData" style="margin-top: 16px;">
+                                <div id="sourceSelectorContainer" class="upload-sources-panel sheet-selector-container hidden" style="margin-top: 16px;">
+                                    <div id="sheetTabList" class="upload-sources-tree" role="region" aria-label="Uploaded workbooks and sheets"></div>
+                                    <div id="sheetDropdownContainer" class="sheet-dropdown-container hidden">
+                                        <label for="sheetDropdown" class="sheet-dropdown-label">All sheets (compact)</label>
+                                        <select id="sheetDropdown" class="sheet-dropdown"></select>
+                                    </div>
+                                    <input type="hidden" id="sheetSelect">
+                                    <input type="hidden" id="sourceSelect">
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </div>
 
-                <!-- Target Scope File Zone -->
-                <div class="upload-column">
-                    <h3>2. Target Scope (Required)</h3>
-                    <div class="upload-zone secondary" id="dropZoneSchema">
-                        <div class="upload-icon">⚙️</div>
-                        <p>Drag JSON Scope Template here</p>
-                        <input type="file" id="fileInputSchema" accept=".json" hidden>
-                        <span class="upload-hint">Supports: .json (Target Scope Template)</span>
-                    </div>
-                    <div class="file-info hidden" id="fileInfoSchema" style="margin-top: 16px;">
-                        <div class="file-card">
-                            <div class="file-icon">📄</div>
-                            <div class="file-details">
-                                <h4 id="fileNameSchema">-</h4>
-                                <p id="fileSizeSchema">-</p>
-                            </div>
-                            <button class="btn-icon" id="removeFileSchema">✕</button>
+                <section id="hierarchyRegisterSection" class="hierarchy-register-section hidden" aria-label="Register enterprise info and media hierarchy">
+                    <div class="hierarchy-register-head">
+                        <div>
+                            <h2>2. Register enterprise info &amp; media hierarchy</h2>
+                            <p class="hierarchy-register-sub">
+                                Set Market / Category / Brand once for the job. Then choose each
+                                file’s media grain: Publisher → Campaign → Ad Group → Ad → Creative.
+                                Column shaping and attribute mapping follow in Guided Setup.
+                            </p>
                         </div>
+                        <button type="button" class="btn-secondary" id="hierarchyRefreshBtn" title="Re-analyze uploaded files">Refresh</button>
                     </div>
+
+                    <div id="enterpriseInfoCard" class="hierarchy-enterprise-card"></div>
+
+                    <div id="hierarchyKpis" class="hierarchy-kpi-grid"></div>
+                    <div id="hierarchyComparisonBanner" class="hierarchy-comparison-banner hidden" role="status"></div>
+                    <div id="hierarchySourceCards" class="hierarchy-source-cards"></div>
+                    <div class="hierarchy-register-footer">
+                        <label class="hierarchy-mixed-ack hidden" id="hierarchyMixedAckLabel">
+                            <input type="checkbox" id="hierarchyMixedAck">
+                            I understand these files sit at different hierarchy levels and will proceed carefully
+                        </label>
+                        <button type="button" class="btn-secondary" id="hierarchySaveBtn">Save registration</button>
+                    </div>
+                </section>
+
+                <div class="actions-row upload-actions-row">
+                    <button class="btn-primary upload-action-btn" id="mappingBtn" disabled>
+                        <span>🧭</span> Start Guided Setup
+                    </button>
                 </div>
             </div>
-        </div>
 
-        <div class="actions-row upload-actions-row">
-            <button class="btn-primary upload-action-btn" id="mappingBtn" disabled>
-                <span>🧭</span> Start Guided Setup
-            </button>
-        </div>
-
-        <div class="recent-jobs upload-recent-jobs" id="recentJobs">
-            <h3>Recent Jobs</h3>
-            <div class="jobs-list" id="jobsList">
-                <p class="empty-state">No recent jobs</p>
-            </div>
+            <aside class="upload-workspace-side" aria-label="Recent jobs">
+                <div class="recent-jobs upload-recent-jobs" id="recentJobs">
+                    <h3>Recent Jobs</h3>
+                    <div id="jobsRetentionBanner" class="jobs-retention-banner" hidden></div>
+                    <div class="jobs-list" id="jobsList">
+                        <p class="empty-state">No recent jobs</p>
+                    </div>
+                </div>
+            </aside>
         </div>
     </main>
 

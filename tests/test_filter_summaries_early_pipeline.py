@@ -23,10 +23,50 @@ def test_planner_injects_filter_summaries_after_extract():
         ],
         reasoning="",
     )
-    out = gen._ensure_filter_summaries_after_extract(plan, {}, {"x_scope": {}})
+    structure_analysis = {
+        "tables": [{"label": "Grand Total row at bottom", "coordinates": {}}],
+    }
+    out = gen._ensure_filter_summaries_after_extract(plan, {}, {"x_scope": {}}, structure_analysis)
     names = [t["tool"] for t in out.tool_calls]
     assert names.index("transform.filter_summaries") == names.index("layout.extract") + 1
     assert names.index("transform.rename") > names.index("transform.filter_summaries")
+
+
+def test_planner_skips_filter_summaries_without_summary_signals():
+    gen = PlanGenerator(llm_client=None)
+    plan = ExtractionPlan(
+        tool_calls=[
+            {
+                "tool": "layout.extract",
+                "params": {"start_row": 0, "end_row": 20, "start_col": 0, "end_col": 5, "header_row": 0},
+            },
+            {"tool": "transform.filter_summaries", "params": {"keywords": ["Total"]}},
+            {"tool": "transform.rename", "params": {"mapping": {"a": "b"}}},
+        ],
+        reasoning="",
+        requires_human_review=True,
+        review_reason="Plan includes destructive tools: transform.filter_summaries",
+        confidence=0.95,
+    )
+    out = gen.finalize_plan(plan, {}, {"x_scope": {}}, structure_analysis={"tables": []})
+    names = [t["tool"] for t in out.tool_calls]
+    assert "transform.filter_summaries" not in names
+    assert out.requires_human_review is False
+    assert out.review_reason == ""
+
+
+def test_reconcile_keeps_review_for_approval_items_without_destructive_reason():
+    gen = PlanGenerator(llm_client=None)
+    plan = ExtractionPlan(
+        tool_calls=[{"tool": "layout.extract", "params": {}}],
+        approval_items=[{"summary": "Confirm date column"}],
+        requires_human_review=True,
+        review_reason="Plan includes destructive tools: transform.filter_summaries",
+        confidence=0.95,
+    )
+    out = gen._reconcile_destructive_plan_review(plan)
+    assert out.requires_human_review is True
+    assert "approval items" in out.review_reason
 
 
 def test_sort_places_filter_summaries_after_extract_before_rename():

@@ -86,3 +86,10 @@ Evaluation scale: 1 (Critical Failure) to 5 (Perfect Mastery).
 5. **Evidence Required**: Every finding MUST cite specific evidence (e.g., "Column 'spend' has 15 NaT values at rows 23-37"). Findings without evidence are invalid.
 6. **Rubric Compliance**: Your TQS MUST follow the rubric anchoring in §3. Do not give TQS > 69 if a mandatory column is missing.
 7. Output ONLY JSON. No markdown wrappers.
+
+## 6. PIPELINE EVALS INPUT (Tier 1)
+When **DETERMINISTIC PIPELINE EVALS** are provided in the user message:
+- Treat **Critical gate: FAIL** and `dimension_mismatch`, `metric_mismatch`, `context_grounding_critical`, `zero_rows`, `mass_row_loss`, `metric_column_wiped`, or `union_false_duplicate` as **Integrity** findings with `critical: true`.
+- Cross-check Parsing/Strategy critiques against structure/plan advisory violations (do not contradict deterministic gates).
+- If pipeline evals pass the critical gate but the judge sees output issues, note the discrepancy in Accountability.
+- Per-source failures in multi-sheet jobs must be cited with `source_id` when available.

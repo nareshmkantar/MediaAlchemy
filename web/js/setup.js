@@ -1,6 +1,6 @@
 /**
  * Schema Agent - Setup Workspace
- * Handles Layout Demarcation (Step 1) and Column Mapping (Step 2)
+ * Handles Column shaping (Step 1) and Column Mapping (Step 2)
  */
 
 let currentJobId = null;
@@ -13,6 +13,26 @@ let mappingBlocks = null;
 /** Set from /api/mapping/propose when multi-level headers were merged for column names. */
 let mappingHeaderDerivation = null;
 let targetColumnOptions = ['No match'];
+/** @type {Map<string, {id: string, name: string, kind: string, supports_currency: boolean}>} */
+let targetColumnMeta = new Map();
+const ADD_CUSTOM_METRIC = '__add_custom_metric__';
+const VALUE_SCALE_CHOICES = [
+    { value: '1', label: 'As reported (×1)' },
+    { value: '1000', label: "Thousands ('000)" },
+    { value: '1000000', label: 'Millions' },
+];
+const CURRENCY_CHOICES = [
+    { value: '', label: 'Currency not set' },
+    { value: 'EUR', label: 'EUR' },
+    { value: 'USD', label: 'USD' },
+    { value: 'GBP', label: 'GBP' },
+    { value: 'CHF', label: 'CHF' },
+    { value: 'PLN', label: 'PLN' },
+    { value: 'SEK', label: 'SEK' },
+    { value: 'NOK', label: 'NOK' },
+    { value: 'DKK', label: 'DKK' },
+    { value: 'Other', label: 'Other…' },
+];
 let mappingSaveTimer = null;
 
 /** Last fetched preview payload for re-render (e.g. header label toggle). */
@@ -58,8 +78,14 @@ let lastSetupJobForHeader = null;
 let lastSetupSources = [];
 /** Order of sources as rendered in sheet tabs (for “save & next sheet”). */
 let setupSourceRegistryOrder = [];
-/** 1 = demarcation workspace visible, 2 = mapping (no tab UI — use this instead of `.tab-btn`). */
+/** 1 = layout, 1.5 = messy standardize, 1.75 = column std, 2 = mapping. */
 let setupUiStep = 1;
+/** Last standardize API payload (assignment + preview) for the current sheet. */
+let standardizeState = null;
+/** Column shaping (multipart split/combine) working state for current sheet. */
+let columnStdState = null;
+let columnStdDirty = false;
+let columnStdSaveTimer = null;
 /** Template targets that should count as "primary" in semantic column mapping. */
 let primaryTargetColumns = new Set();
 
@@ -151,7 +177,16 @@ const elements = {
     backToLayoutBtn: document.getElementById('backToLayoutBtn'),
     demarcationSection: document.getElementById('demarcationSection'),
     mappingSection: document.getElementById('mappingSection'),
+    standardizeSection: document.getElementById('standardizeSection'),
+    standardizeWorkspace: document.getElementById('standardizeWorkspace'),
+    columnStdSection: document.getElementById('columnStdSection'),
+    columnStdWorkspace: document.getElementById('columnStdWorkspace'),
     confirmLayoutMapSheetBtn: document.getElementById('confirmLayoutMapSheetBtn'),
+    confirmStandardizeMapBtn: document.getElementById('confirmStandardizeMapBtn'),
+    confirmColumnStdBtn: document.getElementById('confirmColumnStdBtn'),
+    regenerateStandardTableBtn: document.getElementById('regenerateStandardTableBtn'),
+    backToLayoutFromStdBtn: document.getElementById('backToLayoutFromStdBtn'),
+    backFromColumnStdBtn: document.getElementById('backFromColumnStdBtn'),
     saveMappingNextSheetBtn: document.getElementById('saveMappingNextSheetBtn'),
     skipProcessBtn: document.getElementById('skipProcessBtn'),
     setupGlobalActionsHint: document.getElementById('setupGlobalActionsHint'),
@@ -168,6 +203,14 @@ const elements = {
 
 const SAVE_MAPPING_NEXT_LABEL = 'Save mapping & next sheet';
 const CONFIRM_LAYOUT_MAP_LABEL = 'Confirm & map →';
+const CONFIRM_LAYOUT_STANDARDIZE_LABEL = 'Confirm & standardize →';
+/** Legacy — Layout Demarcation removed from Guided Setup happy path */
+const SETUP_STEP_LAYOUT = 1.25;
+const SETUP_STEP_STANDARDIZE = 1.5;
+/** Column shaping: multipart detect → split/keep → combine parts → media dimensions */
+const SETUP_STEP_COLUMN_STD = 1;
+const SETUP_STEP_MAPPING = 2;
+const COLSTD_CUSTOM = '__custom__';
 const SAVE_LAYOUT_SKIP_MAP_LABEL = 'Save layout & next sheet →';
 const RUN_AGENT_LABEL = 'Run Agent';
 
@@ -207,7 +250,7 @@ function refreshMappingPrimaryActionButton(job) {
     if (!btn || btn.dataset.finalizing === '1' || btn.querySelector('.spinner')) return;
     const j = job || lastSetupJobForHeader;
     const uxs = (j && j.ux_stepper_summary) || {};
-    const runMode = setupUiStep === 2 && computeSheetsGuidedSetupDone(j);
+    const runMode = setupUiStep === SETUP_STEP_MAPPING && computeSheetsGuidedSetupDone(j);
     btn.textContent = runMode ? RUN_AGENT_LABEL : SAVE_MAPPING_NEXT_LABEL;
     btn.title = runMode
         ? 'Open Console and start the run automatically (current sheet’s mapping is saved first if needed).'
@@ -221,15 +264,26 @@ function refreshMappingPrimaryActionButton(job) {
 /** Match server ``layout_registry_row_is_main_data`` for in-memory demarcation blocks. */
 function blockCountsAsKeptMainData(block) {
     if (!block || typeof block !== 'object') return false;
+    const dec = String(normalizeBlockDecision(block)).trim().toLowerCase();
+    if (dec === 'discard' || dec === 'context' || dec === 'metadata' || dec === 'ignore' || dec === 'noise' || dec === 'use as context') {
+        return false;
+    }
+    if (dec === 'keep' || dec === 'approved') return true;
     const cat = String(block.category || '')
         .trim()
         .toLowerCase()
         .replace(/\s+/g, '')
         .replace(/_/g, '');
-    if (cat !== 'maindata') return false;
+    return cat === 'maindata';
+}
+
+/** Human label for the block card header — reflects the user's toggle, not the stale AI category. */
+function effectiveBlockTypeLabel(block) {
     const dec = String(normalizeBlockDecision(block)).trim().toLowerCase();
-    if (dec === 'discard' || dec === 'context') return false;
-    return dec === 'keep' || dec === 'approved' || dec === '';
+    if (dec === 'keep' || dec === 'approved') return 'Main Data';
+    if (dec === 'context' || dec === 'metadata' || dec === 'use as context') return 'Metadata';
+    if (dec === 'discard' || dec === 'ignore' || dec === 'noise') return 'Ignored';
+    return block.category || 'Unknown';
 }
 
 function countKeptMainDataBlocksFromProposal(blocks) {
@@ -274,15 +328,33 @@ function computeSheetsGuidedSetupDoneAssumingCurrentLayoutSaved(job = lastSetupJ
 }
 
 /** Layout step primary: map vs skip-mapping vs Run Agent when this sheet has no main data blocks. */
+function sheetNeedsStandardize(report) {
+    if (!report || typeof report !== 'object') return false;
+    const cls = String(report.classification || '').toLowerCase();
+    const score = Number(report.complexity_score);
+    if (cls === 'messy') return true;
+    if (!Number.isNaN(score) && score >= 50) return true;
+    if (report.crosstab) return true;
+    if (report.adapter_used || report.use_adapter) return true;
+    return false;
+}
+
+function currentSheetNeedsStandardize() {
+    return sheetNeedsStandardize(demarcationProposal?.layout_complexity);
+}
+
 function refreshLayoutPrimaryActionButton(job) {
     const btn = elements.confirmLayoutMapSheetBtn;
-    if (!btn || setupUiStep !== 1) return;
+    if (!btn || setupUiStep !== SETUP_STEP_LAYOUT) return;
     if (btn.dataset.finalizing === '1' || btn.querySelector('.spinner')) return;
     const j = job || lastSetupJobForHeader;
     const mainKept = countKeptMainDataBlocksFromProposal(demarcationProposal?.blocks);
     if (mainKept > 0) {
-        btn.textContent = CONFIRM_LAYOUT_MAP_LABEL;
-        btn.title = 'Save this sheet’s layout and open column mapping for the same sheet';
+        const tidy = currentSheetNeedsStandardize();
+        btn.textContent = tidy ? CONFIRM_LAYOUT_STANDARDIZE_LABEL : CONFIRM_LAYOUT_MAP_LABEL;
+        btn.title = tidy
+            ? 'Save this sheet’s layout and convert the messy grid into a standard Date / Dimensions / Metrics table'
+            : 'Save this sheet’s layout and open column mapping for the same sheet';
     } else {
         const runMode = computeSheetsGuidedSetupDoneAssumingCurrentLayoutSaved(j);
         btn.textContent = runMode ? RUN_AGENT_LABEL : SAVE_LAYOUT_SKIP_MAP_LABEL;
@@ -577,8 +649,8 @@ function renderSetupSourcePanels() {
         const sheetPart = source.sheet_name ? String(source.sheet_name) : (source.file_name || source.source_id || 'Sheet');
         const { layoutDone, mappingDone } = getSourceLayoutMappingDone(source.source_id, source.sheet_name);
         const tier = tierForSheet(layoutDone, mappingDone);
-        const lm = `${layoutDone ? 'L✓' : 'L·'} ${mappingDone ? 'M✓' : 'M·'}`;
-        const pipTitle = `${sheetPart} — ${layoutDone ? 'layout saved' : 'layout pending'}; ${mappingDone ? 'mapping saved' : 'mapping pending'}`;
+        const lm = `${layoutDone ? 'C✓' : 'C·'} ${mappingDone ? 'M✓' : 'M·'}`;
+        const pipTitle = `${sheetPart} — ${layoutDone ? 'column shaping saved' : 'column shaping pending'}; ${mappingDone ? 'mapping saved' : 'mapping pending'}`;
         const selected = matchCur(source);
         const sid = escapeAttr(source.source_id);
         const sn = escapeAttr(source.sheet_name || '');
@@ -633,6 +705,7 @@ document.addEventListener('DOMContentLoaded', () => {
         return;
     }
 
+    setCurrentJob(currentJobId, currentSheet, currentSourceId);
     init();
 });
 
@@ -681,6 +754,19 @@ async function init() {
         const job = await getJobStatus(currentJobId);
         lastSetupJobForHeader = job;
 
+        const dataFiles = job.data_files || [];
+        const uxs = job.ux_stepper_summary || {};
+        const hierarchyOk = Boolean(
+            job.hierarchy_register_complete
+            || uxs.hierarchy_register_complete
+        );
+        if (dataFiles.length > 0 && !hierarchyOk) {
+            showToast('Register media hierarchy on Upload before Guided Setup.', 'warning');
+            const q = `upload.html?job_id=${encodeURIComponent(currentJobId)}`;
+            setTimeout(() => { window.location.href = q; }, 1200);
+            return;
+        }
+
         alignSourceSelectionWithJob(job);
         syncSetupUrlWithSelection();
 
@@ -701,7 +787,7 @@ async function init() {
 
         mergeJobDemarcationProposalsIntoCache(job);
 
-        // Start with demarcation
+        // Start with Column shaping (Layout Demarcation removed from happy path)
 
         try {
             const prevLabels = localStorage.getItem('setupPreviewShowHeaderLabels');
@@ -710,9 +796,9 @@ async function init() {
             }
         } catch (e) { /* ignore */ }
 
-        await loadDemarcation();
         await loadSourceInventory();
         refreshUxStepperFromJob(job);
+        switchStep(SETUP_STEP_COLUMN_STD);
 
         if (elements.setupSourcePanels && !elements.setupSourcePanels.dataset.clickBound) {
             elements.setupSourcePanels.dataset.clickBound = '1';
@@ -720,11 +806,12 @@ async function init() {
         }
 
         if (elements.backToLayoutBtn) {
-            elements.backToLayoutBtn.addEventListener('click', () => switchStep(1));
+            elements.backToLayoutBtn.addEventListener('click', () => {
+                switchStep(SETUP_STEP_COLUMN_STD);
+            });
         }
-
-        if (elements.confirmLayoutMapSheetBtn) {
-            elements.confirmLayoutMapSheetBtn.addEventListener('click', () => confirmLayoutAndOpenMappingForCurrentSheet());
+        if (elements.confirmColumnStdBtn) {
+            elements.confirmColumnStdBtn.addEventListener('click', () => confirmColumnStdAndOpenMapping());
         }
         if (elements.saveMappingNextSheetBtn) {
             elements.saveMappingNextSheetBtn.addEventListener('click', () => onSaveMappingOrRunAgentClick());
@@ -733,7 +820,8 @@ async function init() {
         elements.skipProcessBtn?.addEventListener('click', () => skipAndAutoProcess());
 
         document.getElementById('closePreviewBtn').addEventListener('click', closeModal);
-        document.getElementById('reScanBtn').addEventListener('click', () => loadDemarcationBatch(true));
+        const reScanBtn = document.getElementById('reScanBtn');
+        if (reScanBtn) reScanBtn.addEventListener('click', () => loadDemarcationBatch(true));
         if (elements.previewShowHeaderLabelsChk) {
             elements.previewShowHeaderLabelsChk.addEventListener('change', () => {
                 try {
@@ -755,6 +843,11 @@ async function init() {
             elements.demarcationWorkspace.dataset.inlinePreviewClickBound = '1';
             elements.demarcationWorkspace.addEventListener('click', onDemarcationInlinePreviewRowClick);
         }
+
+        window.addEventListener('pagehide', flushSetupDraftsBeacon);
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'hidden') flushSetupDraftsBeacon();
+        });
 
     } catch (e) {
         showToast(`Initialization failed: ${e.message}`, 'error');
@@ -793,14 +886,25 @@ window.changeSource = async function (sourceId, sheetName) {
         clearTimeout(mappingSaveTimer);
         mappingSaveTimer = null;
     }
-    if (setupUiStep === 2 && currentJobId && mappingProposal && mappingProposal.length > 0) {
+    if (columnStdSaveTimer) {
+        clearTimeout(columnStdSaveTimer);
+        columnStdSaveTimer = null;
+    }
+    // Flush drafts for the *current* sheet before switching ids
+    if (setupUiStep === SETUP_STEP_MAPPING && currentJobId && mappingProposal && mappingProposal.length > 0) {
         try {
             await persistMappingDraft();
         } catch {
             /* best-effort flush before switching sheet */
         }
     }
-    const sidKey = String(sourceId || '');
+    if (columnStdState && currentJobId && currentSourceId && columnStdDirty) {
+        try {
+            await persistColumnStdDraft(false);
+        } catch {
+            /* best-effort */
+        }
+    }
     currentSourceId = sourceId;
     currentSheet = sheetName || null;
     setCurrentJob(currentJobId, currentSheet, currentSourceId);
@@ -808,25 +912,19 @@ window.changeSource = async function (sourceId, sheetName) {
 
     renderSetupSourcePanels();
     updateSetupContextHeader();
-    if (setupUiStep === 1) {
-        if (demarcationBatchCache && sidKey && demarcationBatchCache[sidKey]) {
-            demarcationProposal = demarcationBatchCache[sidKey];
-            renderDemarcationBlocks(Array.isArray(demarcationProposal.blocks) ? demarcationProposal.blocks : []);
-            applyDemarcationStatusFromProposal();
-            loadSourceInventory();
-        } else {
-            await hydrateDemarcationCacheFromJob();
-            if (demarcationBatchCache && sidKey && demarcationBatchCache[sidKey]) {
-                demarcationProposal = demarcationBatchCache[sidKey];
-                renderDemarcationBlocks(Array.isArray(demarcationProposal.blocks) ? demarcationProposal.blocks : []);
-                applyDemarcationStatusFromProposal();
-                loadSourceInventory();
-            } else {
-                await loadDemarcationBatch(false);
-            }
-        }
-    } else {
+    columnStdState = null;
+    columnStdDirty = false;
+    if (setupUiStep === SETUP_STEP_STANDARDIZE || setupUiStep === SETUP_STEP_LAYOUT) {
+        switchStep(SETUP_STEP_COLUMN_STD);
+        return;
+    }
+    if (setupUiStep === SETUP_STEP_COLUMN_STD) {
+        await loadColumnStd(true);
+        loadSourceInventory();
+    } else if (setupUiStep === SETUP_STEP_MAPPING) {
         await loadMapping(false);
+    } else {
+        switchStep(SETUP_STEP_COLUMN_STD);
     }
     void getJobStatus(currentJobId)
         .then((j) => refreshUxStepperFromJob(j))
@@ -846,6 +944,10 @@ function applyDemarcationStatusFromProposal() {
         statusEl.className = 'status-badge warning';
     } else if (demarcationProposal.llm_status === 'confidence_gated_no_llm') {
         statusEl.textContent = 'Confidence gating (no uncertain blocks → no LLM)';
+        statusEl.className = 'status-badge success';
+    } else if (demarcationProposal.layout_complexity && demarcationProposal.layout_complexity.adapter_used) {
+        const st = demarcationProposal.layout_complexity.sheet_type || 'matrix';
+        statusEl.textContent = `Layout diagnostics (${st})`;
         statusEl.className = 'status-badge success';
     } else if (demarcationProposal.llm_status === 'confidence_gated_classified') {
         statusEl.textContent = 'Python + AI (uncertain band only)';
@@ -987,6 +1089,988 @@ function formatRowLabel(rowIdx) {
     return `Row ${Number(rowIdx) + 1}`;
 }
 
+function formatLayoutSampleRecord(rec) {
+    if (!rec || typeof rec !== 'object') return '';
+    const bits = [];
+    if (rec.dimensions) bits.push(Array.isArray(rec.dimensions) ? rec.dimensions.join(' / ') : String(rec.dimensions));
+    if (rec.metric) bits.push(`Metric: ${rec.metric}`);
+    if (rec.period) bits.push(`Period: ${rec.period}`);
+    if (rec.value != null) bits.push(`Value: ${rec.value}`);
+    return bits.join(' · ');
+}
+
+const LAYOUT_ROLE_META = {
+    metadata: { label: 'Metadata', color: '#94a3b8' },
+    time: { label: 'Time', color: '#f59e0b' },
+    dimensions: { label: 'Dimensions', color: '#14b8a6' },
+    metrics: { label: 'Metrics', color: '#a78bfa' },
+    values: { label: 'Values', color: '#60a5fa' },
+    totals: { label: 'Totals', color: '#fb923c' },
+    noise: { label: 'Comments / noise', color: '#f87171' },
+};
+
+let layoutMinimapState = null;
+let layoutMinimapResizeObserver = null;
+let layoutMinimapWantExpanded = false;
+
+function layoutRoleColor(role) {
+    return (LAYOUT_ROLE_META[role] || {}).color || '#64748b';
+}
+
+function hexToRgba(hex, alpha) {
+    const raw = String(hex || '').replace('#', '');
+    const n = parseInt(raw.length === 3 ? raw.split('').map((c) => c + c).join('') : raw, 16);
+    if (Number.isNaN(n)) return `rgba(100, 116, 139, ${alpha})`;
+    const r = (n >> 16) & 255;
+    const g = (n >> 8) & 255;
+    const b = n & 255;
+    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function layoutOverlayArea(overlay) {
+    const rows = Number(overlay.end_row) - Number(overlay.start_row) + 1;
+    const cols = Number(overlay.end_col) - Number(overlay.start_col) + 1;
+    return Math.max(1, rows) * Math.max(1, cols);
+}
+
+function buildLayoutComplexityPanel(report) {
+    if (!report || typeof report !== 'object') return '';
+    const sheetType = String(report.sheet_type || report.classification || 'unknown').replace(/_/g, ' ');
+    const score = report.complexity_score != null ? Number(report.complexity_score) : null;
+    const cls = String(report.classification || '');
+    const reasons = Array.isArray(report.reasons) ? report.reasons : [];
+    const roles = report.roles_for_review || {};
+    const roleOrder = ['metadata', 'time', 'dimensions', 'metrics', 'values', 'totals', 'noise'];
+    const overlayRoles = new Set((report.minimap?.overlays || []).map((o) => o.role));
+    const roleRows = roleOrder.map((key) => {
+        const role = roles[key];
+        if (!role) return '';
+        const color = layoutRoleColor(key);
+        return `<tr class="layout-role-row" data-role="${escapeAttr(key)}" style="--role-color:${color}">
+            <td><span class="layout-role-swatch" aria-hidden="true"></span>${escapeHtml(role.label || key)}</td>
+            <td>${escapeHtml(String(role.kind || role.axis || role.cell || '—'))}</td>
+            <td>${escapeHtml(String(role.detail || ''))}</td>
+        </tr>`;
+    }).join('');
+    const samples = Array.isArray(report.sample_records) ? report.sample_records.slice(0, 8) : [];
+    const sampleHtml = samples.length
+        ? `<p class="section-label">Sample records (click to locate on the map)</p>
+           <ol class="layout-sample-records">${samples.map((s, i) => {
+               const row = s.row != null ? Number(s.row) : '';
+               const col = s.col != null ? Number(s.col) : '';
+               return `<li class="layout-sample-item" data-sample-index="${i}" data-row="${escapeAttr(String(row))}" data-col="${escapeAttr(String(col))}" tabindex="0">${escapeHtml(formatLayoutSampleRecord(s))}</li>`;
+           }).join('')}</ol>`
+        : '';
+    const legendKeys = roleOrder.filter((key) => overlayRoles.has(key));
+    const legendHtml = legendKeys.map((key) => {
+        const meta = LAYOUT_ROLE_META[key] || { label: key, color: '#64748b' };
+        return `<button type="button" class="layout-minimap-legend-item" data-role="${escapeAttr(key)}" style="--role-color:${meta.color}">
+            <span class="layout-role-swatch" aria-hidden="true"></span>${escapeHtml(meta.label)}
+        </button>`;
+    }).join('');
+    const hasMinimap = report.minimap && report.minimap.occupancy;
+    const messy = sheetNeedsStandardize(report);
+    const adapterNote = messy
+        ? 'This sheet is not a flat table. Confirm the map, then Confirm & standardize to assign Date / Dimensions / Metrics / Values / noise and generate a standard table for column mapping.'
+        : (report.adapter_used
+            ? 'Confirm Time / Dimensions / Metrics / Values on the map. The two regions below are only what Confirm & map saves — not the old island-by-island walkthrough.'
+            : 'Standard connected-component blocks (clean table path).');
+    return `
+        <div class="layout-complexity-panel" data-layout-complexity="1">
+            <div class="layout-complexity-header">
+                <div>
+                    <h3>Sheet understanding — ${escapeHtml(sheetType)}</h3>
+                    <p class="layout-complexity-meta">
+                        ${score != null ? `Complexity score ${escapeHtml(String(score))} · ` : ''}
+                        Band: ${escapeHtml(cls || 'n/a')}
+                        ${report.shape ? ` · Shape: ${escapeHtml(String(report.shape))}` : ''}
+                        ${report.crosstab ? ' · Crosstab / period headers' : ''}
+                    </p>
+                </div>
+                ${hasMinimap ? `<button type="button" class="layout-minimap-zoom-btn layout-minimap-expand-btn" data-minimap-expand aria-expanded="false" title="Open map at full width">Expand</button>` : ''}
+            </div>
+            ${reasons.length ? `<ul class="layout-complexity-reasons">${reasons.map((r) => `<li>${escapeHtml(String(r))}</li>`).join('')}</ul>` : ''}
+            <div class="layout-complexity-body">
+                ${hasMinimap ? `
+                <div class="layout-minimap-wrap">
+                    <div class="layout-minimap-toolbar">
+                        <p class="section-label">Sheet map</p>
+                        <div class="layout-minimap-zoom-btns">
+                            <button type="button" class="layout-minimap-zoom-btn" data-minimap-zoom="out" title="Zoom out" aria-label="Zoom out">−</button>
+                            <span class="layout-minimap-zoom-label" data-minimap-zoom-label>100%</span>
+                            <button type="button" class="layout-minimap-zoom-btn" data-minimap-zoom="in" title="Zoom in" aria-label="Zoom in">+</button>
+                            <button type="button" class="layout-minimap-zoom-btn layout-minimap-fit-btn" data-minimap-zoom="home" title="Readable top-left">Home</button>
+                            <button type="button" class="layout-minimap-zoom-btn layout-minimap-fit-btn" data-minimap-zoom="fit" title="Fit whole sheet">Fit</button>
+                            <button type="button" class="layout-minimap-zoom-btn layout-minimap-load-btn" data-minimap-load-cells title="Fetch every non-empty cell once and keep it while you pan">Load all cells</button>
+                            <button type="button" class="layout-minimap-zoom-btn layout-minimap-expand-btn" data-minimap-expand aria-expanded="false" title="Open map at full width">Expand</button>
+                        </div>
+                    </div>
+                    <canvas class="layout-minimap" tabindex="0" role="img" aria-label="Sheet occupancy map. Scroll to zoom, drag to pan."></canvas>
+                    <p class="layout-minimap-nav-hint">Scroll to move · Ctrl+scroll to zoom · drag to pan · Load all cells keeps values on screen</p>
+                    <div class="layout-minimap-legend">${legendHtml}</div>
+                    <p class="layout-minimap-hint" data-layout-minimap-hint></p>
+                </div>` : ''}
+                <div class="layout-complexity-confirm">
+                    <div class="layout-complexity-roles">
+                        <p class="section-label">Confirm what will be used</p>
+                        <table class="layout-role-table">
+                            <thead><tr><th>Role</th><th>Detected as</th><th>Where</th></tr></thead>
+                            <tbody>${roleRows}</tbody>
+                        </table>
+                    </div>
+                    ${sampleHtml ? `<div class="layout-complexity-samples">${sampleHtml}</div>` : ''}
+                </div>
+            </div>
+            <p class="block-inline-note">${escapeHtml(adapterNote)}${messy ? '' : (report.adapter_used ? ' Approve the map, then Confirm &amp; map.' : ' Approve with Treat as Data / Metadata / Ignore on the regions below, then Confirm &amp; map.')}</p>
+        </div>`;
+}
+
+function layoutMinimapBboxRect(bbox, minimap, width, height) {
+    const cols = Math.max(1, Number(minimap.cols) || 1);
+    const rows = Math.max(1, Number(minimap.rows) || 1);
+    const originC = Number(minimap.start_col) || 0;
+    const originR = Number(minimap.start_row) || 0;
+    const x = ((Number(bbox.start_col) - originC) / cols) * width;
+    const y = ((Number(bbox.start_row) - originR) / rows) * height;
+    const w = ((Number(bbox.end_col) - Number(bbox.start_col) + 1) / cols) * width;
+    const h = ((Number(bbox.end_row) - Number(bbox.start_row) + 1) / rows) * height;
+    return { x, y, w: Math.max(w, 1), h: Math.max(h, 1) };
+}
+
+const LAYOUT_MINIMAP_MIN_SCALE = 1;
+const LAYOUT_MINIMAP_MAX_SCALE = 24;
+const LAYOUT_MINIMAP_GUTTER_LEFT = 44;
+const LAYOUT_MINIMAP_GUTTER_TOP = 24;
+let layoutMinimapPreviewTimer = null;
+let layoutMinimapPreviewReq = 0;
+
+function layoutMinimapViewSize() {
+    const canvas = layoutMinimapState?.canvas;
+    if (!canvas) return { cssW: 1, cssH: 1 };
+    const expanded = Boolean(layoutMinimapWantExpanded || layoutMinimapState?.expanded);
+    return {
+        cssW: Math.max(1, canvas.clientWidth || canvas.getBoundingClientRect().width),
+        cssH: Math.max(1, canvas.clientHeight || (expanded ? 560 : 400)),
+    };
+}
+
+function layoutMinimapMetrics() {
+    const minimap = layoutMinimapState?.minimap || {};
+    const { cssW, cssH } = layoutMinimapViewSize();
+    const rows = Math.max(1, Number(minimap.rows) || 1);
+    const cols = Math.max(1, Number(minimap.cols) || 1);
+    const scale = layoutMinimapState?.scale || 1;
+    const gutterL = LAYOUT_MINIMAP_GUTTER_LEFT;
+    const gutterT = LAYOUT_MINIMAP_GUTTER_TOP;
+    const innerW = Math.max(1, cssW - gutterL);
+    const innerH = Math.max(1, cssH - gutterT);
+    const colPx = (innerW / cols) * scale;
+    const rowPx = (innerH / rows) * scale;
+    return {
+        cssW,
+        cssH,
+        innerW,
+        innerH,
+        gutterL,
+        gutterT,
+        rows,
+        cols,
+        scale,
+        colPx,
+        rowPx,
+        originR: Number(minimap.start_row) || 0,
+        originC: Number(minimap.start_col) || 0,
+        showText: colPx >= 28 && rowPx >= 10,
+    };
+}
+
+function clampLayoutMinimapCamera() {
+    if (!layoutMinimapState) return;
+    const m = layoutMinimapMetrics();
+    const scale = m.scale;
+    const contentW = m.innerW * scale;
+    const contentH = m.innerH * scale;
+    if (contentW <= m.innerW) {
+        layoutMinimapState.panX = (m.innerW - contentW) / 2;
+    } else {
+        layoutMinimapState.panX = Math.min(0, Math.max(m.innerW - contentW, layoutMinimapState.panX));
+    }
+    if (contentH <= m.innerH) {
+        layoutMinimapState.panY = (m.innerH - contentH) / 2;
+    } else {
+        layoutMinimapState.panY = Math.min(0, Math.max(m.innerH - contentH, layoutMinimapState.panY));
+    }
+}
+
+function updateLayoutMinimapZoomLabel() {
+    const el = document.querySelector('[data-minimap-zoom-label]');
+    if (!el || !layoutMinimapState) return;
+    const home = layoutMinimapHomeScale();
+    const current = layoutMinimapState.scale || home;
+    el.textContent = `${Math.max(1, Math.round((current / home) * 100))}%`;
+}
+
+function layoutMinimapHomeScale() {
+    if (!layoutMinimapState) return 1;
+    if (!layoutMinimapState.homeScale) {
+        layoutMinimapState.homeScale = readableLayoutMinimapScale();
+    }
+    return layoutMinimapState.homeScale;
+}
+
+function layoutMinimapMaxScale() {
+    return Math.max(LAYOUT_MINIMAP_MAX_SCALE, layoutMinimapHomeScale() * 4);
+}
+
+function layoutMinimapScreenToWorld(sx, sy) {
+    const m = layoutMinimapMetrics();
+    return {
+        x: (sx - m.gutterL - (layoutMinimapState.panX || 0)) / m.scale,
+        y: (sy - m.gutterT - (layoutMinimapState.panY || 0)) / m.scale,
+    };
+}
+
+function layoutMinimapCellFromEvent(event, canvas, minimap) {
+    const rect = canvas.getBoundingClientRect();
+    const world = layoutMinimapScreenToWorld(event.clientX - rect.left, event.clientY - rect.top);
+    const m = layoutMinimapMetrics();
+    const cols = Math.max(1, Number(minimap.cols) || 1);
+    const rows = Math.max(1, Number(minimap.rows) || 1);
+    const col = Math.floor((world.x / Math.max(m.innerW, 1)) * cols) + (Number(minimap.start_col) || 0);
+    const row = Math.floor((world.y / Math.max(m.innerH, 1)) * rows) + (Number(minimap.start_row) || 0);
+    return { row, col };
+}
+
+function zoomLayoutMinimapAt(sx, sy, factor) {
+    if (!layoutMinimapState) return;
+    const prev = layoutMinimapState.scale || 1;
+    const next = Math.min(layoutMinimapMaxScale(), Math.max(LAYOUT_MINIMAP_MIN_SCALE, prev * factor));
+    if (next === prev) return;
+    const m = layoutMinimapMetrics();
+    const world = layoutMinimapScreenToWorld(sx, sy);
+    layoutMinimapState.scale = next;
+    layoutMinimapState.panX = (sx - m.gutterL) - world.x * next;
+    layoutMinimapState.panY = (sy - m.gutterT) - world.y * next;
+    clampLayoutMinimapCamera();
+    updateLayoutMinimapZoomLabel();
+    drawLayoutMinimap();
+}
+
+function resetLayoutMinimapView() {
+    if (!layoutMinimapState) return;
+    layoutMinimapState.scale = 1;
+    layoutMinimapState.panX = 0;
+    layoutMinimapState.panY = 0;
+    clampLayoutMinimapCamera();
+    updateLayoutMinimapZoomLabel();
+    drawLayoutMinimap();
+}
+
+function readableLayoutMinimapScale() {
+    if (!layoutMinimapState) return 1;
+    const prev = layoutMinimapState.scale || 1;
+    layoutMinimapState.scale = 1;
+    const m = layoutMinimapMetrics();
+    layoutMinimapState.scale = prev;
+    const rowScale = (18 * m.rows) / Math.max(m.innerH, 1);
+    const colScale = (48 * m.cols) / Math.max(m.innerW, 1);
+    return Math.min(LAYOUT_MINIMAP_MAX_SCALE, Math.max(1, rowScale, colScale));
+}
+
+function readableLayoutMinimapView() {
+    if (!layoutMinimapState) return;
+    layoutMinimapState.homeScale = readableLayoutMinimapScale();
+    layoutMinimapState.scale = layoutMinimapState.homeScale;
+    layoutMinimapState.panX = 0;
+    layoutMinimapState.panY = 0;
+    clampLayoutMinimapCamera();
+    updateLayoutMinimapZoomLabel();
+    drawLayoutMinimap();
+}
+
+function syncLayoutMinimapExpandButtons() {
+    document.querySelectorAll('[data-minimap-expand]').forEach((btn) => {
+        btn.setAttribute('aria-expanded', layoutMinimapWantExpanded ? 'true' : 'false');
+        btn.textContent = layoutMinimapWantExpanded ? 'Collapse' : 'Expand';
+        btn.title = layoutMinimapWantExpanded ? 'Exit full-width map (Esc)' : 'Open map at full width';
+    });
+}
+
+function setLayoutMinimapExpanded(expanded) {
+    const panel = document.querySelector('.layout-complexity-panel');
+    if (!panel) return;
+    layoutMinimapWantExpanded = Boolean(expanded);
+    panel.classList.toggle('is-expanded', layoutMinimapWantExpanded);
+    document.body.classList.toggle('layout-map-expanded', layoutMinimapWantExpanded);
+    if (layoutMinimapState) layoutMinimapState.expanded = layoutMinimapWantExpanded;
+    syncLayoutMinimapExpandButtons();
+    requestAnimationFrame(() => {
+        requestAnimationFrame(() => readableLayoutMinimapView());
+    });
+}
+
+function onLayoutMapExpandKeydown(event) {
+    if (event.key === 'Escape' && layoutMinimapWantExpanded) {
+        event.preventDefault();
+        setLayoutMinimapExpanded(false);
+    }
+}
+
+function focusLayoutMinimapRect(rect) {
+    if (!layoutMinimapState || !rect) return;
+    const m = layoutMinimapMetrics();
+    const tall = rect.h > rect.w * 6;
+    const wide = rect.w > rect.h * 6;
+    let scale;
+    const cap = layoutMinimapMaxScale();
+    if (tall) {
+        scale = Math.min(cap, Math.max(layoutMinimapHomeScale() * 0.35, (m.innerW * 0.22) / Math.max(rect.w, 1)));
+    } else if (wide) {
+        scale = Math.min(cap, Math.max(layoutMinimapHomeScale() * 0.35, (m.innerH * 0.18) / Math.max(rect.h, 1)));
+    } else {
+        scale = Math.min(
+            cap,
+            Math.max(layoutMinimapHomeScale() * 0.25, Math.min((m.innerW * 0.7) / Math.max(rect.w, 1), (m.innerH * 0.7) / Math.max(rect.h, 1))),
+        );
+    }
+    layoutMinimapState.scale = scale;
+    if (tall) {
+        layoutMinimapState.panX = m.innerW * 0.18 - rect.x * scale;
+        layoutMinimapState.panY = 20 - rect.y * scale;
+    } else if (wide) {
+        layoutMinimapState.panX = 16 - rect.x * scale;
+        layoutMinimapState.panY = m.innerH * 0.16 - rect.y * scale;
+    } else {
+        layoutMinimapState.panX = m.innerW / 2 - (rect.x + rect.w / 2) * scale;
+        layoutMinimapState.panY = m.innerH / 2 - (rect.y + rect.h / 2) * scale;
+    }
+    clampLayoutMinimapCamera();
+    updateLayoutMinimapZoomLabel();
+    drawLayoutMinimap();
+}
+
+function focusLayoutMinimapRole(role) {
+    const minimap = layoutMinimapState?.minimap;
+    if (!minimap || !role) return;
+    const overlay = (minimap.overlays || []).find((o) => o.role === role);
+    if (!overlay) return;
+    const m = layoutMinimapMetrics();
+    focusLayoutMinimapRect(layoutMinimapBboxRect(overlay, minimap, m.innerW, m.innerH));
+}
+
+function focusLayoutMinimapCell(row, col) {
+    const minimap = layoutMinimapState?.minimap;
+    if (!minimap) return;
+    const m = layoutMinimapMetrics();
+    const rect = layoutMinimapBboxRect({
+        start_row: row, end_row: row, start_col: col, end_col: col,
+    }, minimap, m.innerW, m.innerH);
+    const scale = Math.min(LAYOUT_MINIMAP_MAX_SCALE, Math.max(8, 28 / Math.max(rect.w, rect.h, 1)));
+    layoutMinimapState.scale = scale;
+    layoutMinimapState.panX = m.innerW / 2 - (rect.x + rect.w / 2) * scale;
+    layoutMinimapState.panY = m.innerH / 2 - (rect.y + rect.h / 2) * scale;
+    clampLayoutMinimapCamera();
+    updateLayoutMinimapZoomLabel();
+    drawLayoutMinimap();
+}
+
+function hitTestLayoutOverlay(row, col, overlays) {
+    const hits = (overlays || []).filter((o) => (
+        row >= Number(o.start_row) && row <= Number(o.end_row)
+        && col >= Number(o.start_col) && col <= Number(o.end_col)
+    ));
+    hits.sort((a, b) => {
+        if ((a.style === 'dot') !== (b.style === 'dot')) return a.style === 'dot' ? -1 : 1;
+        return layoutOverlayArea(a) - layoutOverlayArea(b);
+    });
+    return hits[0] || null;
+}
+
+function setLayoutMinimapActiveRole(role, hintText) {
+    if (!layoutMinimapState) return;
+    const turningOff = layoutMinimapState.activeRole === role;
+    if (turningOff) {
+        layoutMinimapState.activeRole = null;
+    } else {
+        layoutMinimapState.activeRole = role || null;
+    }
+    const hint = document.querySelector('[data-layout-minimap-hint]');
+    if (hint) {
+        hint.textContent = hintText || (layoutMinimapState.activeRole
+            ? `Highlighting ${(LAYOUT_ROLE_META[layoutMinimapState.activeRole] || {}).label || layoutMinimapState.activeRole}`
+            : '');
+    }
+    document.querySelectorAll('.layout-role-row, .layout-minimap-legend-item').forEach((el) => {
+        el.classList.toggle('is-active', el.getAttribute('data-role') === layoutMinimapState.activeRole);
+    });
+    if (!turningOff && layoutMinimapState.activeRole) {
+        focusLayoutMinimapRole(layoutMinimapState.activeRole);
+    } else {
+        drawLayoutMinimap();
+    }
+}
+
+function drawLayoutMinimapAxisLabels(ctx, m) {
+    const { cssW, cssH, innerW, innerH, gutterL, gutterT, rows, cols, scale, originR, originC, colPx, rowPx } = m;
+    ctx.save();
+    ctx.fillStyle = '#161c24';
+    ctx.fillRect(0, 0, cssW, gutterT);
+    ctx.fillRect(0, 0, gutterL, cssH);
+    ctx.fillStyle = '#1c2430';
+    ctx.fillRect(0, 0, gutterL, gutterT);
+    ctx.strokeStyle = 'rgba(148, 163, 184, 0.35)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(gutterL, 0);
+    ctx.lineTo(gutterL, cssH);
+    ctx.moveTo(0, gutterT);
+    ctx.lineTo(cssW, gutterT);
+    ctx.stroke();
+
+    ctx.fillStyle = '#cbd5e1';
+    ctx.font = '11px Inter, sans-serif';
+    ctx.textBaseline = 'middle';
+    const panX = layoutMinimapState.panX || 0;
+    const panY = layoutMinimapState.panY || 0;
+    const rowStep = rowPx >= 16 ? 1 : Math.max(1, Math.ceil(16 / Math.max(rowPx, 1)));
+    const colStep = colPx >= 28 ? 1 : Math.max(1, Math.ceil(28 / Math.max(colPx, 1)));
+    ctx.textAlign = 'right';
+    for (let r = originR; r < originR + rows; r += rowStep) {
+        const y = gutterT + panY + ((r - originR + 0.5) / rows) * innerH * scale;
+        if (y < gutterT + 4 || y > cssH - 2) continue;
+        ctx.fillText(String(r + 1), gutterL - 6, y);
+    }
+    ctx.textAlign = 'center';
+    for (let c = originC; c < originC + cols; c += colStep) {
+        const x = gutterL + panX + ((c - originC + 0.5) / cols) * innerW * scale;
+        if (x < gutterL + 8 || x > cssW - 8) continue;
+        ctx.fillText(indexToExcelColumn(c), x, gutterT / 2);
+    }
+    ctx.restore();
+}
+
+function layoutMinimapVisibleSheetRange(m) {
+    const tl = layoutMinimapScreenToWorld(m.gutterL, m.gutterT);
+    const br = layoutMinimapScreenToWorld(m.cssW, m.cssH);
+    const r0 = Math.max(m.originR, Math.floor((tl.y / m.innerH) * m.rows) + m.originR);
+    const r1 = Math.min(m.originR + m.rows - 1, Math.ceil((br.y / m.innerH) * m.rows) + m.originR);
+    const c0 = Math.max(m.originC, Math.floor((tl.x / m.innerW) * m.cols) + m.originC);
+    const c1 = Math.min(m.originC + m.cols - 1, Math.ceil((br.x / m.innerW) * m.cols) + m.originC);
+    return { r0, r1, c0, c1 };
+}
+
+function ingestLayoutMinimapCells(list) {
+    if (!layoutMinimapState) return;
+    if (!layoutMinimapState.cells) layoutMinimapState.cells = new Map();
+    (list || []).forEach((item) => {
+        if (item == null || item.t == null || item.t === '') return;
+        layoutMinimapState.cells.set(`${Number(item.r)}:${Number(item.c)}`, String(item.t));
+    });
+}
+
+function syncLayoutMinimapLoadButton() {
+    const btn = document.querySelector('[data-minimap-load-cells]');
+    if (!btn || !layoutMinimapState) return;
+    const status = layoutMinimapState.cellsStatus || 'idle';
+    btn.disabled = status === 'loading' || status === 'all';
+    if (status === 'loading') btn.textContent = 'Loading…';
+    else if (status === 'all') btn.textContent = 'Cells loaded';
+    else btn.textContent = 'Load all cells';
+}
+
+function layoutMinimapEnsureMergeIndex() {
+    if (!layoutMinimapState) return { covered: new Set(), list: [] };
+    if (layoutMinimapState.mergeIndex) return layoutMinimapState.mergeIndex;
+    const list = Array.isArray(layoutMinimapState.minimap?.merges)
+        ? layoutMinimapState.minimap.merges
+        : [];
+    const covered = new Set();
+    const origin = new Map();
+    list.forEach((mg) => {
+        origin.set(`${Number(mg.start_row)}:${Number(mg.start_col)}`, mg);
+        for (let r = Number(mg.start_row); r <= Number(mg.end_row); r += 1) {
+            for (let c = Number(mg.start_col); c <= Number(mg.end_col); c += 1) {
+                if (r === Number(mg.start_row) && c === Number(mg.start_col)) continue;
+                covered.add(`${r}:${c}`);
+            }
+        }
+    });
+    layoutMinimapState.mergeIndex = { covered, origin, list };
+    return layoutMinimapState.mergeIndex;
+}
+
+function drawLayoutMinimapMerges(ctx, m) {
+    const { list } = layoutMinimapEnsureMergeIndex();
+    if (!list.length) return;
+    const vis = layoutMinimapVisibleSheetRange(m);
+    const minimap = layoutMinimapState.minimap;
+    ctx.save();
+    list.forEach((mg) => {
+        if (mg.end_row < vis.r0 || mg.start_row > vis.r1 || mg.end_col < vis.c0 || mg.start_col > vis.c1) return;
+        const rect = layoutMinimapBboxRect(mg, minimap, m.innerW, m.innerH);
+        ctx.fillStyle = 'rgba(22, 32, 46, 0.97)';
+        ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
+        ctx.strokeStyle = 'rgba(186, 198, 214, 0.65)';
+        ctx.lineWidth = 1.35 / m.scale;
+        ctx.strokeRect(
+            rect.x + 0.5 / m.scale,
+            rect.y + 0.5 / m.scale,
+            Math.max(rect.w - 1 / m.scale, 1 / m.scale),
+            Math.max(rect.h - 1 / m.scale, 1 / m.scale),
+        );
+    });
+    ctx.restore();
+}
+
+function drawLayoutMinimapCellValues(ctx, m) {
+    const cells = layoutMinimapState.cells;
+    if (!cells || cells.size === 0) return;
+    if (m.rowPx < 10 || m.colPx < 28) return;
+    const vis = layoutMinimapVisibleSheetRange(m);
+    const minimap = layoutMinimapState.minimap;
+    const { covered, origin } = layoutMinimapEnsureMergeIndex();
+    const fontPx = Math.min(12, Math.max(9, m.rowPx - 5));
+    ctx.save();
+    ctx.font = `${fontPx / m.scale}px Inter, sans-serif`;
+    ctx.fillStyle = 'rgba(248, 250, 252, 0.96)';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    for (let r = vis.r0; r <= vis.r1; r += 1) {
+        for (let c = vis.c0; c <= vis.c1; c += 1) {
+            const key = `${r}:${c}`;
+            if (covered.has(key)) continue;
+            const merge = origin.get(key);
+            let text = cells.get(key);
+            if (!text && merge) {
+                for (let rr = Number(merge.start_row); rr <= Number(merge.end_row) && !text; rr += 1) {
+                    for (let cc = Number(merge.start_col); cc <= Number(merge.end_col); cc += 1) {
+                        text = cells.get(`${rr}:${cc}`);
+                        if (text) break;
+                    }
+                }
+            }
+            if (!text) continue;
+            const box = merge || { start_row: r, end_row: r, start_col: c, end_col: c };
+            const rect = layoutMinimapBboxRect(box, minimap, m.innerW, m.innerH);
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(rect.x + 2 / m.scale, rect.y, Math.max(rect.w - 4 / m.scale, 1 / m.scale), rect.h);
+            ctx.clip();
+            ctx.fillText(text, rect.x + 4 / m.scale, rect.y + rect.h / 2);
+            ctx.restore();
+        }
+    }
+    ctx.restore();
+}
+
+async function loadLayoutMinimapCells({ all = true } = {}) {
+    if (!layoutMinimapState || !currentJobId) return;
+    if (layoutMinimapState.cellsStatus === 'loading') return;
+    if (all && layoutMinimapState.cellsStatus === 'all') return;
+    const minimap = layoutMinimapState.minimap;
+    const m = layoutMinimapMetrics();
+    let r0;
+    let r1;
+    let c0;
+    let c1;
+    if (all) {
+        r0 = Number(minimap.start_row) || 0;
+        r1 = Number(minimap.end_row) || r0;
+        c0 = Number(minimap.start_col) || 0;
+        c1 = Number(minimap.end_col) || c0;
+    } else {
+        const vis = layoutMinimapVisibleSheetRange(m);
+        r0 = vis.r0;
+        r1 = vis.r1;
+        c0 = vis.c0;
+        c1 = vis.c1;
+    }
+    if (r1 < r0 || c1 < c0) return;
+    layoutMinimapState.cellsStatus = 'loading';
+    syncLayoutMinimapLoadButton();
+    const req = ++layoutMinimapPreviewReq;
+    let url = `/api/demarcation/preview/${currentJobId}?sparse=1&start_row=${r0}&end_row=${r1}&start_col=${c0}&end_col=${c1}`;
+    if (currentSheet) url += `&sheet_name=${encodeURIComponent(currentSheet)}`;
+    if (currentSourceId) url += `&source_id=${encodeURIComponent(currentSourceId)}`;
+    try {
+        const res = await fetch(url);
+        const data = await res.json();
+        if (req !== layoutMinimapPreviewReq || !layoutMinimapState) return;
+        if (data.error) {
+            layoutMinimapState.cellsStatus = layoutMinimapState.cells?.size ? 'partial' : 'idle';
+            syncLayoutMinimapLoadButton();
+            return;
+        }
+        ingestLayoutMinimapCells(data.cells);
+        layoutMinimapState.cellsStatus = all ? 'all' : 'partial';
+        syncLayoutMinimapLoadButton();
+        const hint = document.querySelector('[data-layout-minimap-hint]');
+        if (hint) {
+            hint.textContent = all
+                ? `Loaded ${layoutMinimapState.cells.size} cells — pan and scroll without reloading`
+                : `Loaded ${layoutMinimapState.cells.size} cells in view`;
+        }
+        drawLayoutMinimap();
+    } catch (err) {
+        if (layoutMinimapState) {
+            layoutMinimapState.cellsStatus = layoutMinimapState.cells?.size ? 'partial' : 'idle';
+            syncLayoutMinimapLoadButton();
+        }
+    }
+}
+
+function drawLayoutMinimap() {
+    if (!layoutMinimapState?.canvas || !layoutMinimapState.minimap) return;
+    const canvas = layoutMinimapState.canvas;
+    const minimap = layoutMinimapState.minimap;
+    const m = layoutMinimapMetrics();
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(m.cssW * dpr);
+    canvas.height = Math.round(m.cssH * dpr);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, m.cssW, m.cssH);
+    ctx.fillStyle = '#10151c';
+    ctx.fillRect(0, 0, m.cssW, m.cssH);
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(m.gutterL, m.gutterT, m.innerW, m.innerH);
+    ctx.clip();
+    ctx.translate(m.gutterL + (layoutMinimapState.panX || 0), m.gutterT + (layoutMinimapState.panY || 0));
+    ctx.scale(m.scale, m.scale);
+
+    const gw = Math.max(1, Number(minimap.grid_cols) || 1);
+    const gh = Math.max(1, Number(minimap.grid_rows) || 1);
+    const occ = String(minimap.occupancy || '');
+    const cellW = m.innerW / gw;
+    const cellH = m.innerH / gh;
+    const gap = m.scale >= 2.5 ? 0.4 / m.scale : 0;
+    if (!m.showText) {
+        ctx.fillStyle = 'rgba(226, 232, 240, 0.28)';
+        for (let gy = 0; gy < gh; gy += 1) {
+            for (let gx = 0; gx < gw; gx += 1) {
+                if (occ[gy * gw + gx] !== '1') continue;
+                ctx.fillRect(gx * cellW, gy * cellH, Math.max(cellW - gap, 0.5), Math.max(cellH - gap, 0.5));
+            }
+        }
+    } else {
+        ctx.strokeStyle = 'rgba(148, 163, 184, 0.18)';
+        ctx.lineWidth = 1 / m.scale;
+        const vis = layoutMinimapVisibleSheetRange(m);
+        for (let r = vis.r0; r <= vis.r1 + 1; r += 1) {
+            const y = ((r - m.originR) / m.rows) * m.innerH;
+            ctx.beginPath();
+            ctx.moveTo(0, y);
+            ctx.lineTo(m.innerW, y);
+            ctx.stroke();
+        }
+        for (let c = vis.c0; c <= vis.c1 + 1; c += 1) {
+            const x = ((c - m.originC) / m.cols) * m.innerW;
+            ctx.beginPath();
+            ctx.moveTo(x, 0);
+            ctx.lineTo(x, m.innerH);
+            ctx.stroke();
+        }
+    }
+
+    drawLayoutMinimapMerges(ctx, m);
+
+    const active = layoutMinimapState.activeRole;
+    const overlays = Array.isArray(minimap.overlays) ? minimap.overlays : [];
+    const bands = overlays.filter((o) => o.style !== 'dot');
+    const dots = overlays.filter((o) => o.style === 'dot');
+    const paintOrder = ['metadata', 'values', 'time', 'dimensions', 'metrics', 'totals'];
+    bands.sort((a, b) => paintOrder.indexOf(a.role) - paintOrder.indexOf(b.role));
+    bands.forEach((overlay) => {
+        const rect = layoutMinimapBboxRect(overlay, minimap, m.innerW, m.innerH);
+        const isActive = overlay.role === active;
+        const dimOthers = Boolean(active) && !isActive;
+        const base = overlay.role === 'values' ? 0.18 : 0.07;
+        const activeFill = overlay.role === 'values' ? 0.28 : 0.16;
+        ctx.fillStyle = hexToRgba(layoutRoleColor(overlay.role), dimOthers ? 0.03 : (isActive ? activeFill : base));
+        ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
+    });
+    dots.forEach((overlay) => {
+        const rect = layoutMinimapBboxRect(overlay, minimap, m.innerW, m.innerH);
+        const isActive = !active || overlay.role === active;
+        const cx = rect.x + rect.w / 2;
+        const cy = rect.y + rect.h / 2;
+        const radius = Math.max(3 / m.scale, Math.min(rect.w, rect.h, 6 / m.scale));
+        ctx.beginPath();
+        ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+        ctx.fillStyle = hexToRgba(layoutRoleColor('noise'), isActive ? 0.95 : 0.25);
+        ctx.fill();
+    });
+
+    drawLayoutMinimapCellValues(ctx, m);
+
+    bands.forEach((overlay) => {
+        const rect = layoutMinimapBboxRect(overlay, minimap, m.innerW, m.innerH);
+        const isActive = overlay.role === active;
+        const dimOthers = Boolean(active) && !isActive;
+        ctx.strokeStyle = hexToRgba(layoutRoleColor(overlay.role), dimOthers ? 0.2 : (isActive ? 1 : 0.7));
+        ctx.lineWidth = (isActive ? 3 : 1.5) / m.scale;
+        ctx.strokeRect(rect.x + 0.5 / m.scale, rect.y + 0.5 / m.scale, Math.max(rect.w - 1 / m.scale, 1 / m.scale), Math.max(rect.h - 1 / m.scale, 1 / m.scale));
+    });
+
+    const cell = layoutMinimapState.highlightCell;
+    if (cell && cell.row != null && cell.col != null) {
+        const rect = layoutMinimapBboxRect({
+            start_row: cell.row, end_row: cell.row, start_col: cell.col, end_col: cell.col,
+        }, minimap, m.innerW, m.innerH);
+        ctx.strokeStyle = '#fde68a';
+        ctx.lineWidth = 2 / m.scale;
+        ctx.strokeRect(rect.x, rect.y, Math.max(rect.w, 4 / m.scale), Math.max(rect.h, 4 / m.scale));
+    }
+    ctx.restore();
+    drawLayoutMinimapAxisLabels(ctx, m);
+}
+
+function initLayoutMinimap(report) {
+    if (layoutMinimapResizeObserver) {
+        layoutMinimapResizeObserver.disconnect();
+        layoutMinimapResizeObserver = null;
+    }
+    layoutMinimapState = null;
+    const canvas = document.querySelector('.layout-minimap');
+    const minimap = report?.minimap;
+    if (!canvas || !minimap?.occupancy) {
+        document.body.classList.remove('layout-map-expanded');
+        return;
+    }
+    layoutMinimapState = {
+        canvas,
+        minimap,
+        report,
+        activeRole: null,
+        highlightCell: null,
+        scale: 1,
+        homeScale: 0,
+        panX: 0,
+        panY: 0,
+        cells: new Map(),
+        cellsStatus: 'idle',
+        mergeIndex: null,
+        expanded: layoutMinimapWantExpanded,
+    };
+    if (layoutMinimapWantExpanded) {
+        const panel = document.querySelector('.layout-complexity-panel');
+        panel?.classList.add('is-expanded');
+        document.body.classList.add('layout-map-expanded');
+        syncLayoutMinimapExpandButtons();
+    }
+    updateLayoutMinimapZoomLabel();
+    layoutMinimapResizeObserver = new ResizeObserver(() => {
+        clampLayoutMinimapCamera();
+        drawLayoutMinimap();
+    });
+    layoutMinimapResizeObserver.observe(canvas);
+    requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+            readableLayoutMinimapView();
+            const area = (Number(minimap.rows) || 0) * (Number(minimap.cols) || 0);
+            if (area > 0 && area <= 25000) {
+                void loadLayoutMinimapCells({ all: true });
+            } else {
+                syncLayoutMinimapLoadButton();
+            }
+        });
+    });
+
+    canvas.addEventListener('wheel', (event) => {
+        event.preventDefault();
+        if (event.ctrlKey || event.metaKey) {
+            const rect = canvas.getBoundingClientRect();
+            const factor = event.deltaY < 0 ? 1.18 : 1 / 1.18;
+            zoomLayoutMinimapAt(event.clientX - rect.left, event.clientY - rect.top, factor);
+            return;
+        }
+        const dx = event.deltaX || (event.shiftKey ? event.deltaY : 0);
+        const dy = event.shiftKey ? 0 : event.deltaY;
+        layoutMinimapState.panX -= dx;
+        layoutMinimapState.panY -= dy;
+        clampLayoutMinimapCamera();
+        drawLayoutMinimap();
+    }, { passive: false });
+
+    canvas.addEventListener('pointerdown', (event) => {
+        if (event.button !== 0) return;
+        canvas.setPointerCapture(event.pointerId);
+        layoutMinimapState.pointer = {
+            id: event.pointerId,
+            lastX: event.clientX,
+            lastY: event.clientY,
+            startX: event.clientX,
+            startY: event.clientY,
+            moved: false,
+        };
+        canvas.classList.add('is-panning');
+    });
+    canvas.addEventListener('pointermove', (event) => {
+        const pointer = layoutMinimapState?.pointer;
+        if (!pointer || pointer.id !== event.pointerId) return;
+        const dx = event.clientX - pointer.lastX;
+        const dy = event.clientY - pointer.lastY;
+        if (Math.abs(event.clientX - pointer.startX) + Math.abs(event.clientY - pointer.startY) > 5) {
+            pointer.moved = true;
+        }
+        if (!pointer.moved) return;
+        layoutMinimapState.panX += dx;
+        layoutMinimapState.panY += dy;
+        pointer.lastX = event.clientX;
+        pointer.lastY = event.clientY;
+        clampLayoutMinimapCamera();
+        drawLayoutMinimap();
+    });
+    const endPan = (event) => {
+        const pointer = layoutMinimapState?.pointer;
+        if (!pointer || pointer.id !== event.pointerId) return;
+        canvas.classList.remove('is-panning');
+        try { canvas.releasePointerCapture(event.pointerId); } catch (err) { /* already released */ }
+        layoutMinimapState.pointer = pointer.moved ? { ...pointer, id: null } : null;
+    };
+    canvas.addEventListener('pointerup', endPan);
+    canvas.addEventListener('pointercancel', endPan);
+
+    canvas.addEventListener('click', (event) => {
+        const leftover = layoutMinimapState.pointer;
+        if (leftover?.moved) {
+            layoutMinimapState.pointer = null;
+            return;
+        }
+        layoutMinimapState.pointer = null;
+        const { row, col } = layoutMinimapCellFromEvent(event, canvas, minimap);
+        const hit = hitTestLayoutOverlay(row, col, minimap.overlays || []);
+        const range = hit?.excel_range ? ` (${hit.excel_range})` : '';
+        const label = hit ? `${(LAYOUT_ROLE_META[hit.role] || {}).label || hit.role}${range}` : '';
+        layoutMinimapState.highlightCell = { row, col };
+        if (hit) {
+            layoutMinimapState.activeRole = hit.role;
+            const hint = document.querySelector('[data-layout-minimap-hint]');
+            if (hint) hint.textContent = label;
+            document.querySelectorAll('.layout-role-row, .layout-minimap-legend-item').forEach((el) => {
+                el.classList.toggle('is-active', el.getAttribute('data-role') === hit.role);
+            });
+            drawLayoutMinimap();
+        } else {
+            setLayoutMinimapActiveRole(null, '');
+            drawLayoutMinimap();
+        }
+    });
+
+    canvas.addEventListener('dblclick', (event) => {
+        event.preventDefault();
+        const rect = canvas.getBoundingClientRect();
+        if ((layoutMinimapState.scale || 1) / layoutMinimapHomeScale() >= 1.35) {
+            readableLayoutMinimapView();
+            return;
+        }
+        zoomLayoutMinimapAt(event.clientX - rect.left, event.clientY - rect.top, 2.4);
+    });
+
+    canvas.addEventListener('keydown', (event) => {
+        const step = 40;
+        if (event.key === '+' || event.key === '=') {
+            event.preventDefault();
+            const { cssW, cssH } = layoutMinimapViewSize();
+            zoomLayoutMinimapAt(cssW / 2, cssH / 2, 1.25);
+        } else if (event.key === '-' || event.key === '_') {
+            event.preventDefault();
+            const { cssW, cssH } = layoutMinimapViewSize();
+            zoomLayoutMinimapAt(cssW / 2, cssH / 2, 1 / 1.25);
+        } else if (event.key === 'Home') {
+            event.preventDefault();
+            readableLayoutMinimapView();
+        } else if (event.key === '0') {
+            event.preventDefault();
+            resetLayoutMinimapView();
+        } else if (event.key === 'ArrowLeft') {
+            event.preventDefault();
+            layoutMinimapState.panX += step;
+            clampLayoutMinimapCamera();
+            drawLayoutMinimap();
+        } else if (event.key === 'ArrowRight') {
+            event.preventDefault();
+            layoutMinimapState.panX -= step;
+            clampLayoutMinimapCamera();
+            drawLayoutMinimap();
+        } else if (event.key === 'ArrowUp') {
+            event.preventDefault();
+            layoutMinimapState.panY += step;
+            clampLayoutMinimapCamera();
+            drawLayoutMinimap();
+        } else if (event.key === 'ArrowDown') {
+            event.preventDefault();
+            layoutMinimapState.panY -= step;
+            clampLayoutMinimapCamera();
+            drawLayoutMinimap();
+        }
+    });
+
+    document.querySelectorAll('[data-minimap-zoom]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+            const action = btn.getAttribute('data-minimap-zoom');
+            const { cssW, cssH } = layoutMinimapViewSize();
+            if (action === 'in') zoomLayoutMinimapAt(cssW / 2, cssH / 2, 1.4);
+            else if (action === 'out') zoomLayoutMinimapAt(cssW / 2, cssH / 2, 1 / 1.4);
+            else if (action === 'home') readableLayoutMinimapView();
+            else if (action === 'fit') resetLayoutMinimapView();
+        });
+    });
+
+    document.querySelectorAll('[data-minimap-load-cells]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+            void loadLayoutMinimapCells({ all: true });
+        });
+    });
+
+    document.querySelectorAll('[data-minimap-expand]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+            setLayoutMinimapExpanded(!layoutMinimapWantExpanded);
+        });
+    });
+    document.removeEventListener('keydown', onLayoutMapExpandKeydown);
+    document.addEventListener('keydown', onLayoutMapExpandKeydown);
+
+    document.querySelectorAll('.layout-role-row, .layout-minimap-legend-item').forEach((el) => {
+        el.addEventListener('click', () => {
+            const role = el.getAttribute('data-role');
+            const overlay = (minimap.overlays || []).find((o) => o.role === role);
+            const hint = overlay?.excel_range ? `${(LAYOUT_ROLE_META[role] || {}).label || role} (${overlay.excel_range})` : '';
+            setLayoutMinimapActiveRole(role, hint);
+        });
+    });
+
+    document.querySelectorAll('.layout-sample-item').forEach((el) => {
+        const activate = () => {
+            const row = el.getAttribute('data-row');
+            const col = el.getAttribute('data-col');
+            if (row === '' || col === '') return;
+            layoutMinimapState.highlightCell = { row: Number(row), col: Number(col) };
+            layoutMinimapState.activeRole = 'values';
+            document.querySelectorAll('.layout-role-row, .layout-minimap-legend-item').forEach((item) => {
+                item.classList.toggle('is-active', item.getAttribute('data-role') === 'values');
+            });
+            document.querySelectorAll('.layout-sample-item').forEach((item) => item.classList.toggle('is-active', item === el));
+            const hint = document.querySelector('[data-layout-minimap-hint]');
+            if (hint) {
+                const a1 = `${indexToExcelColumn(Number(col))}${Number(row) + 1}`;
+                hint.textContent = `Sample cell ${a1}`;
+            }
+            focusLayoutMinimapCell(Number(row), Number(col));
+        };
+        el.addEventListener('click', activate);
+        el.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                activate();
+            }
+        });
+    });
+}
+
 function renderDemarcationBlocks(blocks) {
     if (!blocks || blocks.length === 0) {
         const dbg = demarcationProposal && demarcationProposal.demarcation_debug;
@@ -1072,7 +2156,7 @@ function renderDemarcationBlocks(blocks) {
         <div class="demarcation-block-card decision-node ${block.category.toLowerCase().replace(' ', '-')} stagger-${(index % 3) + 1}" data-id="${block.id}">
             <div class="card-toolbar">
                 <div class="toolbar-info">
-                    <span class="block-type-label">Block Type: ${escapeHtml(block.category || 'Unknown')}</span>
+                    <span class="block-type-label">Block Type: ${escapeHtml(effectiveBlockTypeLabel(block))}</span>
                     ${reviewBadge}
                     <div class="block-subtext">${escapeHtml(block.name || 'Candidate block')} (${escapeHtml(block.excel_range || 'Unknown range')})${sheetHtml}</div>
                 </div>
@@ -1160,7 +2244,17 @@ function renderDemarcationBlocks(blocks) {
         </div>`;
     }).join('');
 
-    elements.demarcationWorkspace.innerHTML = legendFooter + cardsHtml;
+    const adapterUsed = Boolean(demarcationProposal?.layout_complexity?.adapter_used);
+    const regionsHtml = adapterUsed
+        ? `<details class="layout-compat-regions">
+            <summary>Regions Confirm &amp; map will save (${blocks.length}) — mapping compatibility, not island classification</summary>
+            ${cardsHtml}
+           </details>`
+        : cardsHtml;
+
+    elements.demarcationWorkspace.innerHTML =
+        buildLayoutComplexityPanel(demarcationProposal?.layout_complexity) + legendFooter + regionsHtml;
+    initLayoutMinimap(demarcationProposal?.layout_complexity);
     void hydrateInlineDemarcationPreviews(blocks);
     refreshLayoutPrimaryActionButton();
 }
@@ -1441,6 +2535,7 @@ async function submitLayoutForSource(blocks, sourceId, sheetName) {
             blocks,
             source_id: sourceId,
             sheet_name: sheetName || null,
+            layout_complexity: demarcationProposal?.layout_complexity || null,
         }),
     });
     const payload = await response.json();
@@ -1484,11 +2579,11 @@ async function advanceToNextSourceAfterMappingSkip(toastMessage) {
     if (toastMessage) showToast(toastMessage, 'info');
     const { next } = getNextSourceInTabOrder();
     if (next && next.source_id) {
-        switchStep(1);
+        switchStep(SETUP_STEP_LAYOUT);
         await changeSource(next.source_id, next.sheet_name || '');
         return true;
     }
-    switchStep(1);
+    switchStep(SETUP_STEP_LAYOUT);
     showToast('No more sheets in this job.', 'info');
     return false;
 }
@@ -1557,8 +2652,13 @@ async function confirmLayoutAndOpenMappingForCurrentSheet() {
             refreshUxStepperFromJob(jobAfterNav);
             return;
         }
-        switchStep(2);
-        showToast('Layout saved — column mapping for this sheet.', 'success');
+        if (currentSheetNeedsStandardize()) {
+            switchStep(SETUP_STEP_STANDARDIZE);
+            showToast('Layout saved — assign Date / Dimensions / Metrics, then generate the standard table.', 'success');
+        } else {
+            switchStep(SETUP_STEP_COLUMN_STD);
+            showToast('Layout saved — standardize columns (split/combine), then map.', 'success');
+        }
     } catch (e) {
         showToast(`Save failed: ${e.message}`, 'error');
     }
@@ -1572,7 +2672,7 @@ async function onSaveMappingOrRunAgentClick() {
     const jobPeek = await getJobStatus(currentJobId);
     lastSetupJobForHeader = jobPeek;
     const uxsPeek = jobPeek.ux_stepper_summary || {};
-    if (setupUiStep === 2 && computeSheetsGuidedSetupDone(jobPeek)) {
+    if (setupUiStep === SETUP_STEP_MAPPING && computeSheetsGuidedSetupDone(jobPeek)) {
         await goToHarmonizationPrep(elements.saveMappingNextSheetBtn);
         return;
     }
@@ -1597,7 +2697,7 @@ async function saveMappingAndNextSheet() {
         showToast('Mapping saved for this sheet.', 'success');
         const { next } = getNextSourceInTabOrder();
         if (next && next.source_id) {
-            switchStep(1);
+            switchStep(SETUP_STEP_LAYOUT);
             await changeSource(next.source_id, next.sheet_name || '');
         } else {
             const uxs = job.ux_stepper_summary || {};
@@ -1655,7 +2755,11 @@ async function goToMappingStep() {
             refreshUxStepperFromJob(jobAfter);
             return;
         }
-        switchStep(2);
+        if (currentSheetNeedsStandardize()) {
+            switchStep(SETUP_STEP_STANDARDIZE);
+        } else {
+            switchStep(SETUP_STEP_COLUMN_STD);
+        }
         refreshUxStepperFromJob(job);
     } catch (e) {
         showToast(`Open mapping failed: ${e.message}`, 'error');
@@ -1943,6 +3047,10 @@ function inferRoleFromSemantics(col) {
     const cls = String(col.classification || '').toLowerCase();
     const dec = String(col.decision || '').toLowerCase();
     const ctype = String(col.column_type || '').toLowerCase();
+    const target = String(col.target_column || '').trim();
+    if (target && target !== 'No match' && primaryTargetColumns.has(target)) {
+        return 'primary';
+    }
     const isMetricLike =
         ctype === 'metric' ||
         cls.includes('delivery') ||
@@ -1952,14 +3060,35 @@ function inferRoleFromSemantics(col) {
     if (dec === 'discard' || ctype === 'blank' || cls.includes('blank') || cls.includes('derived')) {
         return 'exclude';
     }
-    const target = String(col.target_column || '').trim();
-    if (target && target !== 'No match' && primaryTargetColumns.has(target)) {
-        return 'primary';
-    }
     if (isMetricLike) {
         return 'exclude';
     }
     return 'supporting';
+}
+
+/** 1-based source index for Supporting Meta suffixes (_1, _2, …). */
+function currentSourceSuffixIndex() {
+    const list = Array.isArray(setupSourceRegistryOrder) ? setupSourceRegistryOrder : [];
+    const sid = String(currentSourceId || '');
+    const idx = list.findIndex((s) => String(s?.source_id || '') === sid);
+    return idx >= 0 ? idx + 1 : 1;
+}
+
+function applyOutputAliasForRole(col) {
+    if (!col) return;
+    const target = String(col.target_column || '').trim();
+    const role = String(col.role || 'supporting').trim().toLowerCase();
+    if (!target || target.toLowerCase() === 'no match' || role === 'exclude') {
+        col.output_alias = '';
+        return;
+    }
+    if (role === 'primary') {
+        col.output_alias = target;
+    } else if (role === 'supporting') {
+        col.output_alias = `${target}_${currentSourceSuffixIndex()}`;
+    } else {
+        col.output_alias = '';
+    }
 }
 
 /** Role → decision/target coupling so downstream submit logic still sees Keep/Metadata/Discard. */
@@ -1971,13 +3100,16 @@ function applyRoleRule(col) {
         col.target_column = 'No match';
         col.target_match_method = col.target_match_method || 'manual';
         col.target_match_confidence = 0.0;
+        col.output_alias = '';
         return;
     }
     if (role === 'primary') {
         col.decision = 'Keep';
+        applyOutputAliasForRole(col);
         return;
     }
     col.decision = 'Metadata';
+    applyOutputAliasForRole(col);
 }
 
 function applyDecisionRule(col) {
@@ -2021,7 +3153,9 @@ function normalizeMappingProposal(mapping) {
             col.column_name = name;
             if (!col.source_column) col.source_column = name;
         }
-        if (!col.role) col.role = inferRoleFromSemantics(col);
+        if (!col.role) {
+            col.role = inferRoleFromSemantics(col);
+        }
         if (!isDateMappingCardCandidate(col)) {
             col.date_semantic = '';
         } else if (!col.date_semantic) {
@@ -2172,17 +3306,7 @@ async function loadMapping(force = false) {
         }
     }
 
-    try {
-        await requireValidLlmConfig({ redirectOnFail: 'immediate' });
-    } catch (e) {
-        if (statusEl) {
-            statusEl.textContent = 'Mapping Failed';
-            statusEl.className = 'status-badge danger';
-        }
-        elements.mappingGrid.innerHTML = `<p class="error-text">${escapeHtml(e.message || 'LLM not configured')}</p>
-            <p class="block-inline-note"><a href="/pages/settings.html">Open Settings</a> to configure your API key.</p>`;
-        return;
-    }
+    // Synonym / column-shaping matching only — no LLM required for Guided Setup mapping.
 
     const stopMappingProgressPoll = () => {
         if (mappingProgressTimer) {
@@ -2224,7 +3348,7 @@ async function loadMapping(force = false) {
         statusEl.className = 'status-badge warning';
     }
     if (live) {
-        live.textContent = 'Starting semantic mapping request…';
+        live.textContent = 'Matching columns by synonyms and column-shaping names…';
     }
     pollMappingProposeProgress();
     mappingProgressTimer = setInterval(pollMappingProposeProgress, 650);
@@ -2255,6 +3379,44 @@ async function loadMapping(force = false) {
 
         targetColumnOptions = Array.isArray(data.target_columns) ? ['No match', ...data.target_columns] : ['No match'];
         primaryTargetColumns = new Set(Array.isArray(data.primary_target_columns) ? data.primary_target_columns : []);
+        targetColumnMeta = new Map();
+        const opts = Array.isArray(data.target_column_options) ? data.target_column_options : [];
+        for (const o of opts) {
+            if (!o || !o.id) continue;
+            targetColumnMeta.set(String(o.id), {
+                id: String(o.id),
+                name: String(o.name || o.id),
+                kind: String(o.kind || 'dimension'),
+                supports_currency: Boolean(o.supports_currency) || String(o.id) === 'spends' || String(o.id) === 'spend',
+            });
+        }
+        for (const id of data.target_columns || []) {
+            if (!id || targetColumnMeta.has(id)) continue;
+            const isMetric = primaryTargetColumns.has(id) && /spend|impression|click|roas|view|metric/i.test(id);
+            targetColumnMeta.set(id, {
+                id,
+                name: id.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()),
+                kind: isMetric ? 'metric' : 'dimension',
+                supports_currency: id === 'spends' || id === 'spend',
+            });
+        }
+        // Ensure known metrics are marked even if options omitted
+        for (const mid of ['spends', 'spend', 'impressions', 'clicks', 'video_views', 'roas']) {
+            if (!targetColumnMeta.has(mid) && targetColumnOptions.includes(mid)) {
+                targetColumnMeta.set(mid, {
+                    id: mid,
+                    name: mid === 'spends' || mid === 'spend' ? 'Spend'
+                        : mid === 'roas' ? 'ROAS (Campaign KPI)'
+                        : mid.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()),
+                    kind: 'metric',
+                    supports_currency: mid === 'spends' || mid === 'spend',
+                });
+            } else if (targetColumnMeta.has(mid)) {
+                const m = targetColumnMeta.get(mid);
+                m.kind = 'metric';
+                if (mid === 'spends' || mid === 'spend') m.supports_currency = true;
+            }
+        }
         mappingHeaderDerivation = data.header_derivation || null;
         applyMappingFromProposeResponse(data);
         const reuse = data.mapping_reuse;
@@ -2331,18 +3493,184 @@ function duplicateTargetDetailsInProposal(rows) {
     return details;
 }
 
-/** Target-column <select> scoped to the template columns for this job. */
+function targetOptionLabel(id) {
+    if (!id || id === 'No match') return 'No match';
+    const meta = targetColumnMeta.get(id);
+    if (meta && meta.name) return meta.name;
+    return String(id).replace(/_/g, ' ');
+}
+
+function isMetricTarget(id) {
+    if (!id || id === 'No match') return false;
+    const meta = targetColumnMeta.get(id);
+    if (meta && meta.kind === 'metric') return true;
+    return /^(spends?|impressions|clicks|video_views|roas)$/i.test(String(id));
+}
+
+function metricSupportsCurrency(id) {
+    if (!id) return false;
+    const meta = targetColumnMeta.get(id);
+    if (meta && meta.supports_currency) return true;
+    return /^(spends?|spend)$/i.test(String(id));
+}
+
+function valueScaleNoteFor(scale) {
+    const s = Number(scale) || 1;
+    if (s === 1000) return "values in thousands ('000)";
+    if (s === 1000000) return 'values in millions';
+    return '';
+}
+
+/** Target-column <select> with Metrics / Dimensions groups + add custom metric. */
 function buildTargetColumnOptionsHtml(selectedTarget) {
     const current = selectedTarget || 'No match';
-    const options = Array.isArray(targetColumnOptions) && targetColumnOptions.length > 0
-        ? targetColumnOptions
-        : ['No match'];
-    return options
-        .map((opt) => {
-            const sel = opt === current ? ' selected' : '';
-            return `<option value="${escapeAttr(opt)}"${sel}>${escapeHtml(opt)}</option>`;
-        })
-        .join('');
+    const ids = Array.isArray(targetColumnOptions) && targetColumnOptions.length > 0
+        ? targetColumnOptions.filter((o) => o && o !== 'No match')
+        : [];
+    const metrics = [];
+    const dims = [];
+    for (const id of ids) {
+        if (isMetricTarget(id)) metrics.push(id);
+        else dims.push(id);
+    }
+    metrics.sort((a, b) => targetOptionLabel(a).localeCompare(targetOptionLabel(b), undefined, { sensitivity: 'base' }));
+    dims.sort((a, b) => targetOptionLabel(a).localeCompare(targetOptionLabel(b), undefined, { sensitivity: 'base' }));
+
+    const opt = (id) => {
+        const sel = id === current ? ' selected' : '';
+        return `<option value="${escapeAttr(id)}"${sel}>${escapeHtml(targetOptionLabel(id))}</option>`;
+    };
+    let html = `<option value="No match"${current === 'No match' ? ' selected' : ''}>No match</option>`;
+    if (metrics.length) {
+        html += `<optgroup label="Metrics">${metrics.map(opt).join('')}</optgroup>`;
+    }
+    if (dims.length) {
+        html += `<optgroup label="Dimensions">${dims.map(opt).join('')}</optgroup>`;
+    }
+    html += `<optgroup label="Custom"><option value="${ADD_CUSTOM_METRIC}">+ Add additional metric…</option></optgroup>`;
+    if (current && current !== 'No match' && current !== ADD_CUSTOM_METRIC && !ids.includes(current)) {
+        html += `<option value="${escapeAttr(current)}" selected>${escapeHtml(targetOptionLabel(current))}</option>`;
+    }
+    return html;
+}
+
+function buildMetricMetaSelectHtml(columnName, col, blockId) {
+    if (!col || !isMetricTarget(col.target_column)) return '';
+    const target = String(col.target_column || '');
+    const safeColumnName = JSON.stringify(columnName || '');
+    const safeBlockId = JSON.stringify(blockId || '');
+    let scale = '1';
+    try {
+        const n = Number(col.value_scale);
+        if (n === 1000 || n === 1000000) scale = String(n);
+        else if (n && n !== 1) scale = String(n);
+    } catch (e) { /* ignore */ }
+    const scaleOpts = VALUE_SCALE_CHOICES.map((c) => (
+        `<option value="${escapeAttr(c.value)}" ${String(c.value) === scale ? 'selected' : ''}>${escapeHtml(c.label)}</option>`
+    )).join('');
+    let currencyHtml = '';
+    if (metricSupportsCurrency(target)) {
+        const cur = String(col.metric_currency || '');
+        const curOpts = CURRENCY_CHOICES.map((c) => (
+            `<option value="${escapeAttr(c.value)}" ${c.value === cur ? 'selected' : ''}>${escapeHtml(c.label)}</option>`
+        )).join('');
+        currencyHtml = `
+            <div class="mapping-header-target mapping-header-target--bare">
+                <select class="mapping-target-select mapping-target-select--metric-currency sia-select sia-select--compact"
+                    aria-label="Currency for ${escapeAttr(columnName)}"
+                    onchange='updateCardMetricCurrency(${safeColumnName}, this.value, ${safeBlockId})'>
+                    ${curOpts}
+                </select>
+            </div>`;
+    }
+    return `
+        <div class="mapping-header-target mapping-header-target--bare">
+            <select class="mapping-target-select mapping-target-select--metric-scale sia-select sia-select--compact"
+                aria-label="Value scale for ${escapeAttr(columnName)}"
+                onchange='updateCardValueScale(${safeColumnName}, this.value, ${safeBlockId})'>
+                ${scaleOpts}
+            </select>
+        </div>
+        ${currencyHtml}`;
+}
+
+window.updateCardValueScale = function (columnName, value, blockId) {
+    if (!columnName) return;
+    const col = findMappingColumn(columnName, blockId);
+    if (!col) return;
+    const scale = Number(value) || 1;
+    col.value_scale = scale;
+    col.value_scale_note = valueScaleNoteFor(scale);
+    scheduleMappingDraftSave();
+    renderMappingCards();
+};
+
+window.updateCardMetricCurrency = function (columnName, value, blockId) {
+    if (!columnName) return;
+    const col = findMappingColumn(columnName, blockId);
+    if (!col) return;
+    col.metric_currency = String(value || '').trim();
+    scheduleMappingDraftSave();
+    renderMappingCards();
+};
+
+async function promptAndAddCustomMetric(columnName, blockId) {
+    const name = window.prompt('Name the additional metric (e.g. Conversions, Viewability):');
+    if (!name || !String(name).trim()) {
+        renderMappingCards();
+        return;
+    }
+    try {
+        const res = await fetch(`/api/mapping/custom-metric/${encodeURIComponent(currentJobId)}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: String(name).trim() }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.error) throw new Error(data.error || `Could not add metric (${res.status})`);
+        const metric = data.metric || {};
+        const mid = metric.id;
+        if (Array.isArray(data.target_columns)) {
+            targetColumnOptions = ['No match', ...data.target_columns];
+        } else if (mid && !targetColumnOptions.includes(mid)) {
+            targetColumnOptions.push(mid);
+        }
+        if (Array.isArray(data.target_column_options)) {
+            for (const o of data.target_column_options) {
+                if (o && o.id) {
+                    targetColumnMeta.set(String(o.id), {
+                        id: String(o.id),
+                        name: String(o.name || o.id),
+                        kind: String(o.kind || 'metric'),
+                        supports_currency: Boolean(o.supports_currency),
+                    });
+                }
+            }
+        } else if (mid) {
+            targetColumnMeta.set(mid, {
+                id: mid,
+                name: metric.name || mid,
+                kind: 'metric',
+                supports_currency: false,
+            });
+        }
+        if (mid) primaryTargetColumns.add(mid);
+        const col = findMappingColumn(columnName, blockId);
+        if (col && mid) {
+            col.target_column = mid;
+            col.target_match_method = 'manual';
+            col.target_match_confidence = 1.0;
+            col.role = 'primary';
+            col.decision = 'Keep';
+            if (col.value_scale == null) col.value_scale = 1;
+        }
+        scheduleMappingDraftSave();
+        renderMappingCards();
+        showToast(`Added metric “${metric.name || mid}”.`, 'success');
+    } catch (e) {
+        showToast(e.message || 'Failed to add metric', 'error');
+        renderMappingCards();
+    }
 }
 
 /** Role change: coupling with target/decision and autosave. */
@@ -2359,6 +3687,10 @@ window.updateCardRole = function (columnName, role, blockId) {
 /** Target-column change from the source card. */
 window.updateCardTarget = function (columnName, newTarget, blockId) {
     if (!columnName) return;
+    if (newTarget === ADD_CUSTOM_METRIC) {
+        void promptAndAddCustomMetric(columnName, blockId);
+        return;
+    }
     const col = findMappingColumn(columnName, blockId);
     if (!col) return;
     const target = newTarget || 'No match';
@@ -2370,10 +3702,26 @@ window.updateCardTarget = function (columnName, newTarget, blockId) {
     } else if (!col.date_semantic) {
         col.date_semantic = inferDateSemanticFromColumn(col);
     }
-    if (col.role !== 'exclude') {
-        col.role = inferRoleFromSemantics(col);
+    if (!isMetricTarget(target)) {
+        col.metric_currency = '';
+    } else {
+        if (col.value_scale == null || col.value_scale === '' || Number(col.value_scale) === 0) {
+            col.value_scale = 1;
+        }
+        if (!metricSupportsCurrency(target)) {
+            col.metric_currency = '';
+        }
     }
-    applyRoleRule(col);
+    if (target !== 'No match') {
+        col.role = (primaryTargetColumns.has(target) || isMetricTarget(target)) ? 'primary' : 'supporting';
+        col.decision = col.role === 'primary' ? 'Keep' : 'Metadata';
+        applyOutputAliasForRole(col);
+    } else {
+        if (col.role !== 'exclude') {
+            col.role = inferRoleFromSemantics(col);
+        }
+        applyRoleRule(col);
+    }
     scheduleMappingDraftSave();
     renderMappingCards();
 };
@@ -2558,6 +3906,7 @@ function renderOneMappingCard(col, blockId) {
     const inlineDateControls = isDateMappingCardCandidate(col)
         ? buildDateSemanticSelectHtml(columnName, col.date_semantic, blockId)
         : '';
+    const inlineMetricControls = buildMetricMetaSelectHtml(columnName, col, blockId);
 
     let previewContent = '';
     if (hasNumericStats) {
@@ -2604,6 +3953,8 @@ function renderOneMappingCard(col, blockId) {
     const reusedPeer = Boolean(
         col.mapping_reused_from_source_id || col._mappingReusedFromSourceId,
     );
+    const splitFrom = String(col.split_from || col.packed_source_column || '').trim();
+    const outputAlias = String(col.output_alias || '').trim();
     const safeColumnName = JSON.stringify(columnName);
     const safeBlockId = JSON.stringify(blockId || '');
     return `
@@ -2611,12 +3962,15 @@ function renderOneMappingCard(col, blockId) {
             <div class="mapping-card-header mapping-card-header--by-source">
                 <div class="mapping-header-left">
                     <span class="mapping-source-col-label" title="Source column from this block">${columnName ? escapeHtml(columnName) : '<em class="text-muted">Unnamed column</em>'}</span>
+                    ${splitFrom ? `<span class="hierarchy-pill muted" title="Split from packed column">from ${escapeHtml(splitFrom)}</span>` : ''}
                     <span class="col-type-badge ${badgeClass}">${escapeHtml(colType)}</span>
+                    ${outputAlias && !isExcluded ? `<span class="hierarchy-pill ok" title="Output name when collating sources">→ ${escapeHtml(outputAlias)}</span>` : ''}
                 </div>
                 <div class="mapping-header-dropdown-row">
                     ${inlineDateControls}
+                    ${inlineMetricControls}
                     <div class="mapping-header-target mapping-header-target--bare">
-                        <select class="mapping-target-select mapping-target-select--target-field" aria-label="Target column for ${escapeAttr(columnName)}"
+                        <select class="mapping-target-select mapping-target-select--target-field sia-select sia-select--compact" aria-label="Target column for ${escapeAttr(columnName)}"
                             onchange='updateCardTarget(${safeColumnName}, this.value, ${safeBlockId})'
                             ${isExcluded ? 'disabled' : ''}>
                             ${buildTargetColumnOptionsHtml(selectedTarget)}
@@ -2704,8 +4058,12 @@ function renderMappingCards() {
             ? `<div class="mapping-reuse-banner" role="status"><strong>Reused mapping</strong> — ${reuseCount} column(s) match a <strong>same-named sheet</strong> already mapped in this job. Gold border = copy; change targets or roles anytime.</div>`
             : '';
     const dateRangeSemanticHintBanner = buildDateRangeSemanticHintBanner();
+    const standardizedBanner =
+        mappingHeaderDerivation && mappingHeaderDerivation.format === 'standardized_table'
+            ? `<div class="mapping-reuse-banner" role="status"><strong>Standard table</strong> — these columns are Date, dimensions, and metrics from the tidy-up step, not the original messy grid.</div>`
+            : '';
 
-    const restoreWindowScrollY = setupUiStep === 2 ? window.scrollY : null;
+    const restoreWindowScrollY = setupUiStep === SETUP_STEP_MAPPING ? window.scrollY : null;
 
     const cardsHtml = sections
         .map((section) => {
@@ -2733,7 +4091,7 @@ function renderMappingCards() {
         .join('');
 
     elements.mappingGrid.innerHTML =
-        scopeIntro + reuseBanner + duplicateTargetsBanner + dateRangeSemanticHintBanner + cardsHtml;
+        scopeIntro + standardizedBanner + reuseBanner + duplicateTargetsBanner + dateRangeSemanticHintBanner + cardsHtml;
 
     if (restoreWindowScrollY != null) {
         requestAnimationFrame(() => {
@@ -2748,42 +4106,780 @@ function getConfColor(conf) {
     return '#ef4444';
 }
 
+// ===== Step 1.5: Standardize messy layout =====
+
+function collectStandardizeAssignment() {
+    const base = (standardizeState && standardizeState.assignment) ? { ...standardizeState.assignment } : {};
+    const names = [];
+    document.querySelectorAll('[data-std-dim-name]').forEach((input) => names.push(input.value.trim()));
+    if (names.length) base.dimension_names = names;
+    const include = { ...(base.include_roles || {}) };
+    document.querySelectorAll('[data-std-include]').forEach((input) => {
+        include[input.getAttribute('data-std-include')] = input.checked;
+    });
+    base.include_roles = include;
+    const excludeTotals = document.getElementById('stdExcludeTotals');
+    const excludeNoise = document.getElementById('stdExcludeNoise');
+    if (excludeTotals) base.exclude_totals = excludeTotals.checked;
+    if (excludeNoise) base.exclude_noise = excludeNoise.checked;
+    return base;
+}
+
+function standardizeRoleColor(key) {
+    return (LAYOUT_ROLE_META[key] || {}).color || '#64748b';
+}
+
+function renderStandardizeWorkspace(payload) {
+    const host = elements.standardizeWorkspace;
+    const statusEl = document.getElementById('standardizeStatus');
+    if (!host) return;
+    if (!payload || payload.error) {
+        if (statusEl) {
+            statusEl.textContent = 'Failed';
+            statusEl.className = 'status-badge danger';
+        }
+        host.innerHTML = `<p class="standardize-error">${escapeHtml(payload?.error || 'Could not build a standard table.')}</p>`;
+        return;
+    }
+    if (statusEl) {
+        statusEl.textContent = payload.ok ? (payload.applied ? 'Saved' : 'Preview ready') : 'Needs review';
+        statusEl.className = payload.ok ? 'status-badge success' : 'status-badge warning';
+    }
+    const score = payload.complexity_score != null ? Number(payload.complexity_score) : null;
+    const cls = String(payload.classification || '');
+    const reasons = Array.isArray(payload.reasons) ? payload.reasons : [];
+    const roles = Array.isArray(payload.roles) ? payload.roles : [];
+    const assignment = payload.assignment || {};
+    const preview = payload.preview || {};
+    const columnRoles = payload.column_roles || preview.column_roles || {};
+    const columns = Array.isArray(preview.columns) ? preview.columns : [];
+    const rows = Array.isArray(preview.rows) ? preview.rows : [];
+
+    const roleCards = roles.map((role) => {
+        const key = role.key;
+        const color = standardizeRoleColor(key);
+        const editable = key === 'dimensions' && Array.isArray(role.names) && role.names.length;
+        const excludeCard = key === 'noise' || key === 'totals';
+        const namesHtml = editable
+            ? `<div class="standardize-dim-names">${role.names.map((name, i) => `
+                <label>Dimension ${i + 1} column name
+                    <input type="text" data-std-dim-name="${i}" value="${escapeAttr(name)}" />
+                </label>`).join('')}</div>`
+            : '';
+        const includeHtml = excludeCard
+            ? ''
+            : `<label class="inline-checkbox"><input type="checkbox" data-std-include="${escapeAttr(key)}" ${role.included ? 'checked' : ''} /> Include in standard table</label>`;
+        return `<article class="standardize-role-card" style="--role-color:${color}">
+            <h4>${escapeHtml(role.label || key)} <span class="role-kind">${escapeHtml(String(role.kind || ''))}</span></h4>
+            <p>${escapeHtml(String(role.detail || ''))}</p>
+            ${includeHtml}
+            ${namesHtml}
+        </article>`;
+    }).join('');
+
+    const head = columns.map((col) => {
+        const role = columnRoles[col] || '';
+        const color = role === 'date' ? LAYOUT_ROLE_META.time.color
+            : role === 'dimension' ? LAYOUT_ROLE_META.dimensions.color
+            : LAYOUT_ROLE_META.metrics.color;
+        return `<th><span>${escapeHtml(col)}</span><span class="standardize-col-role" style="--role-color:${color}">${escapeHtml(role || 'metric')}</span></th>`;
+    }).join('');
+    const body = rows.map((row) => (
+        `<tr>${columns.map((col) => `<td title="${escapeAttr(String(row[col] ?? ''))}">${escapeHtml(String(row[col] ?? ''))}</td>`).join('')}</tr>`
+    )).join('');
+
+    host.innerHTML = `
+        <section class="standardize-intro">
+            <h3>Convert this messy sheet into a standard table</h3>
+            <p>
+                ${score != null ? `Complexity score ${escapeHtml(String(score))} · ` : ''}
+                Band: ${escapeHtml(cls || 'n/a')}
+                ${payload.sheet_type ? ` · ${escapeHtml(String(payload.sheet_type).replace(/_/g, ' '))}` : ''}.
+                Confirm Date / period, Dimensions, Metrics, and Values. Comments, noise, and totals stay out of the table.
+                The result has <strong>Date</strong>, dimension, and metric <strong>column headers</strong>, with one row per period × dimension combination — then column mapping uses this table.
+            </p>
+            ${reasons.length ? `<ul class="layout-complexity-reasons">${reasons.map((r) => `<li>${escapeHtml(String(r))}</li>`).join('')}</ul>` : ''}
+        </section>
+        <div class="standardize-role-grid">${roleCards}</div>
+        <div class="standardize-toggles">
+            <label><input type="checkbox" id="stdExcludeTotals" ${assignment.exclude_totals !== false ? 'checked' : ''} /> Exclude totals</label>
+            <label><input type="checkbox" id="stdExcludeNoise" ${assignment.exclude_noise !== false ? 'checked' : ''} /> Exclude comments / noise</label>
+        </div>
+        <section class="standardize-preview-wrap">
+            <h4>Standard table preview</h4>
+            <p class="standardize-preview-meta">${escapeHtml(payload.message || '')}${preview.row_count != null ? ` · ${preview.row_count} row(s)` : ''}</p>
+            ${columns.length ? `
+            <div class="table-container">
+                <table class="standardize-preview-table">
+                    <thead><tr>${head}</tr></thead>
+                    <tbody>${body || '<tr><td colspan="' + columns.length + '">No preview rows</td></tr>'}</tbody>
+                </table>
+            </div>` : `<p class="standardize-error">No standard columns yet. Adjust roles and click Generate table.</p>`}
+        </section>`;
+}
+
+async function loadStandardize(force = false) {
+    const host = elements.standardizeWorkspace;
+    const statusEl = document.getElementById('standardizeStatus');
+    if (host) {
+        host.innerHTML = `<div class="empty-state"><span class="spinner"></span><p>Building a standard Date / Dimensions / Metrics table…</p></div>`;
+    }
+    if (statusEl) {
+        statusEl.textContent = 'Generating…';
+        statusEl.className = 'status-badge scanning';
+    }
+    try {
+        if (!currentJobId) throw new Error('No active job.');
+        let payload;
+        if (force) {
+            const r = await fetch(`/api/layout/standardize/${currentJobId}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    source_id: currentSourceId,
+                    sheet_name: currentSheet,
+                    assignment: collectStandardizeAssignment(),
+                    apply: false,
+                }),
+            });
+            payload = await r.json();
+            if (!r.ok || payload.error) throw new Error(payload.error || `Standardize failed (${r.status})`);
+        } else {
+            const qs = new URLSearchParams();
+            if (currentSheet) qs.set('sheet_name', currentSheet);
+            if (currentSourceId) qs.set('source_id', currentSourceId);
+            const r = await fetch(`/api/layout/standardize/preview/${currentJobId}?${qs}`, { cache: 'no-store' });
+            payload = await r.json();
+            if (!r.ok || payload.error) throw new Error(payload.error || `Standardize preview failed (${r.status})`);
+        }
+        standardizeState = payload;
+        renderStandardizeWorkspace(payload);
+    } catch (e) {
+        standardizeState = { error: e.message };
+        renderStandardizeWorkspace(standardizeState);
+        showToast(e.message, 'error');
+    }
+}
+
+async function confirmStandardizeAndOpenMapping() {
+    const btn = elements.confirmStandardizeMapBtn;
+    if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner"></span> Saving…';
+    }
+    try {
+        if (!currentJobId) throw new Error('No active job.');
+        const r = await fetch(`/api/layout/standardize/${currentJobId}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                source_id: currentSourceId,
+                sheet_name: currentSheet,
+                assignment: collectStandardizeAssignment(),
+                apply: true,
+            }),
+        });
+        const payload = await r.json();
+        if (!r.ok || payload.error || !payload.ok) {
+            throw new Error(payload.error || payload.message || `Could not save standard table (${r.status})`);
+        }
+        standardizeState = payload;
+        renderStandardizeWorkspace(payload);
+        switchStep(SETUP_STEP_COLUMN_STD);
+        showToast('Standard table saved — split/combine columns, then map attributes.', 'success');
+    } catch (e) {
+        showToast(e.message, 'error');
+    } finally {
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = 'Use table & continue →';
+        }
+    }
+}
+
+function attrTargetOptions(selected, targets, { includeCustom = false } = {}) {
+    const normalized = (targets || []).map((t) => {
+        if (typeof t === 'string') return { id: t, name: t };
+        return { id: t.id || '', name: t.name || t.id || '' };
+    }).filter((t) => t.id);
+    normalized.sort((a, b) => String(a.name).localeCompare(String(b.name), undefined, { sensitivity: 'base' }));
+    const opts = [`<option value="">— attribute —</option>`];
+    for (const t of normalized) {
+        opts.push(`<option value="${escapeAttr(t.id)}" ${t.id === selected ? 'selected' : ''}>${escapeHtml(t.name)}</option>`);
+    }
+    if (includeCustom) {
+        const customSel = selected === COLSTD_CUSTOM ? 'selected' : '';
+        opts.push(`<option value="${COLSTD_CUSTOM}" ${customSel}>Name a new dimension…</option>`);
+    }
+    return opts.join('');
+}
+
+/** Ensure each split has a `parts[]` model for the Column shaping UI. */
+function normalizeColumnStdSplit(cf) {
+    if (!cf || typeof cf !== 'object') return cf;
+    const dims = Array.isArray(cf.target_dimensions) ? [...cf.target_dimensions] : [];
+    const partSamples = Array.isArray(cf.part_samples) ? cf.part_samples : [];
+    let parts = Array.isArray(cf.parts) ? cf.parts.map((p) => ({ ...p })) : null;
+    const n = Math.max(
+        Number(cf.part_count) || 0,
+        dims.length,
+        partSamples.length,
+        parts ? parts.length : 0,
+        2,
+    );
+    while (dims.length < n) dims.push('');
+    if (!parts || parts.length === 0) {
+        parts = [];
+        for (let i = 0; i < n; i += 1) {
+            const t = dims[i] || '';
+            parts.push({
+                index: i,
+                sample: partSamples[i] || '',
+                combine_with_previous: false,
+                target: t && t !== COLSTD_CUSTOM ? t : '',
+                custom_name: '',
+            });
+        }
+    } else {
+        while (parts.length < n) {
+            const i = parts.length;
+            parts.push({
+                index: i,
+                sample: partSamples[i] || '',
+                combine_with_previous: false,
+                target: dims[i] || '',
+                custom_name: '',
+            });
+        }
+        parts = parts.slice(0, n).map((p, i) => ({
+            index: i,
+            sample: p.sample || partSamples[i] || '',
+            combine_with_previous: i > 0 && Boolean(p.combine_with_previous),
+            target: p.target === COLSTD_CUSTOM ? COLSTD_CUSTOM : (p.target || ''),
+            custom_name: p.custom_name || '',
+        }));
+    }
+    cf.part_count = n;
+    cf.parts = parts;
+    cf.target_dimensions = dims;
+    if (cf.single_dimension == null) cf.single_dimension = false;
+    if (cf.accepted == null) cf.accepted = !cf.single_dimension;
+    cf.single_target = cf.single_target || '';
+    cf.single_custom_name = cf.single_custom_name || '';
+    return cf;
+}
+
+/** Collapse parts with combine_with_previous into output_columns for persistence. */
+function syncSplitDerivedFields(cf) {
+    if (!cf || !Array.isArray(cf.parts)) return;
+    const dims = [];
+    const outputs = [];
+    let current = null;
+    for (const part of cf.parts) {
+        dims.push(
+            part.combine_with_previous && current
+                ? (current.target === COLSTD_CUSTOM ? '' : current.target)
+                : (part.target === COLSTD_CUSTOM ? '' : (part.target || '')),
+        );
+        if (part.combine_with_previous && current) {
+            current.part_indexes.push(part.index);
+            continue;
+        }
+        const isCustom = part.target === COLSTD_CUSTOM || (!part.target && part.custom_name);
+        current = {
+            part_indexes: [part.index],
+            target: isCustom ? '' : (part.target || ''),
+            custom_name: isCustom ? (part.custom_name || '') : '',
+        };
+        outputs.push(current);
+    }
+    cf.target_dimensions = dims;
+    cf.output_columns = outputs;
+}
+
+async function loadColumnStd(force = false) {
+    const ws = elements.columnStdWorkspace;
+    if (!ws || !currentJobId || !currentSourceId) return;
+    if (!force && columnStdState && columnStdState.source_id === currentSourceId) {
+        renderColumnStdWorkspace(columnStdState);
+        return;
+    }
+    ws.innerHTML = '<div class="empty-state"><span class="spinner"></span><p>Detecting multipart columns…</p></div>';
+    const status = document.getElementById('columnStdStatus');
+    if (status) {
+        status.textContent = 'Loading…';
+        status.className = 'status-badge scanning';
+    }
+    try {
+        const data = await fetchJson(
+            `/api/column-standardize/propose/${encodeURIComponent(currentJobId)}?source_id=${encodeURIComponent(currentSourceId)}`,
+        );
+        const splits = (Array.isArray(data.splits) ? data.splits : []).map((s) => normalizeColumnStdSplit({ ...s }));
+        const attrLabels = [
+            ...(Array.isArray(data.attribute_options) ? data.attribute_options : []),
+            ...(data.media_hierarchy || []).map((l) => ({ id: l.id, name: l.name })),
+            ...(data.common_attributes || []).map((a) => ({ id: a.id, name: a.name })),
+        ];
+        const labelById = {};
+        for (const a of attrLabels) {
+            if (a && a.id) labelById[a.id] = a.name || a.id;
+        }
+        const targetOptsList = (data.attribute_options && data.attribute_options.length)
+            ? data.attribute_options.map((t) => ({ id: t.id, name: t.name || t.id }))
+            : (data.attribute_targets || []).map((t) => ({ id: t, name: labelById[t] || t }));
+        columnStdState = {
+            source_id: currentSourceId,
+            columns: data.columns || [],
+            splits,
+            combines: Array.isArray(data.combines) ? data.combines.map((c) => ({ ...c })) : [],
+            destination_grain_columns: Array.isArray(data.destination_grain_columns)
+                ? [...data.destination_grain_columns]
+                : [],
+            attribute_targets: data.attribute_targets || [],
+            attribute_options: targetOptsList,
+            media_hierarchy: data.media_hierarchy || [],
+            common_attributes: data.common_attributes || [],
+        };
+        renderColumnStdWorkspace(columnStdState);
+        if (status) {
+            const n = splits.length;
+            status.textContent = n ? `${n} multipart` : 'Ready';
+            status.className = n ? 'status-badge warning' : 'status-badge';
+        }
+    } catch (e) {
+        columnStdState = { error: e.message, source_id: currentSourceId };
+        if (ws) ws.innerHTML = `<div class="empty-state"><p class="standardize-error">${escapeHtml(e.message)}</p></div>`;
+        if (status) {
+            status.textContent = 'Error';
+            status.className = 'status-badge';
+        }
+        showToast(e.message, 'error');
+    }
+}
+
+function renderColumnStdWorkspace(state) {
+    const ws = elements.columnStdWorkspace;
+    if (!ws) return;
+    if (!state || state.error) {
+        ws.innerHTML = `<div class="empty-state"><p class="standardize-error">${escapeHtml(state?.error || 'No data')}</p></div>`;
+        return;
+    }
+    const targets = state.attribute_options || state.attribute_targets || [];
+    const attrLabels = [
+        ...(state.media_hierarchy || []).map((l) => ({ id: l.id, name: l.name })),
+        ...(state.common_attributes || []).map((a) => ({ id: a.id, name: a.name })),
+        ...(Array.isArray(state.attribute_options) ? state.attribute_options : []),
+    ];
+    const labelById = Object.fromEntries(attrLabels.filter((a) => a && a.id).map((a) => [a.id, a.name || a.id]));
+    const targetOptsList = Array.isArray(state.attribute_options) && state.attribute_options.length
+        ? state.attribute_options
+        : (targets || []).map((t) => (typeof t === 'string' ? { id: t, name: labelById[t] || t } : t));
+    const multipartCols = new Set((state.splits || []).map((s) => s.source_column));
+
+    const splitsHtml = (state.splits || []).map((cf, idx) => {
+        normalizeColumnStdSplit(cf);
+        const modeSplit = !cf.single_dimension;
+        const delim = cf.delimiter || '';
+        const status = cf.single_dimension
+            ? '<span class="hierarchy-pill muted">Keep as single</span>'
+            : '<span class="hierarchy-pill ok">Split</span>';
+
+        let body = '';
+        if (!modeSplit) {
+            const singleSel = (cf.single_target === COLSTD_CUSTOM || cf.single_custom_name)
+                ? COLSTD_CUSTOM
+                : (cf.single_target || '');
+            body = `
+                <div class="column-std-single-row">
+                    <label>Map whole column to
+                        <select class="sia-select sia-select--compact" data-colstd-action="single-target" data-split-idx="${idx}">
+                            ${attrTargetOptions(singleSel, targetOptsList, { includeCustom: true })}
+                        </select>
+                    </label>
+                    <input type="text" class="${singleSel === COLSTD_CUSTOM ? '' : 'hidden'}"
+                        data-colstd-action="single-custom" data-split-idx="${idx}"
+                        placeholder="New dimension name"
+                        value="${escapeAttr(cf.single_custom_name || '')}">
+                </div>`;
+        } else {
+            const partRows = (cf.parts || []).map((part, pi) => {
+                const sel = part.custom_name && (!part.target || part.target === COLSTD_CUSTOM)
+                    ? COLSTD_CUSTOM
+                    : (part.target || '');
+                const showCustom = sel === COLSTD_CUSTOM;
+                return `<tr class="column-std-part-row" data-split-idx="${idx}" data-part-idx="${pi}">
+                    <td class="column-std-part-idx">Part ${pi + 1}</td>
+                    <td class="column-std-part-sample"><code>${escapeHtml(part.sample || '—')}</code></td>
+                    <td>${pi === 0 ? '—' : `<label class="column-std-combine-chk">
+                        <input type="checkbox" data-colstd-action="combine-prev" data-split-idx="${idx}" data-part-idx="${pi}"
+                            ${part.combine_with_previous ? 'checked' : ''}>
+                        Combine with previous
+                    </label>`}</td>
+                    <td>
+                        <select class="sia-select sia-select--compact" data-colstd-action="part-target" data-split-idx="${idx}" data-part-idx="${pi}"
+                            ${part.combine_with_previous ? 'disabled' : ''}>
+                            ${attrTargetOptions(sel, targetOptsList, { includeCustom: true })}
+                        </select>
+                        <input type="text" class="column-std-custom-name sia-input ${showCustom && !part.combine_with_previous ? '' : 'hidden'}"
+                            data-colstd-action="part-custom" data-split-idx="${idx}" data-part-idx="${pi}"
+                            placeholder="New dimension name"
+                            value="${escapeAttr(part.custom_name || '')}"
+                            ${part.combine_with_previous ? 'disabled' : ''}>
+                    </td>
+                </tr>`;
+            }).join('');
+            body = `
+                <div class="column-std-parts-wrap">
+                    <p class="column-std-parts-hint">Assign each part to a media dimension, or combine adjacent parts into one column.</p>
+                    <table class="column-std-parts-table">
+                        <thead><tr><th></th><th>Sample</th><th>Combine</th><th>Output dimension</th></tr></thead>
+                        <tbody>${partRows}</tbody>
+                    </table>
+                </div>`;
+        }
+
+        return `<div class="column-std-split-card" data-split-idx="${idx}">
+            <div class="column-std-split-head">
+                <div>
+                    <strong>${escapeHtml(cf.source_column)}</strong>
+                    <span class="column-std-multipart-badge" title="${escapeAttr(cf.reason || '')}">Multipart · “${escapeHtml(delim)}”</span>
+                    ${status}
+                </div>
+                <div class="column-std-mode-toggle" role="group" aria-label="Split or keep single">
+                    <button type="button" class="btn-sm ${modeSplit ? 'btn-primary' : 'btn-secondary'}"
+                        data-colstd-action="accept-split" data-split-idx="${idx}">Split</button>
+                    <button type="button" class="btn-sm ${!modeSplit ? 'btn-primary' : 'btn-secondary'}"
+                        data-colstd-action="keep-single" data-split-idx="${idx}">Keep as single</button>
+                </div>
+            </div>
+            <div class="hierarchy-combined-samples">${escapeHtml((cf.samples || []).slice(0, 4).join(' · '))}</div>
+            ${body}
+        </div>`;
+    }).join('') || '<p class="hierarchy-source-meta">No multipart columns detected on this sheet.</p>';
+
+    const otherCols = (state.columns || []).filter((c) => !multipartCols.has(c));
+    const otherHtml = otherCols.length
+        ? `<details class="column-std-other"><summary>Other columns (${otherCols.length}) — not multipart</summary>
+            <p class="hierarchy-source-meta">${escapeHtml(otherCols.join(', '))}</p></details>`
+        : '';
+
+    const grainChecks = (state.media_hierarchy || []).map((lv) => {
+        const checked = (state.destination_grain_columns || []).includes(lv.id);
+        return `<label class="column-std-grain-chip">
+            <input type="checkbox" data-colstd-action="grain" value="${escapeAttr(lv.id)}" ${checked ? 'checked' : ''}>
+            ${escapeHtml(lv.name)}
+        </label>`;
+    }).join('');
+
+    ws.innerHTML = `
+        <div class="column-std-intro">
+            <p>Columns with multipart text (stable separator) are marked below. Choose <strong>Split</strong> or <strong>Keep as single</strong>.
+            After a split, combine adjacent parts into one output and map each output to a media dimension — or name a new one.</p>
+        </div>
+        <section class="column-std-block">
+            <h3>Multipart columns</h3>
+            <div class="column-std-splits">${splitsHtml}</div>
+            ${otherHtml}
+        </section>
+        <section class="column-std-block">
+            <h3>Destination grain columns (Schema Mapping)</h3>
+            <div class="column-std-grains">${grainChecks}</div>
+        </section>
+    `;
+
+    if (ws.dataset.bound !== '1') {
+        ws.dataset.bound = '1';
+        ws.addEventListener('change', onColumnStdChange);
+        ws.addEventListener('click', onColumnStdClick);
+        ws.addEventListener('input', onColumnStdChange);
+    }
+}
+
+function onColumnStdChange(e) {
+    const el = e.target;
+    const action = el.dataset?.colstdAction;
+    if (!action || !columnStdState) return;
+    const si = Number(el.dataset.splitIdx);
+    const pi = Number(el.dataset.partIdx);
+    const split = columnStdState.splits?.[si];
+
+    if (action === 'part-target' && split?.parts?.[pi]) {
+        const part = split.parts[pi];
+        if (el.value === COLSTD_CUSTOM) {
+            part.target = COLSTD_CUSTOM;
+        } else {
+            part.target = el.value;
+            part.custom_name = '';
+        }
+        syncSplitDerivedFields(split);
+        renderColumnStdWorkspace(columnStdState);
+    } else if (action === 'part-custom' && split?.parts?.[pi]) {
+        split.parts[pi].custom_name = el.value;
+        split.parts[pi].target = COLSTD_CUSTOM;
+        syncSplitDerivedFields(split);
+    } else if (action === 'combine-prev' && split?.parts?.[pi]) {
+        split.parts[pi].combine_with_previous = Boolean(el.checked);
+        syncSplitDerivedFields(split);
+        renderColumnStdWorkspace(columnStdState);
+    } else if (action === 'single-target' && split) {
+        if (el.value === COLSTD_CUSTOM) {
+            split.single_target = COLSTD_CUSTOM;
+        } else {
+            split.single_target = el.value;
+            split.single_custom_name = '';
+        }
+        renderColumnStdWorkspace(columnStdState);
+    } else if (action === 'single-custom' && split) {
+        split.single_custom_name = el.value;
+        split.single_target = COLSTD_CUSTOM;
+    } else if (action === 'grain') {
+        const id = el.value;
+        const set = new Set(columnStdState.destination_grain_columns || []);
+        if (el.checked) set.add(id);
+        else set.delete(id);
+        columnStdState.destination_grain_columns = [...set];
+    }
+    scheduleColumnStdSave();
+}
+
+function onColumnStdClick(e) {
+    const btn = e.target.closest('[data-colstd-action]');
+    if (!btn || !columnStdState) return;
+    const action = btn.dataset.colstdAction;
+    if (action === 'accept-split') {
+        const split = columnStdState.splits[Number(btn.dataset.splitIdx)];
+        if (split) {
+            split.accepted = true;
+            split.single_dimension = false;
+            normalizeColumnStdSplit(split);
+            syncSplitDerivedFields(split);
+            renderColumnStdWorkspace(columnStdState);
+            scheduleColumnStdSave();
+        }
+    } else if (action === 'keep-single') {
+        const split = columnStdState.splits[Number(btn.dataset.splitIdx)];
+        if (split) {
+            split.accepted = false;
+            split.single_dimension = true;
+            renderColumnStdWorkspace(columnStdState);
+            scheduleColumnStdSave();
+        }
+    }
+}
+
+function scheduleColumnStdSave() {
+    columnStdDirty = true;
+    if (columnStdSaveTimer) clearTimeout(columnStdSaveTimer);
+    columnStdSaveTimer = setTimeout(() => {
+        columnStdSaveTimer = null;
+        void persistColumnStdDraft(false);
+    }, 600);
+}
+
+function resolveColumnStdSourceId() {
+    if (currentSourceId) return String(currentSourceId);
+    if (columnStdState?.source_id) return String(columnStdState.source_id);
+    const first = (lastSetupSources || [])[0] || (setupSourceRegistryOrder || [])[0];
+    return first?.source_id ? String(first.source_id) : '';
+}
+
+function prepareColumnStdPayload(complete) {
+    if (!columnStdState) return null;
+    const sourceId = resolveColumnStdSourceId();
+    if (!sourceId) return null;
+    for (const s of columnStdState.splits || []) {
+        normalizeColumnStdSplit(s);
+        // Explicit Split mode (not keep-as-single) must be marked accepted on save
+        if (complete && !s.single_dimension) {
+            s.accepted = true;
+        }
+        syncSplitDerivedFields(s);
+        if (s.single_target === COLSTD_CUSTOM) s.single_target = '';
+        for (const p of s.parts || []) {
+            if (p.target === COLSTD_CUSTOM) p.target = '';
+        }
+        for (const o of s.output_columns || []) {
+            if (o.target === COLSTD_CUSTOM) o.target = '';
+        }
+    }
+    return {
+        source_id: sourceId,
+        sheet_name: currentSheet || columnStdState.sheet_name || '',
+        splits: columnStdState.splits || [],
+        combines: columnStdState.combines || [],
+        destination_grain_columns: columnStdState.destination_grain_columns || [],
+        complete: Boolean(complete),
+    };
+}
+
+async function persistColumnStdDraft(complete = false) {
+    const sourceId = resolveColumnStdSourceId();
+    if (!currentJobId) {
+        console.warn('Column shaping save skipped: no job_id');
+        return false;
+    }
+    if (!sourceId) {
+        console.warn('Column shaping save skipped: no source_id');
+        return false;
+    }
+    if (!columnStdState || columnStdState.error) {
+        console.warn('Column shaping save skipped: no valid state');
+        return false;
+    }
+    currentSourceId = sourceId;
+    const payload = prepareColumnStdPayload(complete);
+    if (!payload) return false;
+    try {
+        const res = await fetch(`/api/column-standardize/save/${encodeURIComponent(currentJobId)}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.error) {
+            const msg = data.error || data.message || `Save failed (${res.status})`;
+            throw new Error(msg);
+        }
+        columnStdDirty = false;
+        try {
+            if (data.ux_stepper_summary) {
+                refreshUxStepperFromJob({
+                    ...(lastSetupJobForHeader || {}),
+                    ux_stepper_summary: data.ux_stepper_summary,
+                    ux_source_progress: data.ux_stepper_summary.ux_source_progress,
+                });
+            }
+        } catch (uiErr) {
+            console.warn('UX refresh after column shaping save failed', uiErr);
+        }
+        return true;
+    } catch (e) {
+        console.warn('Column shaping draft save failed', e);
+        persistColumnStdDraft.lastError = e?.message || String(e);
+        return false;
+    }
+}
+
+function flushSetupDraftsBeacon() {
+    try {
+        if (setupUiStep === SETUP_STEP_MAPPING && getAllMappingRows().length > 0 && currentJobId) {
+            const rows = sanitizeMappingForApi(getAllMappingRows());
+            const body = JSON.stringify({
+                mapping: rows,
+                sheet_name: currentSheet,
+                source_id: currentSourceId,
+            });
+            if (navigator.sendBeacon) {
+                navigator.sendBeacon(
+                    `/api/mapping/submit/${encodeURIComponent(currentJobId)}`,
+                    new Blob([body], { type: 'application/json' }),
+                );
+            } else {
+                void persistMappingDraft();
+            }
+        }
+        if (columnStdState && currentJobId && currentSourceId && columnStdDirty) {
+            const payload = prepareColumnStdPayload(false);
+            if (payload && navigator.sendBeacon) {
+                navigator.sendBeacon(
+                    `/api/column-standardize/save/${encodeURIComponent(currentJobId)}`,
+                    new Blob([JSON.stringify(payload)], { type: 'application/json' }),
+                );
+                columnStdDirty = false;
+            } else if (payload) {
+                void persistColumnStdDraft(false);
+            }
+        }
+    } catch (e) {
+        console.warn('flushSetupDraftsBeacon failed', e);
+    }
+}
+
+async function confirmColumnStdAndOpenMapping() {
+    const btn = elements.confirmColumnStdBtn;
+    if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner"></span> Saving…';
+    }
+    try {
+        if (!currentJobId) throw new Error('No active job. Return to Upload and open this job again.');
+        if (!resolveColumnStdSourceId()) throw new Error('No active sheet/source selected.');
+        if (!columnStdState || columnStdState.error) await loadColumnStd(true);
+        if (!columnStdState || columnStdState.error) {
+            throw new Error(columnStdState?.error || 'Column shaping is not ready yet.');
+        }
+        persistColumnStdDraft.lastError = '';
+        const ok = await persistColumnStdDraft(true);
+        if (!ok) {
+            throw new Error(persistColumnStdDraft.lastError || 'Could not save column shaping.');
+        }
+        switchStep(SETUP_STEP_MAPPING);
+        showToast('Column shaping saved — map columns to media attributes.', 'success');
+    } catch (e) {
+        showToast(e.message || 'Could not save column shaping.', 'error');
+    } finally {
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = 'Save & map →';
+        }
+    }
+}
+
 // ===== Transitions =====
 
 function switchStep(step) {
     const demSticky = document.getElementById('demarcationToolbarStickyRow');
+    const stdSticky = document.getElementById('standardizeToolbarStickyRow');
+    const colStdSticky = document.getElementById('columnStdToolbarStickyRow');
     const mapSticky = document.getElementById('mappingToolbarStickyRow');
-    if (step === 1) {
-        setupUiStep = 1;
-        if (elements.tabDemarcation) elements.tabDemarcation.classList.add('active');
-        if (elements.tabMapping) elements.tabMapping.classList.remove('active');
-        elements.demarcationSection.classList.remove('hidden');
-        elements.mappingSection.classList.add('hidden');
-        if (demSticky) demSticky.classList.remove('hidden');
-        if (mapSticky) mapSticky.classList.add('hidden');
-        loadDemarcation(false);
-    } else {
-        setupUiStep = 2;
-        if (elements.tabDemarcation) elements.tabDemarcation.classList.remove('active');
-        if (elements.tabMapping) elements.tabMapping.classList.add('active');
-        elements.demarcationSection.classList.add('hidden');
-        elements.mappingSection.classList.remove('hidden');
-        if (demSticky) demSticky.classList.add('hidden');
-        if (mapSticky) mapSticky.classList.remove('hidden');
-        const cachedRows = getAllMappingRows();
-        const hasSamples = cachedRows.some(
-            (col) => Array.isArray(col?.unique_values) && col.unique_values.length > 0,
-        );
-        if (cachedRows.length > 0 && hasSamples) {
-            renderMappingCards();
-            const statusEl = document.getElementById('mappingStatus');
-            if (statusEl) {
-                statusEl.textContent = 'Mapping Ready';
-                statusEl.className = 'status-badge success';
-            }
-        } else {
-            loadMapping(false);
+    const prev = setupUiStep;
+    const next = Number(step);
+
+    // Best-effort flush when leaving a step (nav / back) so drafts aren't lost
+    if (prev === SETUP_STEP_MAPPING && next !== SETUP_STEP_MAPPING) {
+        if (mappingSaveTimer) {
+            clearTimeout(mappingSaveTimer);
+            mappingSaveTimer = null;
         }
+        void persistMappingDraft();
+    }
+    if (prev === SETUP_STEP_COLUMN_STD && next !== SETUP_STEP_COLUMN_STD && columnStdState && columnStdDirty) {
+        if (columnStdSaveTimer) {
+            clearTimeout(columnStdSaveTimer);
+            columnStdSaveTimer = null;
+        }
+        void persistColumnStdDraft(false);
+    }
+
+    setupUiStep = next;
+    if (layoutMinimapWantExpanded && next !== SETUP_STEP_LAYOUT) setLayoutMinimapExpanded(false);
+
+    const showLayout = next === SETUP_STEP_LAYOUT;
+    const showStd = next === SETUP_STEP_STANDARDIZE;
+    const showColStd = next === SETUP_STEP_COLUMN_STD;
+    const showMap = next === SETUP_STEP_MAPPING;
+
+    if (elements.tabDemarcation) elements.tabDemarcation.classList.toggle('active', showLayout);
+    if (elements.tabMapping) elements.tabMapping.classList.toggle('active', showMap);
+    if (elements.demarcationSection) elements.demarcationSection.classList.toggle('hidden', !showLayout);
+    if (elements.standardizeSection) elements.standardizeSection.classList.toggle('hidden', !showStd);
+    if (elements.columnStdSection) elements.columnStdSection.classList.toggle('hidden', !showColStd);
+    if (elements.mappingSection) elements.mappingSection.classList.toggle('hidden', !showMap);
+    if (demSticky) demSticky.classList.toggle('hidden', !showLayout);
+    if (stdSticky) stdSticky.classList.toggle('hidden', !showStd);
+    if (colStdSticky) colStdSticky.classList.toggle('hidden', !showColStd);
+    if (mapSticky) mapSticky.classList.toggle('hidden', !showMap);
+
+    if (showLayout) {
+        loadDemarcation(false);
+    } else if (showStd) {
+        loadStandardize(false);
+    } else if (showColStd) {
+        loadColumnStd(false);
+    } else if (showMap) {
+        mappingProposal = null;
+        mappingBlocks = null;
+        loadMapping(false);
     }
     refreshUxStepperFromJob(lastSetupJobForHeader);
 }
@@ -2793,7 +4889,7 @@ async function persistCurrentMappingSilently() {
     if (!currentJobId || rows.length === 0) {
         return;
     }
-    if (setupUiStep !== 2) return;
+    if (setupUiStep !== SETUP_STEP_MAPPING) return;
     const r = await fetch(`/api/mapping/submit/${currentJobId}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2884,7 +4980,7 @@ async function skipAndAutoProcess() {
         return;
     }
     try {
-        if (setupUiStep === 2 && mappingProposal && mappingProposal.length > 0) {
+        if (setupUiStep === SETUP_STEP_MAPPING && mappingProposal && mappingProposal.length > 0) {
             try {
                 await persistCurrentMappingSilently();
             } catch (e) {

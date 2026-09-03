@@ -88,6 +88,7 @@ class AgentState(TypedDict):
     iteration: int
     max_iterations: int
     suggested_tools: List[Dict[str, Any]]
+    last_replan_tools: NotRequired[List[Dict[str, Any]]]
     verifier_issues: List[Dict[str, Any]] # NEW: To surface in UI
     
     # ========== Output ==========
@@ -343,27 +344,28 @@ def create_checkpoint(state: AgentState) -> Dict[str, Any]:
 def is_stalled(state: AgentState) -> bool:
     """
     Check if the agent is stuck in an unproductive loop.
-    
-    Triggers:
-    1. Confidence plateau: Minimum progress in last 2 iterations.
-    2. Repeated issues: Same critical issue type found multiple times.
+
+    High confidence is not a stall — 0.85+ means the verifier is largely happy
+    and remaining gaps should finish via max-iterations → finalize, not HITL.
     """
-    trajectory = state.get("confidence_trajectory", [])
+    trajectory = [float(x) for x in (state.get("confidence_trajectory") or []) if x is not None]
+    latest = trajectory[-1] if trajectory else 0.0
+    if latest >= 0.85:
+        return False
+
     if len(trajectory) >= 3:
-        # Check for plateau (less than 5% improvement over last 2 steps)
         last_three = trajectory[-3:]
         if abs(last_three[-1] - last_three[-2]) < 0.05 and abs(last_three[-2] - last_three[-3]) < 0.05:
             return True
-            
-    # Check for repeated unresolved issues
+
     issues = state.get("issues_history", [])
     if issues:
         types = [i["issue_type"] for i in issues if not i.get("resolved")]
         from collections import Counter
         counts = Counter(types)
-        if any(count >= 2 for count in counts.values()):
+        if any(count >= 3 for count in counts.values()):
             return True
-            
+
     return False
 
 def should_rollback(state: AgentState) -> bool:

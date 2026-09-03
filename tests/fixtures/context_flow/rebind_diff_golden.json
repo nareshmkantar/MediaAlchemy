@@ -1,0 +1,18 @@
+[
+  {
+    "stage": "plan_rebind",
+    "source_id": "job:file:Radio_DE",
+    "field": "market",
+    "before": "UK",
+    "after": "DE",
+    "reason": "rebound market: 'UK' → 'DE' (source-local context)"
+  },
+  {
+    "stage": "plan_rebind",
+    "source_id": "job:file:Radio_DE",
+    "field": "channel",
+    "before": "digital",
+    "after": "radio",
+    "reason": "rebound channel: 'digital' → 'radio' (source-local context)"
+  }
+]

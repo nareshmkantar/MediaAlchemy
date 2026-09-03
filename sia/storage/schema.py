@@ -122,7 +122,8 @@ DDL_STATEMENTS: List[str] = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_derived_job ON derived_fields(job_id)",
     "CREATE INDEX IF NOT EXISTS idx_derived_target ON derived_fields(target_source_id)",
-    # Artifact metadata (one row per artifact version)
+    # Artifact metadata (one row per artifact version; includes context_block_snippets,
+    # interpreted_context, and normalized_dataframe refs — Phase 9.2)
     """
     CREATE TABLE IF NOT EXISTS artifacts (
         artifact_id TEXT PRIMARY KEY,

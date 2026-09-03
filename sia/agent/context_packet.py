@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -8,18 +8,220 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
 from .job_run_ledger import build_job_run_ledger_summary
+from .value_scale import enrich_mapping_value_scale, value_scale_summary_from_mappings
 from .target_template_utils import (
     is_no_match_target,
     mapping_targets_requiring_source,
     pre_transform_target_columns,
     template_column_rules_summary,
+    template_union_grain_columns,
     validate_template_shape,
 )
 
 
 KEEP_DECISIONS = {"keep", "metadata", "context", "use as context"}
-MAIN_BLOCK_DECISIONS = {"keep", "main data"}
+MAIN_BLOCK_DECISIONS = {"keep", "main data", "approved"}
 CONTEXT_BLOCK_DECISIONS = {"context", "metadata", "use as context"}
+DISCARD_BLOCK_DECISIONS = {"discard", "ignore", "noise"}
+
+
+def mapping_is_excluded(item: Optional[Dict[str, Any]]) -> bool:
+    """True when Guided Setup marked the source column Exclude / Discard."""
+    if not isinstance(item, dict):
+        return False
+    role = str(item.get("role") or "").strip().lower()
+    decision = str(item.get("decision") or "").strip().lower()
+    return role == "exclude" or decision == "discard"
+
+
+def excluded_source_column_name(item: Optional[Dict[str, Any]]) -> str:
+    if not mapping_is_excluded(item):
+        return ""
+    return str(
+        (item or {}).get("source_column")
+        or (item or {}).get("column_name")
+        or ""
+    ).strip()
+
+
+def _header_is_renamed_keep_target(
+    name_lower: str,
+    approved_mappings: Optional[List[Dict[str, Any]]],
+    present_lower: set[str],
+) -> bool:
+    """True when ``name_lower`` is a keep target already realized on the frame.
+
+    Used so Exclude of a raw Amazon ``date`` column does not delete ``date`` after
+    ``orderStartDate`` was renamed onto that template name. Before rename, the
+    keep source is still present, so the unused raw ``date`` column is dropped.
+    """
+    for item in approved_mappings or []:
+        if not isinstance(item, dict) or mapping_is_excluded(item):
+            continue
+        target = str(item.get("target_column") or "").strip()
+        if not target or is_no_match_target(target) or target.lower() != name_lower:
+            continue
+        source = str(item.get("source_column") or item.get("column_name") or "").strip().lower()
+        if not source or source == name_lower:
+            return True
+        if source not in present_lower:
+            return True
+    return False
+
+
+def drop_excluded_mapping_columns(
+    df: Optional[pd.DataFrame],
+    approved_mappings: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[Optional[pd.DataFrame], List[str]]:
+    """Drop Exclude/Discard source columns, matching headers case-insensitively.
+
+    After rename, a kept source (e.g. ``orderStartDate`` → ``date``) can share the
+    name of a different excluded source (Amazon DSP's unused ``date`` column).
+    Do not drop a header that is already the realized keep-mapping target.
+    """
+    if df is None:
+        return df, []
+    col_by_lower = {str(col).strip().lower(): col for col in df.columns}
+    present_lower = set(col_by_lower)
+    drop: List[Any] = []
+    seen: set[str] = set()
+    for item in approved_mappings or []:
+        name = excluded_source_column_name(item)
+        if not name:
+            continue
+        if _header_is_renamed_keep_target(name.lower(), approved_mappings, present_lower):
+            continue
+        actual = col_by_lower.get(name.lower())
+        if actual is None or str(actual) in seen:
+            continue
+        seen.add(str(actual))
+        drop.append(actual)
+    if not drop:
+        return df, []
+    return df.drop(columns=drop, errors="ignore"), [str(c) for c in drop]
+
+
+def _layout_registry_block_role(block: Dict[str, Any]) -> Optional[str]:
+    """Return ``main``, ``context``, or ``None`` (discarded). User decision overrides AI category."""
+    decision = str(block.get("decision") or "").strip().lower()
+    category = str(block.get("block_category") or block.get("category") or "").strip().lower()
+    cat_compact = category.replace(" ", "").replace("_", "")
+
+    if decision in CONTEXT_BLOCK_DECISIONS:
+        return "context"
+    if decision in DISCARD_BLOCK_DECISIONS:
+        return None
+    if decision in MAIN_BLOCK_DECISIONS:
+        return "main"
+    if cat_compact == "maindata":
+        return "main"
+    if category in {"metadata", "context", "supporting meta", "footnotes", "footnote"}:
+        return "context"
+    return None
+
+CONTEXT_PACKET_SCHEMA_VERSION = 2
+
+_CONTEXT_ONLY_EXACT = {
+    "summary",
+    "notes",
+    "note",
+    "readme",
+    "legend",
+    "glossary",
+    "instructions",
+    "metadata",
+}
+_CONTEXT_ONLY_PREFIXES = ("notes_", "note_", "readme_", "legend_", "meta_")
+_CONTEXT_ONLY_SUFFIXES = ("_notes", "_note", "_summary", "_readme", "_legend")
+_CONTEXT_ONLY_SUBSTRINGS = ("_notes_", "notes_global")
+
+
+def is_context_only_sheet_name(sheet_name: Optional[str]) -> bool:
+    """True when a workbook tab is reference/context (not a main data table to transform)."""
+    if not sheet_name:
+        return False
+    normalized = str(sheet_name).strip().lower().replace(" ", "_")
+    if not normalized:
+        return False
+    if normalized in _CONTEXT_ONLY_EXACT:
+        return True
+    if any(normalized.startswith(prefix) for prefix in _CONTEXT_ONLY_PREFIXES):
+        return True
+    if any(normalized.endswith(suffix) for suffix in _CONTEXT_ONLY_SUFFIXES):
+        return True
+    if any(token in normalized for token in _CONTEXT_ONLY_SUBSTRINGS):
+        return True
+    return False
+
+
+def source_registry_entry_is_main_data(source: Optional[Dict[str, Any]]) -> bool:
+    """True when a registry row should run through transform/plan/union (not context-only)."""
+    if not isinstance(source, dict):
+        return False
+    if source.get("contains_reference_data") or source.get("contains_summary_only"):
+        return False
+    if is_context_only_sheet_name(source.get("sheet_name")):
+        return False
+    raw_main = source.get("contains_main_data")
+    if raw_main is None:
+        return True
+    return bool(raw_main)
+
+
+def source_is_main_data_for_processing(job: Dict[str, Any], source: Optional[Dict[str, Any]]) -> bool:
+    """Layout save wins over registry tab heuristics when demarcation exists for the source."""
+    if not isinstance(source, dict):
+        return False
+    sid = str(source.get("source_id") or "").strip()
+    layouts = [
+        row
+        for row in (job.get("layout_registry") or [])
+        if isinstance(row, dict) and str(row.get("source_id") or "") == sid
+    ]
+    if layouts:
+        return any(_layout_registry_block_role(row) == "main" for row in layouts)
+    return source_registry_entry_is_main_data(source)
+
+
+def refresh_job_source_context_flags(job: Dict[str, Any]) -> None:
+    """Reconcile source_registry processing flags: saved layout overrides tab-name heuristics."""
+    registry = list(job.get("source_registry") or [])
+    layout_by_source: Dict[str, List[Dict[str, Any]]] = {}
+    for row in job.get("layout_registry") or []:
+        if not isinstance(row, dict):
+            continue
+        sid = str(row.get("source_id") or "").strip()
+        if sid:
+            layout_by_source.setdefault(sid, []).append(row)
+
+    changed = False
+    for row in registry:
+        if not isinstance(row, dict):
+            continue
+        sid = str(row.get("source_id") or "").strip()
+        layouts = layout_by_source.get(sid) or []
+        if layouts:
+            main_kept = sum(1 for block in layouts if _layout_registry_block_role(block) == "main")
+            context_kept = sum(1 for block in layouts if _layout_registry_block_role(block) == "context")
+            want_main = main_kept > 0
+            want_ref = not want_main and context_kept > 0
+            want_summary = want_ref
+        else:
+            context_only = is_context_only_sheet_name(row.get("sheet_name"))
+            want_main = not context_only
+            want_ref = context_only
+            want_summary = context_only
+        if (
+            row.get("contains_main_data") != want_main
+            or row.get("contains_reference_data") != want_ref
+            or row.get("contains_summary_only") != want_summary
+        ):
+            row["contains_main_data"] = want_main
+            row["contains_reference_data"] = want_ref
+            row["contains_summary_only"] = want_summary
+            changed = True
+    if changed:
+        job["source_registry"] = registry
 
 
 @dataclass
@@ -111,6 +313,12 @@ class MappingDecision:
     date_semantic: str = ""
     block_id: str = ""
     block_label: str = ""
+    value_scale: float = 1.0
+    value_scale_note: str = ""
+    metric_currency: str = ""
+    output_alias: str = ""
+    split_from: str = ""
+    packed_source_column: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -326,9 +534,24 @@ class ContextPacket:
     # for FILE_RELATIONSHIP_REVIEW (post-execution / web-layer review handles collation).
     defer_graph_file_relationship_review: bool = False
     job_run_ledger_summary: Dict[str, Any] = field(default_factory=dict)
+    context_fingerprint: Optional[str] = None
+    _schema_version: Optional[int] = field(default=None, compare=False, repr=False)
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        out = asdict(self)
+        if out.get("_schema_version") is None:
+            out.pop("_schema_version", None)
+        return out
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict[str, Any]]) -> "ContextPacket":
+        """Construct from a serialized packet dict (tolerates unknown / meta keys)."""
+        row = dict(data or {})
+        known = {f.name for f in fields(cls)}
+        filtered = {k: v for k, v in row.items() if k in known}
+        if "job_id" not in filtered:
+            filtered["job_id"] = str(row.get("job_id") or "")
+        return cls(**filtered)
 
     def planning_summary(self) -> Dict[str, Any]:
         interpreted_fields = dict((self.interpreted_context or {}).get("fields") or {})
@@ -350,6 +573,11 @@ class ContextPacket:
             "brand": self.source_metadata.get("brand"),
             "campaign": self.source_metadata.get("campaign"),
             "owner": self.source_metadata.get("owner"),
+            "media_hierarchy": (
+                (self.source_metadata.get("extra_metadata") or {}).get("media_hierarchy")
+                if isinstance(self.source_metadata.get("extra_metadata"), dict)
+                else self.source_metadata.get("media_hierarchy")
+            ),
         }
         for key, value in interpreted_fields.items():
             if key in effective_source_summary and not str(effective_source_summary.get(key) or "").strip():
@@ -362,10 +590,10 @@ class ContextPacket:
             source_column = mapping.get("source_column", "")
             target_column = mapping.get("target_column", "")
             decision = str(mapping.get("decision", "")).strip().lower()
-            if decision in KEEP_DECISIONS and target_column and target_column != "No match":
-                mapped_columns.append(f"{source_column} -> {target_column}")
-            elif decision == "discard" and source_column:
+            if mapping_is_excluded(mapping) and source_column:
                 excluded_columns.append(source_column)
+            elif decision in KEEP_DECISIONS and target_column and target_column != "No match":
+                mapped_columns.append(f"{source_column} -> {target_column}")
 
         template_properties = self.target_template.get("properties", {}) if isinstance(self.target_template, dict) else {}
         need_source_map = (
@@ -434,6 +662,7 @@ class ContextPacket:
             },
             "interpreted_context": {
                 "fields": interpreted_fields,
+                "scoped_fields": dict((self.interpreted_context or {}).get("scoped_fields") or {}),
                 "assumptions": list((self.interpreted_context or {}).get("assumptions") or [])[:10],
                 "evidence": list((self.interpreted_context or {}).get("evidence") or [])[:12],
             },
@@ -442,6 +671,7 @@ class ContextPacket:
                 "mapped_count": len(mapped_columns),
                 "excluded_columns": excluded_columns[:20],
                 "unresolved_target_columns": unresolved_targets[:20],
+                "value_scale_notes": value_scale_summary_from_mappings(self.approved_mappings)[:12],
             },
             "rules_summary": rules_summary[:20],
             "user_notes": self.user_notes[:10],
@@ -517,30 +747,18 @@ def build_canonical_planning_view(
     if not isinstance(context_packet, dict) or not context_packet:
         return {}
     try:
-        packet = ContextPacket(
-            job_id=str(context_packet.get("job_id") or ""),
-            source_metadata=dict(context_packet.get("source_metadata") or {}),
-            available_sources=list(context_packet.get("available_sources") or []),
-            available_source_summaries=list(context_packet.get("available_source_summaries") or []),
-            approved_layout=dict(context_packet.get("approved_layout") or {}),
-            context_block_snippets=list(context_packet.get("context_block_snippets") or []),
-            interpreted_context=dict(context_packet.get("interpreted_context") or {}),
-            approved_mappings=list(context_packet.get("approved_mappings") or []),
-            business_rules=list(context_packet.get("business_rules") or []),
-            target_template=dict(context_packet.get("target_template") or {}),
-            pre_transform_target_columns=list(context_packet.get("pre_transform_target_columns") or []),
-            file_relationships=list(context_packet.get("file_relationships") or []),
-            user_notes=list(context_packet.get("user_notes") or []),
-            unresolved_items=list(context_packet.get("unresolved_items") or []),
-            lineage=dict(context_packet.get("lineage") or {}),
-            approval_state=dict(context_packet.get("approval_state") or {}),
-            defer_graph_file_relationship_review=bool(
-                context_packet.get("defer_graph_file_relationship_review")
-            ),
-        )
+        packet = ContextPacket.from_dict(context_packet)
     except TypeError:
         return dict(context_packet.get("planning_summary") or {})
-    return packet.canonical_planning_view(mapping_supplement=mapping_supplement)
+    view = packet.canonical_planning_view(mapping_supplement=mapping_supplement)
+    from sia.context.planner_context import apply_boundary_sanitization_to_view
+
+    sid = str(
+        (context_packet.get("lineage") or {}).get("source_id")
+        or (context_packet.get("source_metadata") or {}).get("source_id")
+        or ""
+    ).strip()
+    return apply_boundary_sanitization_to_view(view, context_packet, active_source_id=sid)
 
 
 def make_source_id(job_id: Optional[str], file_id: Optional[str], sheet_name: Optional[str], file_path: Optional[str] = None) -> str:
@@ -562,7 +780,7 @@ def create_source_registry(
     normalized_file_id = str(file_id or Path(file_path).stem)
     for idx, sheet_name in enumerate(normalized_sheets):
         source_id = make_source_id(job_id, normalized_file_id, sheet_name, file_path=file_path)
-        contains_summary_only = bool(sheet_name and str(sheet_name).strip().lower() in {"summary", "notes", "note"})
+        context_only = is_context_only_sheet_name(sheet_name)
         registry.append(SourceMetadata(
             source_id=source_id,
             file_id=normalized_file_id,
@@ -570,8 +788,9 @@ def create_source_registry(
             file_path=file_path,
             sheet_name=sheet_name,
             sheet_order=idx,
-            contains_main_data=not contains_summary_only,
-            contains_summary_only=contains_summary_only,
+            contains_main_data=not context_only,
+            contains_reference_data=context_only,
+            contains_summary_only=context_only,
             fingerprint=f"{normalized_file_id}:{filename}:{sheet_name or 'default'}",
         ).to_dict())
     return registry
@@ -582,29 +801,46 @@ def normalize_mapping_records(records: Optional[List[Dict[str, Any]]], source_id
     for idx, record in enumerate(records or []):
         if not isinstance(record, dict):
             continue
-        normalized.append(MappingDecision(
+        role = str(record.get("role") or "").strip()
+        decision = str(record.get("decision") or "").strip()
+        target_column = str(record.get("target_column") or "No match")
+        if mapping_is_excluded({"role": role, "decision": decision}):
+            role = "exclude"
+            decision = "Discard"
+            target_column = "No match"
+        elif not decision:
+            decision = "Discard"
+        normalized.append(enrich_mapping_value_scale(MappingDecision(
             mapping_id=str(record.get("mapping_id") or f"{source_id}:mapping:{idx}"),
             source_id=str(record.get("source_id") or source_id),
             source_column=str(record.get("source_column") or record.get("column_name") or ""),
             source_column_type=str(record.get("source_column_type") or record.get("column_type") or ""),
             classification=str(record.get("classification") or ""),
-            target_column=str(record.get("target_column") or "No match"),
+            target_column=target_column,
             target_match_method=str(record.get("target_match_method") or "none"),
             target_match_confidence=float(record.get("target_match_confidence") or 0.0),
-            decision=str(record.get("decision") or "Discard"),
+            decision=decision,
             default_value_rule=str(record.get("default_value_rule") or ""),
             format_rule=str(record.get("format_rule") or ""),
             derivation_rule=str(record.get("derivation_rule") or ""),
             confidence=float(record.get("confidence") or 0.0),
             reasoning=str(record.get("reasoning") or ""),
-            role=str(record.get("role") or ""),
+            role=role,
             date_semantic=str(record.get("date_semantic") or ""),
             block_id=str(record.get("block_id") or ""),
             block_label=str(record.get("block_label") or ""),
+            value_scale=float(record.get("value_scale") or 1.0),
+            value_scale_note=str(record.get("value_scale_note") or ""),
+            metric_currency=str(record.get("metric_currency") or ""),
+            output_alias=str(record.get("output_alias") or ""),
+            split_from=str(record.get("split_from") or ""),
+            packed_source_column=str(
+                record.get("packed_source_column") or record.get("split_from") or ""
+            ),
             approved_by=str(record.get("approved_by") or "system"),
             approved_at=str(record.get("approved_at") or ""),
             mapping_version=int(record.get("mapping_version") or 1),
-        ).to_dict())
+        ).to_dict()))
     return normalized
 
 
@@ -746,6 +982,40 @@ def build_context_packet(
     active_template = target_template or {}
     ok_template, _ = validate_template_shape(active_template)
     source_metadata = _merge_scope_hints_from_template(source_metadata, active_template)
+    # Attach hierarchy registration (publisher grain + accepted combined fields)
+    try:
+        from sia.agent.hierarchy_register import get_hierarchy_entry_for_source
+
+        sid_hint = str(
+            selected_source_id
+            or source_metadata.get("source_id")
+            or ""
+        )
+        hier = get_hierarchy_entry_for_source(job, sid_hint) if sid_hint else None
+        if hier:
+            source_metadata = dict(source_metadata)
+            if hier.get("publisher_name") or hier.get("publisher_id"):
+                source_metadata["publisher"] = (
+                    source_metadata.get("publisher")
+                    or hier.get("publisher_name")
+                    or hier.get("publisher_id")
+                )
+            extra = dict(source_metadata.get("extra_metadata") or {})
+            extra["media_hierarchy"] = {
+                "publisher_id": hier.get("publisher_id"),
+                "publisher_name": hier.get("publisher_name"),
+                "grain_level": hier.get("grain_level"),
+                "grain_level_id": hier.get("grain_level_id"),
+                "grain_level_name": hier.get("grain_level_name"),
+                "grain_level_index": hier.get("grain_level_index"),
+                "combined_fields": [
+                    c for c in (hier.get("combined_fields") or [])
+                    if isinstance(c, dict) and c.get("accepted") and not c.get("single_dimension")
+                ],
+            }
+            source_metadata["extra_metadata"] = extra
+    except Exception:
+        pass
     registry_source_id = str(
         source_metadata.get("source_id")
         or selected_source_id
@@ -790,14 +1060,41 @@ def build_context_packet(
         source_metadata["date_granularity"] = derived_date.get("date_granularity")
 
     approved_layout = _build_layout_context(job, source_id=source_id, selected_sheet=selected_sheet)
-    context_block_snippets = _extract_context_block_snippets(
-        source_metadata,
-        approved_layout,
+    sheet_for_scope = str(selected_sheet or source_metadata.get("sheet_name") or "").strip()
+
+    from sia.context.artifacts import resolve_source_context_material
+    from sia.integrity.context_isolation import (
+        append_tab_inference_evidence,
+        build_scoped_fields,
     )
-    interpreted_context = _interpret_context_block_snippets(
-        source_metadata,
+    from sia.context.scoped_field import scoped_fields_to_dict
+
+    def _build_fresh_context() -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        snippets = _extract_context_block_snippets(source_metadata, approved_layout)
+        interpreted = _interpret_context_block_snippets(source_metadata, snippets)
+        return snippets, interpreted
+
+    context_block_snippets, interpreted_context, context_fp, _from_cache = resolve_source_context_material(
+        job,
+        source_id=str(source_id),
+        sheet_name=sheet_for_scope or None,
+        source_metadata=source_metadata,
+        approved_layout=approved_layout,
+        build_fresh=_build_fresh_context,
+    )
+    scoped = build_scoped_fields(
+        interpreted_context,
         context_block_snippets,
+        sheet_for_scope,
+        source_id=str(source_id),
     )
+    if scoped:
+        interpreted_context = dict(interpreted_context or {})
+        interpreted_context = append_tab_inference_evidence(interpreted_context, scoped)
+        from sia.context.scoped_field import scoped_fields_to_flat
+
+        interpreted_context["fields"] = scoped_fields_to_flat(scoped)
+        interpreted_context["scoped_fields"] = scoped_fields_to_dict(scoped)
     business_rule_records = [
         item for item in (job.get("business_rules_registry") or [])
         if not isinstance(item, dict)
@@ -834,8 +1131,165 @@ def build_context_packet(
         },
         defer_graph_file_relationship_review=bool(defer_file_relationship_graph_hitl),
         job_run_ledger_summary=build_job_run_ledger_summary(job),
+        _schema_version=CONTEXT_PACKET_SCHEMA_VERSION,
     )
-    return packet.to_dict()
+    out = packet.to_dict()
+    out["_schema_version"] = CONTEXT_PACKET_SCHEMA_VERSION
+    out["context_fingerprint"] = context_fp
+    try:
+        from sia.context.diff_log import log_scoped_fields_built
+
+        log_scoped_fields_built(
+            job,
+            source_id=str(source_id),
+            fields=(interpreted_context or {}).get("fields") or {},
+            stage="packet_build",
+        )
+    except Exception:
+        pass
+    return out
+
+
+_REVIEW_CONTEXT_OVERLAY_KEYS = (
+    "resolved_planner_decisions",
+    "planner_decision_notes",
+    "duplicate_target_mappings",
+)
+
+# Never overlay these from a saved packet — always keep fresh per-source build.
+_RESUME_SCOPE_FRESH_ONLY_KEYS = (
+    "interpreted_context",
+    "context_block_snippets",
+    "source_metadata",
+    "lineage",
+    "context_fingerprint",
+    "available_sources",
+    "available_source_summaries",
+    "approved_layout",
+    "business_rules",
+    "user_notes",
+)
+
+_REVIEW_MAPPING_OVERLAY_KEYS = (
+    "decision",
+    "target_column",
+    "role",
+    "target_match_confidence",
+    "target_match_method",
+    "date_semantic",
+    "metric_role",
+    "value_scale",
+    "value_scale_note",
+    "metric_currency",
+)
+
+
+def _mapping_row_key(row: Dict[str, Any]) -> str:
+    src = str(row.get("source_column") or row.get("column_name") or "").strip().lower()
+    block_id = str(row.get("block_id") or "").strip()
+    return f"{block_id}|{src}" if block_id else src
+
+
+def _merge_mapping_row_for_resume(fresh: Dict[str, Any], saved: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep fresh registry fields; overlay review-time mapping patches when they differ."""
+    merged = dict(fresh)
+    for key in _REVIEW_MAPPING_OVERLAY_KEYS:
+        if key not in saved:
+            continue
+        if saved.get(key) != merged.get(key):
+            merged[key] = saved[key]
+    return merged
+
+
+def merge_approved_mappings_for_resume(
+    fresh_mappings: Optional[List[Dict[str, Any]]],
+    saved_mappings: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """
+    Merge mapping rows for plan-review resume: job registry is base; review patches win per column.
+    """
+    fresh_rows = [dict(x) for x in (fresh_mappings or []) if isinstance(x, dict)]
+    saved_rows = [dict(x) for x in (saved_mappings or []) if isinstance(x, dict)]
+    if not saved_rows:
+        return fresh_rows
+    if not fresh_rows:
+        return saved_rows
+
+    saved_by_key = {_mapping_row_key(row): row for row in saved_rows}
+    merged: List[Dict[str, Any]] = []
+    for fresh_row in fresh_rows:
+        key = _mapping_row_key(fresh_row)
+        saved_row = saved_by_key.get(key)
+        if saved_row:
+            merged.append(_merge_mapping_row_for_resume(fresh_row, saved_row))
+        else:
+            merged.append(fresh_row)
+    return merged
+
+
+def merge_plan_review_context_packet(
+    fresh_packet: Optional[Dict[str, Any]],
+    saved_packet: Optional[Dict[str, Any]],
+    *,
+    job: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Hybrid resume context (option C): rebuild from job, then overlay planner-review decisions.
+
+    Fresh packet supplies current layout, mappings, rules, and notes from the job.
+    Saved packet supplies analyst decisions from the Review Plan screen.
+    """
+    out = dict(fresh_packet or {})
+    saved = dict(saved_packet or {}) if saved_packet else {}
+    if not saved and not job:
+        return out
+
+    for key in _REVIEW_CONTEXT_OVERLAY_KEYS:
+        val = saved.get(key)
+        if val:
+            out[key] = val
+
+    fresh_only = dict(fresh_packet or {})
+    for key in _RESUME_SCOPE_FRESH_ONLY_KEYS:
+        if key in fresh_only:
+            out[key] = fresh_only[key]
+
+    saved_sid = str(
+        ((saved.get("lineage") or {}).get("source_id"))
+        or ((saved.get("source_metadata") or {}).get("source_id"))
+        or ""
+    ).strip()
+    fresh_sid = str(
+        ((fresh_only.get("lineage") or {}).get("source_id"))
+        or ((fresh_only.get("source_metadata") or {}).get("source_id"))
+        or ""
+    ).strip()
+    if saved_sid and fresh_sid and saved_sid != fresh_sid:
+        for key in _RESUME_SCOPE_FRESH_ONLY_KEYS:
+            if key in fresh_only:
+                out[key] = fresh_only[key]
+
+    if not out.get("resolved_planner_decisions") and job:
+        job_decisions = job.get("resolved_planner_decisions")
+        if job_decisions:
+            out["resolved_planner_decisions"] = list(job_decisions)
+
+    if saved.get("approved_mappings"):
+        out["approved_mappings"] = merge_approved_mappings_for_resume(
+            out.get("approved_mappings"),
+            saved.get("approved_mappings"),
+        )
+        if not out.get("duplicate_target_mappings"):
+            try:
+                from .planner_decisions import duplicate_target_sources
+
+                dupes = duplicate_target_sources(out.get("approved_mappings") or [])
+                if dupes:
+                    out["duplicate_target_mappings"] = dupes
+            except Exception:
+                pass
+
+    return out
 
 
 def _extract_context_block_snippets(
@@ -933,30 +1387,94 @@ def _interpret_context_block_snippets(
     fields: Dict[str, Any] = {}
     assumptions: List[str] = []
     evidence: List[Dict[str, Any]] = []
+    sheet_name = str(source_metadata.get("sheet_name") or "").strip()
+    source_id = str(source_metadata.get("source_id") or "").strip()
 
     for snippet in snippets or []:
         if not isinstance(snippet, dict):
             continue
         label = str(snippet.get("block_label") or snippet.get("block_id") or "context_block")
+        block_id = str(snippet.get("block_id") or "").strip() or None
         lines = [str(item).strip() for item in (snippet.get("text_preview") or []) if str(item).strip()]
         for line in lines:
             norm_line = " ".join(line.split())
             line_lower = norm_line.lower()
 
-            _maybe_capture_field(fields, evidence, label, norm_line, "publisher", _extract_key_value(norm_line, {"publisher", "publisher name", "platform", "site"}))
-            _maybe_capture_field(fields, evidence, label, norm_line, "market", _extract_key_value(norm_line, {"market", "region", "country", "geo"}))
-            _maybe_capture_field(fields, evidence, label, norm_line, "brand", _extract_key_value(norm_line, {"brand"}))
-            _maybe_capture_field(fields, evidence, label, norm_line, "campaign", _extract_key_value(norm_line, {"campaign", "campaign name"}))
-            _maybe_capture_field(fields, evidence, label, norm_line, "owner", _extract_key_value(norm_line, {"owner"}))
-            _maybe_capture_field(fields, evidence, label, norm_line, "variable_type", _extract_key_value(norm_line, {"variable type", "source type", "metric type"}))
-            _maybe_capture_field(fields, evidence, label, norm_line, "date_granularity", _extract_key_value(norm_line, {"date granularity", "granularity", "reporting grain", "time grain"}))
-            _maybe_capture_field(fields, evidence, label, norm_line, "aggregation_logic", _extract_key_value(norm_line, {"aggregation logic", "aggregation rule", "rollup logic"}))
+            _maybe_capture_field(
+                fields, evidence, label, norm_line, "publisher",
+                _extract_key_value(norm_line, {"publisher", "publisher name", "platform", "site"}),
+                source_id=source_id, sheet_name=sheet_name, block_id=block_id,
+            )
+            _maybe_capture_field(
+                fields,
+                evidence,
+                label,
+                norm_line,
+                "channel",
+                _extract_key_value(
+                    norm_line,
+                    {
+                        "channel",
+                        "channel context",
+                        "channel_context",
+                        "media channel",
+                        "paid channel",
+                        "media_channel",
+                        "channel type",
+                        "channel_type",
+                    },
+                ),
+                source_id=source_id,
+                sheet_name=sheet_name,
+                block_id=block_id,
+            )
+            _maybe_capture_field(
+                fields, evidence, label, norm_line, "market",
+                _extract_key_value(norm_line, {"market", "region", "country", "geo"}),
+                source_id=source_id, sheet_name=sheet_name, block_id=block_id,
+            )
+            _maybe_capture_field(
+                fields, evidence, label, norm_line, "brand",
+                _extract_key_value(norm_line, {"brand"}),
+                source_id=source_id, sheet_name=sheet_name, block_id=block_id,
+            )
+            _maybe_capture_field(
+                fields, evidence, label, norm_line, "campaign",
+                _extract_key_value(norm_line, {"campaign", "campaign name"}),
+                source_id=source_id, sheet_name=sheet_name, block_id=block_id,
+            )
+            _maybe_capture_field(
+                fields, evidence, label, norm_line, "owner",
+                _extract_key_value(norm_line, {"owner"}),
+                source_id=source_id, sheet_name=sheet_name, block_id=block_id,
+            )
+            _maybe_capture_field(
+                fields, evidence, label, norm_line, "variable_type",
+                _extract_key_value(norm_line, {"variable type", "source type", "metric type"}),
+                source_id=source_id, sheet_name=sheet_name, block_id=block_id,
+            )
+            _maybe_capture_field(
+                fields, evidence, label, norm_line, "date_granularity",
+                _extract_key_value(norm_line, {"date granularity", "granularity", "reporting grain", "time grain"}),
+                source_id=source_id, sheet_name=sheet_name, block_id=block_id,
+            )
+            _maybe_capture_field(
+                fields, evidence, label, norm_line, "aggregation_logic",
+                _extract_key_value(norm_line, {"aggregation logic", "aggregation rule", "rollup logic"}),
+                source_id=source_id, sheet_name=sheet_name, block_id=block_id,
+            )
 
             period = _extract_modeling_period(norm_line)
             if period:
                 start_date, end_date = period
-                _maybe_capture_field(fields, evidence, label, norm_line, "modeling_period_start", start_date)
-                _maybe_capture_field(fields, evidence, label, norm_line, "modeling_period_end", end_date)
+                _maybe_capture_field(
+                    fields, evidence, label, norm_line, "modeling_period_start", start_date,
+                    source_id=source_id, sheet_name=sheet_name, block_id=block_id,
+                )
+                _maybe_capture_field(
+                    fields, evidence, label, norm_line, "modeling_period_end", end_date,
+                    source_id=source_id, sheet_name=sheet_name, block_id=block_id,
+                )
 
             if any(token in line_lower for token in {"note", "notes", "assumption", "assumptions", "use ", "logic", "rule"}):
                 if norm_line not in assumptions:
@@ -976,6 +1494,10 @@ def _maybe_capture_field(
     line: str,
     field_name: str,
     value: Optional[str],
+    *,
+    source_id: str = "",
+    sheet_name: str = "",
+    block_id: Optional[str] = None,
 ) -> None:
     cleaned = str(value or "").strip()
     if not cleaned:
@@ -988,7 +1510,13 @@ def _maybe_capture_field(
             "field": field_name,
             "value": cleaned,
             "block_label": block_label,
+            "block_id": block_id,
             "line": line,
+            "scope": "block",
+            "source_id": str(source_id or "").strip(),
+            "sheet_name": str(sheet_name or "").strip(),
+            "confidence": 1.0,
+            "hop": 0,
         })
 
 
@@ -1070,23 +1598,25 @@ def apply_context_to_dataframe(
     df: Optional[pd.DataFrame],
     approved_mappings: Optional[List[Dict[str, Any]]] = None,
     business_rules: Optional[List[Dict[str, Any]]] = None,
+    *,
+    drop_excluded: bool = True,
 ) -> Tuple[Optional[pd.DataFrame], List[str]]:
+    """Apply mapping decisions: optional Exclude drop, Keep rename, then rules.
+
+    Set ``drop_excluded=False`` after planner tools have already renamed columns.
+    Schema Mapping Exclude runs on the clean sheet *before* rename; repeating it
+    here would match template names (e.g. ``date``) and delete kept values.
+    """
     if df is None:
         return df, []
 
     result = df.copy()
     applied_actions: List[str] = []
 
-    discard_columns = []
-    for mapping in approved_mappings or []:
-        source_column = mapping.get("source_column")
-        decision = str(mapping.get("decision", "")).strip().lower()
-        if decision == "discard" and source_column in result.columns:
-            discard_columns.append(source_column)
-
-    if discard_columns:
-        result = result.drop(columns=discard_columns, errors="ignore")
-        applied_actions.append(f"dropped {len(discard_columns)} discarded columns")
+    if drop_excluded:
+        result, discard_columns = drop_excluded_mapping_columns(result, approved_mappings)
+        if discard_columns:
+            applied_actions.append(f"dropped {len(discard_columns)} discarded columns")
 
     rename_map: Dict[str, str] = {}
     for mapping in approved_mappings or []:
@@ -1164,11 +1694,10 @@ def _build_layout_context(job: Dict[str, Any], source_id: str, selected_sheet: O
     for block in approved_blocks:
         if not isinstance(block, dict):
             continue
-        decision = str(block.get("decision") or "").strip().lower()
-        category = str(block.get("block_category") or block.get("category") or "").strip().lower()
-        if decision in MAIN_BLOCK_DECISIONS or category == "main_data" or category == "main data":
+        role = _layout_registry_block_role(block)
+        if role == "main":
             main_blocks.append(block)
-        elif decision in CONTEXT_BLOCK_DECISIONS or category in {"metadata", "context", "supporting meta"}:
+        elif role == "context":
             context_blocks.append(block)
     if approved_blocks:
         return {
@@ -1245,7 +1774,14 @@ def _build_available_source_summaries(
             "modeling_period_end": source.get("modeling_period_end"),
             "contains_main_data": contains_main_data,
             "contains_reference_data": contains_reference_data,
+            "publisher": source.get("publisher"),
+            "media_hierarchy": (
+                (source.get("extra_metadata") or {}).get("media_hierarchy")
+                if isinstance(source.get("extra_metadata"), dict)
+                else None
+            ),
             "mapped_targets": mapped_targets,
+            "template_grain_columns": template_union_grain_columns(target_template),
             "kept_source_columns": kept_columns,
             "unresolved_mandatory_targets": sorted(mandatory_targets.difference(mapped_targets)),
         })

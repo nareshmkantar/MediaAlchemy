@@ -158,6 +158,234 @@
             color: #cbd5e1;
             height: 300px;
         }
+
+        .checkpoint-export-panel {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-lg);
+            padding: 24px;
+            margin-bottom: 32px;
+        }
+
+        .checkpoint-export-panel h2 {
+            margin: 0 0 8px;
+            font-size: 1.25rem;
+        }
+
+        .checkpoint-export-panel .section-lead {
+            margin: 0 0 20px;
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            line-height: 1.5;
+        }
+
+        .checkpoint-form-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+            gap: 16px;
+            margin-bottom: 16px;
+        }
+
+        .checkpoint-form-grid label {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: var(--text-secondary);
+        }
+
+        .checkpoint-form-grid select,
+        .checkpoint-form-grid input[type="text"] {
+            padding: 8px 10px;
+            border-radius: var(--radius-sm);
+            border: 1px solid var(--border);
+            background: #1e293b;
+            color: #f8fafc;
+            font-size: 0.9rem;
+            color-scheme: dark;
+        }
+
+        /* Native <select> dropdown lists use OS/browser chrome; force readable options. */
+        .checkpoint-form-grid select option {
+            background-color: #1e293b;
+            color: #f8fafc;
+        }
+
+        .checkpoint-form-grid select option:checked,
+        .checkpoint-form-grid select option:hover {
+            background-color: #4f46e5;
+            color: #ffffff;
+        }
+
+        .checkpoint-options {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 16px;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+
+        .checkpoint-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        .checkpoint-results {
+            border-top: 1px solid var(--border);
+            padding-top: 16px;
+        }
+
+        .checkpoint-stage-list {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            max-height: 520px;
+            overflow-y: auto;
+        }
+
+        .checkpoint-stage-card {
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            padding: 12px 14px;
+            background: var(--bg-main);
+        }
+
+        .checkpoint-stage-card summary {
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 0.9rem;
+            list-style: none;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .checkpoint-stage-card summary::-webkit-details-marker {
+            display: none;
+        }
+
+        .checkpoint-status {
+            font-size: 0.72rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            padding: 3px 8px;
+            border-radius: var(--radius-sm);
+        }
+
+        .checkpoint-status.ok { background: rgba(34, 197, 94, 0.12); color: var(--success); }
+        .checkpoint-status.missing { background: rgba(148, 163, 184, 0.15); color: var(--text-secondary); }
+        .checkpoint-status.skipped { background: rgba(148, 163, 184, 0.1); color: var(--text-tertiary); }
+
+        .checkpoint-scope {
+            font-size: 0.68rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            padding: 2px 6px;
+            border-radius: var(--radius-sm);
+            background: rgba(99, 102, 241, 0.12);
+            color: #a5b4fc;
+            margin-left: 8px;
+        }
+
+        .checkpoint-meta-line {
+            margin: 6px 0 0;
+            font-size: 0.78rem;
+            color: var(--text-tertiary);
+        }
+
+        .checkpoint-json-toolbar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-items: center;
+            margin-top: 10px;
+            margin-bottom: 8px;
+        }
+
+        .checkpoint-json-toolbar .btn-small {
+            font-size: 0.75rem;
+            padding: 4px 10px;
+        }
+
+        .checkpoint-json-tree {
+            max-height: 420px;
+            overflow: auto;
+            font-family: 'Fira Code', monospace;
+            font-size: 0.75rem;
+            background: #0f172a;
+            color: #cbd5e1;
+            padding: 12px;
+            border-radius: var(--radius-sm);
+            line-height: 1.45;
+        }
+
+        .checkpoint-json-tree details {
+            margin-left: 0.85rem;
+            border: none;
+            padding: 0;
+            background: transparent;
+        }
+
+        .checkpoint-json-tree details > summary {
+            cursor: pointer;
+            list-style: none;
+            display: inline-flex;
+            align-items: baseline;
+            gap: 4px;
+            font-weight: 500;
+            color: #e2e8f0;
+        }
+
+        .checkpoint-json-tree details > summary::-webkit-details-marker {
+            display: none;
+        }
+
+        .checkpoint-json-tree details > summary::before {
+            content: '▸';
+            color: #94a3b8;
+            font-size: 0.7rem;
+            width: 0.9rem;
+            display: inline-block;
+        }
+
+        .checkpoint-json-tree details[open] > summary::before {
+            content: '▾';
+        }
+
+        .checkpoint-json-tree .jv-key {
+            color: #7dd3fc;
+        }
+
+        .checkpoint-json-tree .jv-string {
+            color: #86efac;
+        }
+
+        .checkpoint-json-tree .jv-number {
+            color: #fcd34d;
+        }
+
+        .checkpoint-json-tree .jv-bool {
+            color: #c4b5fd;
+        }
+
+        .checkpoint-json-tree .jv-null {
+            color: #94a3b8;
+            font-style: italic;
+        }
+
+        .checkpoint-json-tree .jv-meta {
+            color: #64748b;
+            font-size: 0.7rem;
+        }
+
+        .checkpoint-json-tree .jv-leaf {
+            margin-left: 0.85rem;
+            padding: 1px 0;
+        }
     </style>
 </head>
 
@@ -172,6 +400,55 @@
         </div>
 
         <div class="tests-container">
+            <section class="checkpoint-export-panel" id="checkpointExportPanel">
+                <h2>Pipeline Checkpoint Export</h2>
+                <p class="section-lead">
+                    Review full context, state snapshots, and LLM prompts at each pipeline stage for the
+                    <strong>selected source</strong>. Reference sheets (Validation_Rules, README) show their own
+                    metadata text — including cross-market rules by design in CP-12. Data sheets (UK_TV_Spend, etc.)
+                    should not show another market unless context bleed occurred.
+                </p>
+                <div class="checkpoint-form-grid">
+                    <label>
+                        Job
+                        <select id="checkpointJobSelect">
+                            <option value="">— Select job —</option>
+                        </select>
+                    </label>
+                    <label>
+                        Job ID (manual)
+                        <input type="text" id="checkpointJobId" placeholder="e.g. f581632f" autocomplete="off" />
+                    </label>
+                    <label>
+                        Source
+                        <select id="checkpointSourceSelect">
+                            <option value="">— Default first source —</option>
+                        </select>
+                    </label>
+                    <label>
+                        Stage
+                        <select id="checkpointStageSelect">
+                            <option value="">All stages</option>
+                        </select>
+                    </label>
+                </div>
+                <div class="checkpoint-options">
+                    <label>
+                        <input type="checkbox" id="checkpointFullPacket" />
+                        Full context packet (rebuild via build_context_packet)
+                    </label>
+                </div>
+                <div class="checkpoint-actions">
+                    <button type="button" class="btn-primary" id="checkpointLoadBtn">Load checkpoints</button>
+                    <button type="button" class="btn-secondary" id="checkpointDownloadBtn">Download JSON</button>
+                    <button type="button" class="btn-secondary" id="checkpointOpenApiBtn">Open API URL</button>
+                </div>
+                <div class="checkpoint-results hidden" id="checkpointResults">
+                    <p id="checkpointSummary" class="section-lead"></p>
+                    <div class="checkpoint-stage-list" id="checkpointStageList"></div>
+                </div>
+            </section>
+
             <div class="test-controls">
                 <button class="btn-primary" id="runAllTests">Run All Tests</button>
             </div>

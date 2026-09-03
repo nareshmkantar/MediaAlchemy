@@ -17,7 +17,12 @@ def _cell_text(grid: Any, row: int, col: int) -> str:
     cell = grid.get_cell(row, col)
     if cell is None or getattr(cell, "is_empty", lambda: True)():
         return ""
-    return str(getattr(cell, "value", "") or "").strip()
+    # Keep numeric 0 / False — ``value or ""`` would treat them as blank and
+    # false-positive block-sparse spend on flat tables with many zero metrics.
+    value = getattr(cell, "value", None)
+    if value is None:
+        return ""
+    return str(value).strip()
 
 
 def _is_numeric_text(text: str) -> bool:
@@ -119,14 +124,23 @@ def detect_metric_layout_from_grid(
         label = labels[c] if c < len(labels) else f"col_{c}"
 
         if numeric_rate < 0.04:
-            blank_ratio = 1.0 - numeric_rate
-            if blank_ratio >= 0.15:
+            # Text/dimension columns (Publisher, Channel, …): count non-empty text in
+            # data rows only — do not treat "non-numeric" as blank (that falsely flags
+            # fully populated label columns).
+            nonempty = sum(
+                1 for r in range(data_start, rows) if _cell_text(grid, r, c)
+            )
+            denom = max(rows - data_start, 1)
+            text_fill_rate = nonempty / denom
+            blank_ratio = 1.0 - text_fill_rate
+            if blank_ratio >= 0.25:
                 sparse_dimension_columns.append(
                     {
                         "column_index": c,
                         "column_label": label,
                         "blank_ratio": round(blank_ratio, 4),
                         "role_hint": "dimension_or_label",
+                        "text_fill_rate": round(text_fill_rate, 4),
                     }
                 )
             continue

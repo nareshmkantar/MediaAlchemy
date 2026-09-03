@@ -294,3 +294,37 @@ def test_collation_merge_reorders_columns_from_target_template():
         and "collation.reorder_columns" in (s.get("tools") or [])
         for s in steps
     )
+
+
+def test_enumerate_duplicate_key_groups_includes_file_and_sheet():
+    from sia.agent.parent_collation_graph import enumerate_duplicate_key_groups_for_review
+
+    stacked = pd.DataFrame(
+        {
+            "date": ["2025-03-01", "2025-03-01"],
+            "channel": ["digital", "digital"],
+            "market": ["UK", "UK"],
+            "publisher": ["SiteC", "SiteC"],
+            "spends": [258, 258],
+            "impressions": [3030, 3030],
+        }
+    )
+    meta = [
+        {"source_id": "src_a", "file_name": "CP-07.xlsx", "sheet_name": "Digital_UK"},
+        {"source_id": "src_b", "file_name": "CP-07.xlsx", "sheet_name": "Digital_UK"},
+    ]
+    exact, partial = enumerate_duplicate_key_groups_for_review(
+        stacked,
+        ["date", "channel", "market", "publisher"],
+        union_break_before_row=[1],
+        source_labels=["CP-07.xlsx · Digital_UK", "CP-07.xlsx · Digital_UK"],
+        source_meta=meta,
+        max_each=10,
+    )
+    assert len(exact) == 1
+    assert len(partial) == 0
+    rows = exact[0]["rows"]
+    assert len(rows) == 2
+    assert rows[0]["file_name"] == "CP-07.xlsx"
+    assert rows[0]["sheet_name"] == "Digital_UK"
+    assert rows[1]["sheet_name"] == "Digital_UK"

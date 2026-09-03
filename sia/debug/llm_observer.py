@@ -232,7 +232,8 @@ class LLMObserver:
                 "user_prompt": t.user_prompt,
                 "raw_response": t.raw_response,
                 "retrieved_examples": t.retrieved_examples,
-                "confidence_score": t.confidence_score
+                "confidence_score": t.confidence_score,
+                "input_context": t.input_context,
             })
             
         # 3. Tool Executions
@@ -325,7 +326,8 @@ class LLMObserver:
                 "parsed_output": t.parsed_output if isinstance(t.parsed_output, dict) else {},
                 "retrieved_examples": t.retrieved_examples,
                 "input_summary": t.user_prompt[:200] if t.user_prompt else "",
-                "output_summary": t.raw_response[:200] if t.raw_response else ""
+                "output_summary": t.raw_response[:200] if t.raw_response else "",
+                "input_context": t.input_context,
             })
             
         for tool in self.tool_executions:

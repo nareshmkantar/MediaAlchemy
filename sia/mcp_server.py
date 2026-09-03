@@ -722,6 +722,24 @@ def calculate_column(
                           next_hints=["transform.format", "transform.rename"])
 
 
+@mcp.tool(name="transform.scale_values")
+def scale_values(
+    data: List[Dict[str, Any]],
+    scales: Dict[str, float],
+) -> Dict[str, Any]:
+    """Multiply columns by denomination factors (e.g. thousands in header → ×1000)."""
+    start_time = time.time()
+    rows_in = len(data)
+    df = pd.DataFrame(data)
+    result = TransformationTools.scale_columns(df, scales=scales)
+    return _result_to_dict(
+        result,
+        start_time,
+        rows_in=rows_in,
+        next_hints=["transform.format", "transform.aggregate_weekly", "verify.schema"],
+    )
+
+
 @mcp.tool(name="transform.date_range_to_weekly")
 def date_range_to_weekly(
     data: List[Dict[str, Any]],

@@ -16,8 +16,9 @@ _ML_SUBHEADER_MIN_FILL_RATIO = 0.25
 from sia.models.cell import VisualGrid
 
 
-KEEP_DECISIONS = {"keep", "main data"}
-CONTEXT_DECISIONS = {"context", "metadata"}
+KEEP_DECISIONS = {"keep", "approved", "main data"}
+CONTEXT_DECISIONS = {"context", "metadata", "use as context"}
+DISCARD_DECISIONS = {"discard", "ignore", "noise"}
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -236,9 +237,19 @@ def _classify_blocks(blocks: Optional[List[Dict[str, Any]]]) -> Tuple[List[Dict[
         normalized = dict(block)
         normalized["coordinates"] = _get_block_coordinates(block)
 
-        if decision in KEEP_DECISIONS or category == "main data":
+        # An explicit user decision always overrides the AI-proposed category.
+        # (Clicking "Use as Metadata"/"Ignore" only changes `decision`; the
+        # original `category` stays "Main Data", so category must not win here.)
+        if decision in CONTEXT_DECISIONS:
+            context_blocks.append(normalized)
+        elif decision in DISCARD_DECISIONS:
+            continue
+        elif decision in KEEP_DECISIONS:
             main_blocks.append(normalized)
-        elif decision in CONTEXT_DECISIONS or category in {"context", "metadata", "footnotes", "footnote"}:
+        # Fall back to the AI category only when there is no recognized decision.
+        elif category == "main data":
+            main_blocks.append(normalized)
+        elif category in {"context", "metadata", "footnotes", "footnote"}:
             context_blocks.append(normalized)
 
     return main_blocks, context_blocks

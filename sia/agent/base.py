@@ -23,6 +23,8 @@ class ExtractionPlan:
     requires_human_review: bool = False
     review_reason: str = ""
     raw_analysis: str = ""
+    source_id: str = ""
+    raw_tool_calls: List[Dict] = field(default_factory=list)  # LLM plan before finalize_plan guards
 
 @dataclass
 class VerificationResult:

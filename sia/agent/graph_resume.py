@@ -53,6 +53,15 @@ def can_skip_pipeline_after_load(state: Dict[str, Any]) -> bool:
     return _has_structure(state) and _has_mappings(state) and _has_plan(state)
 
 
+def prepare_integrity_resume_state(resume_state: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep mid-execution dataframe and continue tool chain after integrity review."""
+    out = dict(resume_state or {})
+    out.pop("resume_skip_pipeline_after_load", None)
+    out["resume_graph_from"] = "execute_tools"
+    out["hitl_pending_approval"] = False
+    return out
+
+
 def prepare_plan_review_resume_state(
     resume_state: Dict[str, Any],
     *,
@@ -66,6 +75,16 @@ def prepare_plan_review_resume_state(
     post-``load_file`` fast path when structure, mappings, and plan are present.
     """
     out = dict(resume_state or {})
+    if (
+        str(out.get("hitl_resume_from") or "") == "integrity_review"
+        or out.get("integrity_suppress_checks")
+    ):
+        return prepare_integrity_resume_state(out)
+    if str(out.get("hitl_resume_from") or "") == "verification_stall":
+        # Accept-as-is keeps current_df and an explicit finalize/execute entry.
+        # Do not wipe the frame or force a full reload the way plan-review does.
+        out.pop("resume_skip_pipeline_after_load", None)
+        return out
     if not use_existing_plan:
         out.pop("resume_skip_pipeline_after_load", None)
         return out
@@ -88,13 +107,13 @@ def resolve_resume_graph_entry(state: Dict[str, Any]) -> str:
     """
     Choose the LangGraph node to invoke first on HITL resume.
 
-    Returns one of: ``load_file``, ``generate_plan``, ``execute_tools``.
+    Returns one of: ``load_file``, ``generate_plan``, ``execute_tools``, ``finalize``.
     """
     if not isinstance(state, dict):
         return "load_file"
 
     explicit = str(state.get("resume_graph_from") or "").strip()
-    if explicit in ("load_file", "generate_plan", "execute_tools"):
+    if explicit in ("load_file", "generate_plan", "execute_tools", "finalize"):
         return explicit
 
     pause_from = str(state.get("hitl_resume_from") or state.get("hitl_pause_type") or "").strip()
@@ -120,8 +139,8 @@ def resolve_resume_graph_entry(state: Dict[str, Any]) -> str:
         return "load_file"
 
     # Mid-execution destructive approval or execute pause.
-    if pause_from in ("execute_pause", "destructive_approval") or state.get("destructive_approved"):
-        if has_grid:
+    if pause_from in ("execute_pause", "destructive_approval", "integrity_review") or state.get("destructive_approved"):
+        if has_grid or state.get("current_df") is not None:
             return "execute_tools"
         return "load_file"
 

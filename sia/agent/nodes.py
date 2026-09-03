@@ -23,7 +23,7 @@ from sia.agent.base import ExtractionPlan, VerificationResult
 from sia.agent.analyzer import StructureAnalyzer
 from sia.agent.planner import PlanGenerator
 from sia.agent.verifier import OutputVerifier
-from sia.agent.replanner import Replanner
+from sia.agent.replanner import Replanner, tool_plan_fingerprint
 from sia.agent.scoped_source import (
     apply_scoped_source_to_grid,
     load_scoped_dataframe,
@@ -35,6 +35,7 @@ from sia.agent.context_packet import (
     build_canonical_planning_view,
     compute_date_granularity_alignment,
     effective_target_date_granularity,
+    mapping_is_excluded,
     normalize_mapping_records,
 )
 from sia.agent.target_template_utils import (
@@ -75,6 +76,7 @@ from sia.models.confidence import ProcessingTrace
 from sia.tools.transformation_tools import TransformationTools, execute_tool
 from sia.tools.tool_validator import (
     validate_tool_call,
+    dedupe_redundant_tool_calls,
     is_destructive_tool,
     get_destructive_tools,
     sort_tool_calls_by_pipeline_stage,
@@ -249,6 +251,16 @@ def _load_target_template() -> dict:
 logger = logging.getLogger(__name__)
 
 
+def _tool_snapshot_basename(state: Dict[str, Any], tool_name: str) -> str:
+    """CSV basename under runtime/snapshots; prefix job_id when available for cleanup."""
+    timestamp_str = str(int(time.time() * 1000))
+    job_id = state.get("job_id") or (state.get("context_packet") or {}).get("job_id")
+    safe_tool = re.sub(r"[^\w.\-]+", "_", str(tool_name or "tool"))[:80]
+    if job_id:
+        return f"{job_id}_{timestamp_str}_{safe_tool}.csv"
+    return f"{timestamp_str}_{safe_tool}.csv"
+
+
 def _emit_job_progress(state: AgentState, step_name: str, message: str) -> None:
     """Surface long-running graph work on /api/status (processing page) while the LLM is busy."""
     job_id = (state.get("context_packet") or {}).get("job_id")
@@ -284,6 +296,154 @@ def _persist_transformation_banner_inputs(
         )
     except Exception:
         logger.debug("Transformation banner persistence skipped", exc_info=True)
+
+
+def _pipeline_eval_source_id(state: AgentState) -> str:
+    cp = state.get("context_packet") if isinstance(state.get("context_packet"), dict) else {}
+    sm = state.get("source_metadata") if isinstance(state.get("source_metadata"), dict) else {}
+    lineage = cp.get("lineage") if isinstance(cp.get("lineage"), dict) else {}
+    return str(
+        lineage.get("source_id")
+        or sm.get("source_id")
+        or state.get("source_id")
+        or ""
+    ).strip()
+
+
+def _pipeline_eval_job(state: AgentState):
+    from sia.agent.job_manager import job_manager
+    from sia.evals.runner import PipelineEvalRunner
+
+    job_id = state.get("job_id") or (state.get("context_packet") or {}).get("job_id")
+    if not job_id:
+        return None, None
+    job = job_manager.get_job(str(job_id))
+    if not job:
+        return None, None
+    PipelineEvalRunner.ensure(job)
+    return job, PipelineEvalRunner
+
+
+def _record_pipeline_structure_eval(state: AgentState, analysis: Dict[str, Any]) -> None:
+    job, runner = _pipeline_eval_job(state)
+    sid = _pipeline_eval_source_id(state)
+    if not job or not runner or not sid:
+        return
+    cp = state.get("context_packet") if isinstance(state.get("context_packet"), dict) else {}
+    vp = analysis.get("visual_patterns") if isinstance(analysis.get("visual_patterns"), dict) else {}
+    runner.record_structure(
+        job,
+        sid,
+        structure_analysis=analysis,
+        context_packet=cp,
+        metric_layout_signals=vp.get("metric_layout_signals"),
+    )
+
+
+def _record_pipeline_plan_eval(
+    state: AgentState,
+    plan: ExtractionPlan,
+    *,
+    approval_items: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    job, runner = _pipeline_eval_job(state)
+    sid = _pipeline_eval_source_id(state)
+    if not job or not runner or not sid:
+        return
+    cp = state.get("context_packet") if isinstance(state.get("context_packet"), dict) else {}
+    raw_tools = list(getattr(plan, "raw_tool_calls", None) or plan.tool_calls or [])
+    runner.record_plan(
+        job,
+        sid,
+        raw_tool_calls=raw_tools,
+        finalized_tool_calls=list(plan.tool_calls or []),
+        context_packet=cp,
+        target_template=state.get("target_template"),
+        structure_analysis=state.get("structure_analysis"),
+        plan_confidence=float(plan.confidence or 0.0),
+        approval_items=approval_items if approval_items is not None else list(plan.approval_items or []),
+        plan_source_id=str(getattr(plan, "source_id", "") or ""),
+        resume_state=state,
+    )
+
+
+def _record_pipeline_plan_review_eval(state: AgentState, plan: ExtractionPlan) -> None:
+    job, runner = _pipeline_eval_job(state)
+    sid = _pipeline_eval_source_id(state)
+    if not job or not runner or not sid:
+        return
+    runner.record_plan_review(
+        job,
+        sid,
+        approval_items=list(plan.approval_items or []),
+        plan_confidence=float(plan.confidence or 0.0),
+        context_packet=state.get("context_packet"),
+        structure_analysis=state.get("structure_analysis"),
+    )
+
+
+def _record_pipeline_execution_event(state: AgentState, violation: Dict[str, Any]) -> None:
+    job, runner = _pipeline_eval_job(state)
+    sid = _pipeline_eval_source_id(state)
+    if not job or not runner or not sid:
+        return
+    runner.record_execution_event(job, sid, violation)
+
+
+def _tool_calls_from_history(history_slice: List[Any]) -> List[Dict[str, Any]]:
+    """Convert tools_history records into plan-style tool call dicts for eval diff."""
+    out: List[Dict[str, Any]] = []
+    for row in history_slice or []:
+        if isinstance(row, dict):
+            tool = row.get("tool")
+            params = row.get("params") if isinstance(row.get("params"), dict) else {}
+        else:
+            tool = getattr(row, "tool", None)
+            params = getattr(row, "params", None)
+            params = params if isinstance(params, dict) else {}
+        if not tool:
+            continue
+        out.append({"tool": str(tool), "params": dict(params)})
+    return out
+
+
+def _record_pipeline_execution_deferral(
+    state: AgentState,
+    *,
+    defer_grain: bool,
+    planned_tools: List[Any],
+    executed_tools: List[Any],
+    deferred_tools: List[Dict[str, Any]],
+) -> None:
+    job, runner = _pipeline_eval_job(state)
+    sid = _pipeline_eval_source_id(state)
+    if not job or not runner or not sid:
+        return
+    runner.record_execution_deferral(
+        job,
+        sid,
+        defer_grain=defer_grain,
+        planned_tools=[dict(t) for t in planned_tools if isinstance(t, dict)],
+        executed_tools=[dict(t) for t in executed_tools if isinstance(t, dict)],
+        deferred_tools=deferred_tools,
+    )
+
+
+def _record_pipeline_verify_eval(state: AgentState, issues: List[Dict[str, Any]]) -> None:
+    job, runner = _pipeline_eval_job(state)
+    sid = _pipeline_eval_source_id(state)
+    if not job or not runner or not sid:
+        return
+    bucket = job.setdefault("pipeline_evals", {}).setdefault("per_source", {}).setdefault(sid, {})
+    exec_row = dict(bucket.get("execution") or {"pass": True, "integrity_events": [], "violations": []})
+    exec_row["verifier_issues"] = list(issues or [])[:24]
+    exec_row["metrics"] = {
+        **dict(exec_row.get("metrics") or {}),
+        "verifier_issue_count": len(issues or []),
+        "is_flat": bool(state.get("is_flat")),
+    }
+    bucket["execution"] = exec_row
+    runner.recompute_critical_gate(job)
 
 
 def _compact_blocks_for_llm(blocks: Any, max_items: int = 8) -> List[Dict[str, Any]]:
@@ -364,9 +524,32 @@ def _coerce_tool_params_to_active_workbook(state: Dict[str, Any], params: Dict[s
 
 
 def _enrich_tool_params_from_template(state: Dict[str, Any], tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    """Inject target-template column_rules when planner calls apply_column_rules without rules."""
+    """Inject target-template contracts the planner cannot be trusted to transcribe."""
     out = dict(params or {})
     norm, _ = normalize_tool_name(str(tool_name or "").strip())
+
+    if norm == "verify.schema":
+        # The planner hand-writes `schema` inline, which silently drops minimum /
+        # maximum / enum from the uploaded template. Validate against the real one.
+        tpl = state.get("target_template")
+        if not isinstance(tpl, dict) or not tpl:
+            cp = state.get("context_packet") if isinstance(state.get("context_packet"), dict) else {}
+            tpl = cp.get("target_template") if isinstance(cp.get("target_template"), dict) else None
+        if isinstance(tpl, dict) and isinstance(tpl.get("properties"), dict) and tpl["properties"]:
+            planner_props = out.get("schema")
+            planner_keys = (
+                sorted((planner_props or {}).get("properties", {}).keys())
+                if isinstance(planner_props, dict)
+                else []
+            )
+            out["schema"] = normalize_target_template(tpl)
+            logger.info(
+                "verify.schema: replaced planner schema (%s cols) with target template (%s cols)",
+                len(planner_keys),
+                len(tpl["properties"]),
+            )
+        return out
+
     if norm != "transform.apply_column_rules":
         return out
     existing = out.get("column_rules")
@@ -514,36 +697,9 @@ def _repair_drop_columns_tool_params(
     params: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Remove template primary / mapped targets from drop_columns (planner safety net)."""
-    out = dict(params or {})
-    cols = out.get("columns")
-    if not isinstance(cols, list):
-        return out
-    tpl = state.get("target_template") or {}
-    protected: Set[str] = set()
-    if isinstance(tpl, dict) and tpl:
-        from sia.agent.target_template_utils import (
-            normalize_target_template,
-            pre_transform_target_columns,
-            primary_target_columns,
-        )
+    from sia.integrity.drop_columns_hitl import repair_drop_columns_params
 
-        norm_tpl = normalize_target_template(tpl)
-        protected.update(str(c) for c in primary_target_columns(norm_tpl))
-        protected.update(str(c) for c in pre_transform_target_columns(norm_tpl))
-    for item in list(state.get("approved_mappings") or []):
-        if not isinstance(item, dict):
-            continue
-        tgt = str(item.get("target_column") or "").strip()
-        if tgt:
-            protected.add(tgt)
-    prot_lower = {str(x).strip().lower() for x in protected if str(x).strip()}
-    filtered = [
-        str(c)
-        for c in cols
-        if str(c).strip() and str(c).strip().lower() not in prot_lower
-    ]
-    out["columns"] = filtered
-    return out
+    return repair_drop_columns_params(state, params)
 
 
 def _repair_aggregate_weekly_tool_params(
@@ -684,6 +840,40 @@ def _safe_serialize_df(df: Optional[pd.DataFrame]) -> List[Dict[str, Any]]:
     return records
 
 
+def _ensure_canonical_planning_summary(
+    context_packet: Dict[str, Any],
+    *,
+    current_df: Any = None,
+    scoped_source: Optional[Dict[str, Any]] = None,
+    date_observations: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Rebuild planning_summary from the full context packet (never legacy mapping-only summary)."""
+    cp = dict(context_packet or {})
+    supplement = dict(cp.get("mapping_supplement") or {})
+    if current_df is not None and hasattr(current_df, "columns"):
+        supplement.setdefault("prepared_columns", [str(c) for c in current_df.columns])
+    scoped = scoped_source or {}
+    if scoped.get("header_derivation"):
+        supplement.setdefault("header_derivation", dict(scoped.get("header_derivation") or {}))
+    planning_summary = build_canonical_planning_view(cp, mapping_supplement=supplement or None)
+    date_obs = dict(date_observations or {})
+    if date_obs.get("columns") or date_obs.get("inferred_date_range_pair"):
+        ps = dict(planning_summary)
+        ss = dict(ps.get("source_summary") or {})
+        if date_obs.get("columns"):
+            ss["date_column_observations"] = date_obs["columns"]
+        ss["date_cadence_summary"] = date_obs.get("summary") or ""
+        if date_obs.get("aggregate_confidence") is not None:
+            ss["date_cadence_aggregate_confidence"] = date_obs["aggregate_confidence"]
+        if date_obs.get("mismatch_note"):
+            ss["date_granularity_mismatch_note"] = date_obs["mismatch_note"]
+        if date_obs.get("inferred_date_range_pair"):
+            ss["inferred_date_range_pair"] = date_obs["inferred_date_range_pair"]
+        ps["source_summary"] = ss
+        planning_summary = ps
+    return planning_summary
+
+
 def _build_mapping_stage_supplement(
     prepared_columns: Optional[List[str]] = None,
     header_derivation: Optional[Dict[str, Any]] = None,
@@ -725,7 +915,7 @@ def _summarize_mapping_state(
         f"{item.get('source_column')} -> {item.get('target_column')}"
         for item in approved_mappings
         if (
-            str(item.get("decision", "")).strip().lower() != "discard"
+            not mapping_is_excluded(item)
             and item.get("target_column")
             and item.get("target_column") != "No match"
         )
@@ -733,7 +923,7 @@ def _summarize_mapping_state(
     excluded_columns = [
         item.get("source_column")
         for item in approved_mappings
-        if str(item.get("decision", "")).strip().lower() == "discard" and item.get("source_column")
+        if mapping_is_excluded(item) and item.get("source_column")
     ]
     mandatory_targets = sorted(mapping_targets_requiring_source(target_template)) if isinstance(target_template, dict) else []
     mapped_targets = {
@@ -1397,12 +1587,19 @@ def resolve_mapping_node(state: AgentState) -> Dict[str, Any]:
         cols_preview = []
         if prepared_df is not None and not prepared_df.empty and hasattr(prepared_df, "columns"):
             cols_preview = [str(c) for c in list(prepared_df.columns)[:48]]
+        excluded_preview = [
+            str(item.get("source_column") or "")
+            for item in approved_mappings
+            if mapping_is_excluded(item) and item.get("source_column")
+        ]
         rm_meta = {
             "node": "resolve_mapping",
             "langgraph_layer": "per_source",
             "sheet_name": sheet_name,
             "mapping_origin": mapping_origin,
             "mappings_count": len(approved_mappings),
+            "excluded_count": len(excluded_preview),
+            "excluded_column_preview": excluded_preview[:48],
             "unresolved_targets": len(quality["unresolved_items"]),
             "prepared_column_preview": cols_preview,
         }
@@ -1467,7 +1664,10 @@ def apply_file_relationship_inference(
             }]
         }
 
-    proposals = propose_file_relationships(source_summaries)
+    proposals = propose_file_relationships(
+        source_summaries,
+        target_template=context_packet.get("target_template"),
+    )
     context_packet["relationship_proposals"] = proposals
     context_packet["file_relationships"] = approved_relationships
 
@@ -1837,6 +2037,7 @@ def analyze_structure_node(state: AgentState) -> Dict[str, Any]:
         structure_analysis=analysis,
         plan_tool_calls=None,
     )
+    _record_pipeline_structure_eval(state, analysis)
 
     return {
         "structure_analysis": analysis,
@@ -1851,45 +2052,57 @@ def analyze_structure_node(state: AgentState) -> Dict[str, Any]:
 @trace_node("generate_plan", input_keys=["structure_analysis"])
 def generate_plan_node(state: AgentState) -> Dict[str, Any]:
     """LLM generates extraction plan with HITL checkpoint check."""
-    if state.get("resume_mode") == "use_existing_plan" and state.get("extraction_plan"):
-        existing_plan = state.get("extraction_plan")
-        if isinstance(existing_plan, dict):
-            existing_plan = ExtractionPlan(**existing_plan)
-        from sia.agent.planner import finalize_extraction_plan
+    from sia.integrity.context_isolation import plan_bound_to_wrong_source
 
-        finalized = finalize_extraction_plan(
-            existing_plan,
-            state.get("context_packet"),
-            state.get("target_template"),
-            state.get("structure_analysis"),
-        )
-        if isinstance(finalized, ExtractionPlan):
-            existing_plan = finalized
-        observer_early = get_observer()
-        if observer_early and getattr(observer_early, "_active_spans", None):
-            observer_early.update_span_metadata(
-                "plan_generator_llm",
-                "skipped — resume_mode=use_existing_plan (reusing persisted extraction_plan; use Regenerate plan to call the planner LLM)",
+    if state.get("resume_mode") == "use_existing_plan" and state.get("extraction_plan"):
+        if plan_bound_to_wrong_source(state, state.get("context_packet")):
+            logger.warning(
+                "generate_plan_node: persisted plan targets a different source_id; forcing replan"
             )
-        _persist_transformation_banner_inputs(state, plan_tool_calls=list(existing_plan.tool_calls or []))
-        return {
-            "extraction_plan": existing_plan,
-            "suggested_tools": existing_plan.tool_calls,
-            "expected_columns": existing_plan.expected_columns,
-            "planned_rule_actions": existing_plan.business_rule_actions,
-            "approval_items": [],
-            "hitl_checkpoints": [],
-            "requires_review": False,
-            "review_reason": "",
-            "hitl_pending_approval": False,
-            "hitl_pause_type": None,
-            "trace_steps": [{
-                "step": "generate_plan",
-                "tools_count": len(existing_plan.tool_calls),
-                "confidence": existing_plan.confidence,
-                "reused_existing_plan": True,
-            }]
-        }
+            state = dict(state)
+            state.pop("extraction_plan", None)
+            state.pop("suggested_tools", None)
+            state["resume_mode"] = "replan"
+        else:
+            existing_plan = state.get("extraction_plan")
+            if isinstance(existing_plan, dict):
+                existing_plan = ExtractionPlan(**existing_plan)
+            from sia.agent.planner import finalize_extraction_plan
+
+            finalized = finalize_extraction_plan(
+                existing_plan,
+                state.get("context_packet"),
+                state.get("target_template"),
+                state.get("structure_analysis"),
+            )
+            if isinstance(finalized, ExtractionPlan):
+                existing_plan = finalized
+            observer_early = get_observer()
+            if observer_early and getattr(observer_early, "_active_spans", None):
+                observer_early.update_span_metadata(
+                    "plan_generator_llm",
+                    "skipped — resume_mode=use_existing_plan (reusing persisted extraction_plan; use Regenerate plan to call the planner LLM)",
+                )
+            _persist_transformation_banner_inputs(state, plan_tool_calls=list(existing_plan.tool_calls or []))
+            _record_pipeline_plan_eval(state, existing_plan, approval_items=[])
+            return {
+                "extraction_plan": existing_plan,
+                "suggested_tools": existing_plan.tool_calls,
+                "expected_columns": existing_plan.expected_columns,
+                "planned_rule_actions": existing_plan.business_rule_actions,
+                "approval_items": [],
+                "hitl_checkpoints": [],
+                "requires_review": False,
+                "review_reason": "",
+                "hitl_pending_approval": False,
+                "hitl_pause_type": None,
+                "trace_steps": [{
+                    "step": "generate_plan",
+                    "tools_count": len(existing_plan.tool_calls),
+                    "confidence": existing_plan.confidence,
+                    "reused_existing_plan": True,
+                }]
+            }
     
     if not state.get("llm_client"):
         # Fallback plan for rule-based mode
@@ -1943,16 +2156,6 @@ def generate_plan_node(state: AgentState) -> Dict[str, Any]:
     context_packet = dict(state.get("context_packet") or {})
     date_obs_pkg: Dict[str, Any] = {}
     if context_packet:
-        planning_summary = context_packet.get("planning_summary") or _summarize_mapping_state(
-            target_template or {},
-            list(context_packet.get("approved_mappings") or []),
-            list(context_packet.get("business_rules") or []),
-            dict(context_packet.get("source_metadata") or {}),
-            list(context_packet.get("user_notes") or []),
-            prepared_columns=list((state.get("current_df") or pd.DataFrame()).columns) if hasattr(state.get("current_df"), "columns") else [],
-            header_derivation=((state.get("scoped_source") or {}).get("header_derivation") or {}),
-            sparse_dimension_columns=[],
-        )
         date_obs_pkg = build_date_column_observations_for_planning(
             state.get("current_df"),
             list(context_packet.get("approved_mappings") or []),
@@ -1961,20 +2164,12 @@ def generate_plan_node(state: AgentState) -> Dict[str, Any]:
                 (dict(context_packet.get("source_metadata") or {}).get("date_granularity") or "")
             ),
         )
-        if date_obs_pkg.get("columns") or date_obs_pkg.get("inferred_date_range_pair"):
-            ps = dict(planning_summary)
-            ss = dict(ps.get("source_summary") or {})
-            if date_obs_pkg.get("columns"):
-                ss["date_column_observations"] = date_obs_pkg["columns"]
-            ss["date_cadence_summary"] = date_obs_pkg.get("summary") or ""
-            if date_obs_pkg.get("aggregate_confidence") is not None:
-                ss["date_cadence_aggregate_confidence"] = date_obs_pkg["aggregate_confidence"]
-            if date_obs_pkg.get("mismatch_note"):
-                ss["date_granularity_mismatch_note"] = date_obs_pkg["mismatch_note"]
-            if date_obs_pkg.get("inferred_date_range_pair"):
-                ss["inferred_date_range_pair"] = date_obs_pkg["inferred_date_range_pair"]
-            ps["source_summary"] = ss
-            planning_summary = ps
+        planning_summary = _ensure_canonical_planning_summary(
+            context_packet,
+            current_df=state.get("current_df"),
+            scoped_source=state.get("scoped_source") or {},
+            date_observations=date_obs_pkg,
+        )
         context_packet["planning_summary"] = planning_summary
 
     if _should_defer_weekly_rollup_until_post_collate(state):
@@ -2029,57 +2224,67 @@ def generate_plan_node(state: AgentState) -> Dict[str, Any]:
     requires_review = plan.requires_human_review
     review_reason = plan.review_reason
     
-    # Low confidence plan - trigger HITL
-    if plan.confidence < 0.7:
+    low_confidence_plan = plan.confidence < 0.7
+    if low_confidence_plan:
         requires_review = True
         review_reason = f"Plan confidence ({plan.confidence:.1%}) is below threshold (70%)"
-        
-        # Create HITL checkpoint
-        hitl_manager = state.get("hitl_manager")
-        if hitl_manager:
-            checkpoint = hitl_manager.create_checkpoint(
-                CheckpointType.PLAN_REVIEW,
-                state,
-                review_reason,
-                title="Plan Review Required",
-                description=f"AI generated plan with {len(plan.tool_calls)} tools at {plan.confidence:.1%} confidence"
-            )
-            hitl_checkpoints.append(checkpoint.to_dict())
 
     if plan.approval_items:
         requires_review = True
         if not review_reason:
             review_reason = f"Plan has {len(plan.approval_items)} approval items that need analyst review"
+
+    if requires_review and review_reason:
         hitl_manager = state.get("hitl_manager")
         if hitl_manager:
+            sheet_name = (
+                state.get("sheet_name")
+                or (state.get("scoped_source") or {}).get("sheet_name")
+                or ((state.get("context_packet") or {}).get("source_metadata") or {}).get("sheet_name")
+            )
+            has_approvals = bool(plan.approval_items)
+            title = "Plan Assumptions Review" if has_approvals and not low_confidence_plan else "Plan Review Required"
+            if has_approvals and low_confidence_plan:
+                title = "Plan Review Required"
+            description_parts = [
+                f"AI generated plan with {len(plan.tool_calls)} tools at {plan.confidence:.1%} confidence."
+            ]
+            if has_approvals:
+                description_parts.append(
+                    f"{len(plan.approval_items)} approval item(s) and "
+                    f"{len(plan.business_rule_actions)} planned business-rule action(s) need review."
+                )
             checkpoint = hitl_manager.create_checkpoint(
                 CheckpointType.PLAN_REVIEW,
                 state,
                 review_reason,
-                title="Plan Assumptions Review",
-                description=(
-                    f"The planner produced {len(plan.approval_items)} approval items and "
-                    f"{len(plan.business_rule_actions)} planned business-rule actions."
-                ),
-                severity="medium",
+                title=title,
+                description=" ".join(description_parts),
+                severity="medium" if plan.confidence > 0.5 else "high",
                 available_actions=["approve", "modify", "regenerate", "cancel"],
-                recommended_action="modify",
+                recommended_action="modify" if has_approvals else ("approve" if plan.confidence > 0.6 else "modify"),
+                confidence=float(plan.confidence),
                 trigger_data={
+                    "plan_confidence": float(plan.confidence),
+                    "sheet_name": sheet_name,
                     "approval_items": plan.approval_items,
                     "planned_rule_actions": plan.business_rule_actions,
                     "reasoning": plan.reasoning[:1200] if plan.reasoning else "",
                     "tool_calls": plan.tool_calls,
                     "expected_columns": plan.expected_columns,
-                }
+                },
             )
             hitl_checkpoints.append(checkpoint.to_dict())
+            _record_pipeline_plan_review_eval(state, plan)
 
     should_pause_for_plan_review = bool(hitl_checkpoints) and requires_review
 
     _persist_transformation_banner_inputs(state, plan_tool_calls=list(plan.tool_calls or []))
+    _record_pipeline_plan_eval(state, plan)
 
     return {
         "extraction_plan": plan,
+        "last_replan_tools": list(plan.tool_calls or []),
         "template_contract": template_contract or {},
         "context_packet": context_packet,
         "suggested_tools": plan.tool_calls,
@@ -2120,6 +2325,18 @@ def _squeeze_consecutive_same_tool(
             continue
         out.append(tc)
     return out
+
+
+def _last_column_typing_tool_index(tool_calls: Optional[List[Any]]) -> Optional[int]:
+    """Index of the final rename/type/add/rule operation in the sorted plan."""
+    last_index: Optional[int] = None
+    for index, tool_call in enumerate(tool_calls or []):
+        if not isinstance(tool_call, dict):
+            continue
+        normalized, _ = normalize_tool_name(str(tool_call.get("tool") or "").strip())
+        if pipeline_catalog.stage_for_tool(normalized) == pipeline_catalog.PipelineStage.COLUMN_TYPING:
+            last_index = index
+    return last_index
 
 
 _DAILY_PREP_BEFORE_WEEKLY = frozenset(
@@ -2353,6 +2570,153 @@ def execute_tools_node(state: AgentState) -> Dict[str, Any]:
     current_df = state["current_df"]
 
     tools_to_run = _squeeze_consecutive_same_tool(list(state.get("suggested_tools") or []), "verify.schema")
+    tools_to_run, dedupe_notes = dedupe_redundant_tool_calls(tools_to_run)
+    if dedupe_notes:
+        logger.info(
+            "execute_tools: dropped %s redundant tool call(s): %s",
+            len(dedupe_notes),
+            "; ".join(dedupe_notes[:8]),
+        )
+    from sia.integrity.context_isolation import rebind_source_local_plan_literals
+
+    tools_to_run, rebind_notes = rebind_source_local_plan_literals(
+        tools_to_run,
+        state.get("context_packet") if isinstance(state.get("context_packet"), dict) else {},
+        job=_pipeline_eval_job(state)[0],
+    )
+    for note in rebind_notes[:4]:
+        logger.info("execute_tools rebind: %s", note)
+
+    from sia.integrity.context_isolation import (
+        context_packet_source_id,
+        plan_bound_to_wrong_source,
+        plan_source_id,
+    )
+
+    cp = state.get("context_packet") if isinstance(state.get("context_packet"), dict) else {}
+    active_sid = str(state.get("source_id") or context_packet_source_id(cp) or "").strip()
+    bound_plan_sid = plan_source_id(state.get("extraction_plan"))
+    if active_sid and bound_plan_sid and bound_plan_sid != active_sid:
+        reason = (
+            f"Execution plan is bound to source_id {bound_plan_sid!r} but active sheet is "
+            f"{active_sid!r}. Regenerate the plan for this source before executing tools."
+        )
+        logger.error(reason)
+        hitl_manager = state.get("hitl_manager")
+        if hitl_manager:
+            checkpoint = hitl_manager.create_checkpoint(
+                CheckpointType.PLAN_REVIEW,
+                state,
+                reason,
+                title="Wrong-source plan blocked",
+                description=reason,
+                severity="high",
+                available_actions=["regenerate", "modify", "cancel"],
+                recommended_action="regenerate",
+                trigger_data={
+                    "reasoning": reason,
+                    "plan_source_id": bound_plan_sid,
+                    "active_source_id": active_sid,
+                },
+            )
+            hitl_checkpoints = list(state.get("hitl_checkpoints", []))
+            hitl_checkpoints.append(checkpoint.to_dict())
+        return {
+            "requires_review": True,
+            "review_reason": reason,
+            "hitl_pending_approval": True,
+            "hitl_pause_type": "plan_review",
+            "hitl_checkpoints": hitl_checkpoints if hitl_manager else list(state.get("hitl_checkpoints", [])),
+            "trace_steps": [{
+                "step": "hitl_pause",
+                "reason": reason,
+                "plan_source_id": bound_plan_sid,
+                "active_source_id": active_sid,
+            }],
+        }
+    if plan_bound_to_wrong_source(dict(state), cp):
+        reason = (
+            "Persisted plan or context packet targets a different source than the active sheet. "
+            "Regenerate the plan before executing tools."
+        )
+        logger.error(reason)
+        hitl_manager = state.get("hitl_manager")
+        if hitl_manager:
+            checkpoint = hitl_manager.create_checkpoint(
+                CheckpointType.PLAN_REVIEW,
+                state,
+                reason,
+                title="Wrong-source memory blocked",
+                description=reason,
+                severity="high",
+                available_actions=["regenerate", "cancel"],
+                recommended_action="regenerate",
+            )
+            hitl_checkpoints = list(state.get("hitl_checkpoints", []))
+            hitl_checkpoints.append(checkpoint.to_dict())
+        return {
+            "requires_review": True,
+            "review_reason": reason,
+            "hitl_pending_approval": True,
+            "hitl_pause_type": "plan_review",
+            "hitl_checkpoints": hitl_checkpoints if hitl_manager else list(state.get("hitl_checkpoints", [])),
+            "trace_steps": [{"step": "hitl_pause", "reason": reason}],
+        }
+
+    job, _pe_runner = _pipeline_eval_job(state)
+    from sia.context.verifier import ContextVerifier
+
+    ctx_verify = ContextVerifier.verify_plan_context(
+        state.get("extraction_plan"),
+        cp,
+        job=job,
+        tool_calls=tools_to_run,
+        resume_state=state,
+        target_template=state.get("target_template"),
+    )
+    if not ctx_verify.pass_:
+        critical = ctx_verify.critical_violations()
+        if critical:
+            reason = (
+                "Context verifier blocked execution: "
+                + "; ".join(str(v.get("message") or v.get("type")) for v in critical[:3])
+            )
+            logger.error(reason)
+            hitl_manager = state.get("hitl_manager")
+            hitl_checkpoints = list(state.get("hitl_checkpoints", []))
+            if hitl_manager:
+                checkpoint = hitl_manager.create_checkpoint(
+                    CheckpointType.PLAN_REVIEW,
+                    state,
+                    reason,
+                    title="Context bleed blocked",
+                    description=(
+                        "Plan literals or source binding disagree with scoped local context. "
+                        "Review or regenerate the plan before executing tools."
+                    ),
+                    severity="high",
+                    available_actions=["regenerate", "modify", "cancel"],
+                    recommended_action="regenerate",
+                    trigger_data={
+                        "reasoning": reason,
+                        "context_violations": critical[:8],
+                    },
+                )
+                hitl_checkpoints.append(checkpoint.to_dict())
+            return {
+                "requires_review": True,
+                "review_reason": reason,
+                "hitl_pending_approval": True,
+                "hitl_pause_type": "plan_review",
+                "hitl_checkpoints": hitl_checkpoints,
+                "suggested_tools": tools_to_run,
+                "trace_steps": [{
+                    "step": "hitl_pause",
+                    "reason": reason,
+                    "context_gate": "pre_execute",
+                }],
+            }
+
     deferred_post_collate: List[Dict[str, Any]] = []
     scoped_source = state.get("scoped_source", {}) or {}
     consumed_fast_resume = bool(state.get("resume_skip_pipeline_after_load"))
@@ -2568,9 +2932,27 @@ def execute_tools_node(state: AgentState) -> Dict[str, Any]:
     destructive_tools_in_plan = [t for t in tools_to_run if is_tool_destructive(t.get("tool", ""))]
     
     # Check if we need to pause for HITL approval
-    if destructive_tools_in_plan and not state.get("destructive_approved", False):
-        # Generate previews for all destructive tools
-        previews = generate_all_previews(iteration_data, destructive_tools_in_plan)
+    if not state.get("destructive_approved", False):
+        previews = (
+            generate_all_previews(iteration_data, destructive_tools_in_plan)
+            if destructive_tools_in_plan
+            else []
+        )
+
+        from sia.integrity.drop_columns_hitl import generate_drop_columns_hitl_preview
+
+        for tool_call in tools_to_run:
+            norm_drop, _ = normalize_tool_name(str(tool_call.get("tool", "")).strip())
+            if norm_drop != "transform.drop_columns":
+                continue
+            drop_preview = generate_drop_columns_hitl_preview(
+                iteration_data,
+                tool_call.get("tool", "transform.drop_columns"),
+                tool_call.get("params", {}),
+                state,
+            )
+            if drop_preview:
+                previews.append(drop_preview)
         
         # ONLY pause if there is actually something to delete (avoid "0 destructive operations" warning)
         if previews and any(p.rows_to_delete or p.columns_to_delete for p in previews):
@@ -2611,6 +2993,46 @@ def execute_tools_node(state: AgentState) -> Dict[str, Any]:
         tools_to_run, state
     )
     tools_to_run = sort_tool_calls_by_pipeline_stage(tools_to_run)
+    if state.get("integrity_suppress_checks") or state.get("schema_constraint_suppress_checks"):
+        pause_tool = str(
+            state.get("integrity_pause_tool")
+            or state.get("schema_constraint_pause_tool")
+            or ""
+        ).strip()
+        resume_after_idx = state.get("integrity_resume_after_tool_index")
+        if resume_after_idx is not None:
+            try:
+                idx = int(resume_after_idx)
+                if idx + 1 < len(tools_to_run):
+                    tools_to_run = tools_to_run[idx + 1 :]
+                    logger.info("[HITL] Resume after review: skipping first %d tool(s)", idx + 1)
+                else:
+                    tools_to_run = []
+                    logger.info(
+                        "[HITL] Resume after review: no tools remaining after index %s",
+                        resume_after_idx,
+                    )
+            except (TypeError, ValueError):
+                pass
+        elif pause_tool:
+            found = False
+            trimmed: List[Dict[str, Any]] = []
+            pause_norm, _ = normalize_tool_name(pause_tool)
+            for tc in tools_to_run:
+                tname = str((tc.get("tool") if isinstance(tc, dict) else "") or "").strip()
+                tnorm, _ = normalize_tool_name(tname)
+                if found:
+                    trimmed.append(tc)
+                elif tname == pause_tool or (pause_norm and tnorm == pause_norm):
+                    found = True
+            if found:
+                tools_to_run = trimmed
+                logger.info(
+                    "[HITL] Resume after review: continuing after tool %s (%d tool(s) left)",
+                    pause_tool,
+                    len(tools_to_run),
+                )
+    column_typing_gate_index = _last_column_typing_tool_index(tools_to_run)
     log_state_snapshot(
         "state.execute_tools.deferral",
         "deferral_decision",
@@ -2627,6 +3049,7 @@ def execute_tools_node(state: AgentState) -> Dict[str, Any]:
             ],
             "pre_defer_tools": [t.get("tool") for t in pre_defer_tools],
             "tools_to_run": [t.get("tool") for t in tools_to_run if isinstance(t, dict)],
+            "column_typing_gate_index": column_typing_gate_index,
             "deferred_post_collate_tools": [
                 t.get("tool") for t in deferred_post_collate if isinstance(t, dict)
             ],
@@ -2659,12 +3082,27 @@ def execute_tools_node(state: AgentState) -> Dict[str, Any]:
     merged_context_packet = dict(state.get("context_packet") or {})
     relationship_tool_traces: List[Dict[str, Any]] = []
     relationship_hitl_early: Optional[Dict[str, Any]] = None
+    integrity_hitl_early: Optional[Dict[str, Any]] = None
+    schema_constraint_hitl_early: Optional[Dict[str, Any]] = None
     context_packet_dirty = False
     async def _mcp_execute_tool_chain(session, tools_cache):
         nonlocal iteration_data, tools_history, messages, warnings, low_confidence_items, triggered_sensitive
-        nonlocal merged_context_packet, relationship_tool_traces, relationship_hitl_early, context_packet_dirty
+        nonlocal merged_context_packet, relationship_tool_traces, relationship_hitl_early, integrity_hitl_early
+        nonlocal schema_constraint_hitl_early
+        nonlocal context_packet_dirty
 
-        for tool_call in tools_to_run:
+        from sia.integrity.metric_reconcile import (
+            check_post_tool_integrity,
+            integrity_violation_to_hitl_state,
+        )
+        from sia.integrity.schema_constraints import (
+            constraint_issues_from_dataframe,
+            constraint_issues_from_report,
+            parse_validation_report,
+            schema_constraint_to_hitl_state,
+        )
+
+        for tool_idx, tool_call in enumerate(tools_to_run):
             tool_name = tool_call.get("tool")
             params = tool_call.get("params", {})
             description = tool_call.get("description", "")
@@ -2800,6 +3238,11 @@ def execute_tools_node(state: AgentState) -> Dict[str, Any]:
             
             # Track rows before execution
             rows_before = len(iteration_data) if iteration_data is not None else 0
+            df_before_tool = (
+                iteration_data.copy()
+                if isinstance(iteration_data, pd.DataFrame) and not iteration_data.empty
+                else None
+            )
             log_state_snapshot(
                 "state.execute_tools.tool",
                 "tool_before",
@@ -2868,18 +3311,31 @@ def execute_tools_node(state: AgentState) -> Dict[str, Any]:
                     f"{status_word} — rows {rows_before}→{rows_after} in {duration_ms:.0f}ms"
                     + (f" — {detail}" if detail else ""),
                 )
-                if success and iteration_data is not None and is_destructive_tool(tool_name):
-                    loss_ratio = (rows_before - rows_after) / rows_before if rows_before > 0 else 0
-                    if loss_ratio > 0.8:
-                        low_confidence_items.append(
-                            {
-                                "type": "integrity_violation",
-                                "tool": tool_name,
-                                "item": "data_loss",
-                                "confidence": 0.5,
-                                "details": f"Collation tool {tool_name} removed {loss_ratio*100:.1f}% of data.",
-                            }
+                if success and isinstance(iteration_data, pd.DataFrame) and not state.get("integrity_suppress_checks"):
+                    violation = check_post_tool_integrity(
+                        df_before_tool,
+                        iteration_data,
+                        tool_name,
+                        params,
+                        state,
+                        rows_before=rows_before,
+                        rows_after=rows_after,
+                        is_destructive_fn=is_destructive_tool,
+                        norm_tool=norm_tool,
+                    )
+                    if violation:
+                        _record_pipeline_execution_event(state, violation)
+                        integrity_hitl_early = integrity_violation_to_hitl_state(
+                            violation,
+                            iteration_data,
+                            state,
+                            tools_history_slice=tools_history[prev_tools_len:],
+                            deferred_post_collate=deferred_post_collate,
+                            warnings=warnings,
+                            low_confidence_items=low_confidence_items,
+                            tool_index=tool_idx,
                         )
+                        break
                 if is_destructive_tool(tool_name):
                     triggered_sensitive.append(tool_name)
                 observer = get_observer()
@@ -2902,8 +3358,7 @@ def execute_tools_node(state: AgentState) -> Dict[str, Any]:
                         try:
                             snapshot_dir = str(Path(__file__).parent.parent.parent / "runtime" / "snapshots")
                             os.makedirs(snapshot_dir, exist_ok=True)
-                            timestamp_str = str(int(time.time() * 1000))
-                            filename = f"{timestamp_str}_{tool_name}.csv"
+                            filename = _tool_snapshot_basename(state, tool_name)
                             filepath = os.path.join(snapshot_dir, filename)
                             if isinstance(iteration_data, pd.DataFrame):
                                 iteration_data.to_csv(filepath, index=False)
@@ -3163,41 +3618,32 @@ def execute_tools_node(state: AgentState) -> Dict[str, Any]:
                 + (f" — {detail}" if detail else ""),
             )
     
-            # ===== DATA INTEGRITY GUARDRAIL =====
-            if success and iteration_data is not None:
-                # 1. Check for unexpected 0-row results
-                if rows_after == 0 and rows_before > 0:
-                    low_confidence_items.append({
-                        "type": "integrity_violation",
-                        "tool": tool_name,
-                        "item": "row_count",
-                        "confidence": 0.1,
-                        "details": f"CRITICAL: Tool {tool_name} deleted ALL data ({rows_before} -> 0 rows)."
-                    })
-                
-                # 2. Check for unexpected row loss in non-destructive tools
-                # (e.g. unpivot should INCREASE rows, not decrease)
-                if "unpivot" in tool_name.lower() and rows_after < rows_before:
-                    low_confidence_items.append({
-                        "type": "integrity_violation",
-                        "tool": tool_name,
-                        "item": "row_count",
-                        "confidence": 0.3,
-                        "details": f"Unpivot tool {tool_name} resulted in FEWER rows ({rows_before} -> {rows_after}). Possible misconfiguration."
-                    })
-                
-                # 3. Check for massive data loss (>80%) even in destructive tools
-                if is_destructive_tool(tool_name) and rows_before > 0:
-                    loss_ratio = (rows_before - rows_after) / rows_before
-                    if loss_ratio > 0.8:
-                        low_confidence_items.append({
-                            "type": "integrity_violation",
-                            "tool": tool_name,
-                            "item": "data_loss",
-                            "confidence": 0.5,
-                            "details": f"Destructive tool {tool_name} removed {loss_ratio*100:.1f}% of data. Verify if this was intended."
-                        })
-        
+            # ===== DATA INTEGRITY GUARDRAIL (pause for HITL on violation) =====
+            if success and isinstance(iteration_data, pd.DataFrame) and not state.get("integrity_suppress_checks"):
+                violation = check_post_tool_integrity(
+                    df_before_tool,
+                    iteration_data,
+                    tool_name,
+                    params,
+                    state,
+                    rows_before=rows_before,
+                    rows_after=rows_after,
+                    is_destructive_fn=is_destructive_tool,
+                    norm_tool=norm_tool,
+                )
+                if violation:
+                    _record_pipeline_execution_event(state, violation)
+                    integrity_hitl_early = integrity_violation_to_hitl_state(
+                        violation,
+                        iteration_data,
+                        state,
+                        tools_history_slice=tools_history[prev_tools_len:],
+                        deferred_post_collate=deferred_post_collate,
+                        warnings=warnings,
+                        low_confidence_items=low_confidence_items,
+                        tool_index=tool_idx,
+                    )
+                    break
             
             if is_destructive_tool(tool_name):
                 triggered_sensitive.append(tool_name)
@@ -3222,8 +3668,7 @@ def execute_tools_node(state: AgentState) -> Dict[str, Any]:
                         import os
                         snapshot_dir = str(Path(__file__).parent.parent.parent / "runtime" / "snapshots")
                         os.makedirs(snapshot_dir, exist_ok=True)
-                        timestamp_str = str(int(time.time() * 1000))
-                        filename = f"{timestamp_str}_{tool_name}.csv"
+                        filename = _tool_snapshot_basename(state, tool_name)
                         filepath = os.path.join(snapshot_dir, filename)
                         iteration_data.to_csv(filepath, index=False)
                         snapshot_path = filename
@@ -3277,6 +3722,74 @@ def execute_tools_node(state: AgentState) -> Dict[str, Any]:
                     "details": f"Tool call suggested with low confidence ({tool_confidence:.2f})"
                 })
 
+            # Runtime fail-fast gate: once rename/type_cast/add/rule operations
+            # are complete, scan only template min/max before row-expanding work.
+            if (
+                success
+                and tool_idx == column_typing_gate_index
+                and isinstance(iteration_data, pd.DataFrame)
+                and not state.get("schema_constraint_suppress_checks")
+            ):
+                gate_template = state.get("target_template")
+                if not isinstance(gate_template, dict) or not gate_template:
+                    gate_template = (
+                        merged_context_packet.get("target_template")
+                        if isinstance(merged_context_packet.get("target_template"), dict)
+                        else {}
+                    )
+                gate_issues = constraint_issues_from_dataframe(
+                    iteration_data,
+                    normalize_target_template(gate_template),
+                )
+                if gate_issues:
+                    for gate_issue in gate_issues:
+                        _record_pipeline_execution_event(
+                            state,
+                            {
+                                "type": "schema_constraint",
+                                "subtype": "post_column_typing",
+                                "tool": tool_name,
+                                **gate_issue,
+                            },
+                        )
+                    schema_constraint_hitl_early = schema_constraint_to_hitl_state(
+                        gate_issues,
+                        iteration_data,
+                        state,
+                        tools_history_slice=tools_history[prev_tools_len:],
+                        deferred_post_collate=deferred_post_collate,
+                        warnings=warnings,
+                        low_confidence_items=low_confidence_items,
+                        tool_index=tool_idx,
+                        tool_name=str(tool_name or "column_typing"),
+                    )
+                    break
+
+            # Template min/max → Review-style pause (same class of flag as duplicates)
+            if (
+                success
+                and norm_tool == "verify.schema"
+                and not state.get("schema_constraint_suppress_checks")
+            ):
+                report = parse_validation_report(
+                    message=message,
+                    changes_made=changes_made if isinstance(changes_made, dict) else None,
+                )
+                constraint_issues = constraint_issues_from_report(report)
+                if constraint_issues:
+                    schema_constraint_hitl_early = schema_constraint_to_hitl_state(
+                        constraint_issues,
+                        iteration_data if isinstance(iteration_data, pd.DataFrame) else None,
+                        state,
+                        tools_history_slice=tools_history[prev_tools_len:],
+                        deferred_post_collate=deferred_post_collate,
+                        warnings=warnings,
+                        low_confidence_items=low_confidence_items,
+                        tool_index=tool_idx,
+                        tool_name=str(tool_name or "verify.schema"),
+                    )
+                    break
+
     try:
         get_mcp_client().run_session(_mcp_execute_tool_chain)
     except Exception as e:
@@ -3287,6 +3800,16 @@ def execute_tools_node(state: AgentState) -> Dict[str, Any]:
         rh = dict(relationship_hitl_early)
         rh["tools_history"] = tools_history[prev_tools_len:]
         return rh
+
+    if integrity_hitl_early is not None:
+        ih = dict(integrity_hitl_early)
+        ih["tools_history"] = tools_history[prev_tools_len:]
+        return ih
+
+    if schema_constraint_hitl_early is not None:
+        sh = dict(schema_constraint_hitl_early)
+        sh["tools_history"] = tools_history[prev_tools_len:]
+        return sh
 
     # Check if we should rollback (data became empty or confidence dropped)
     if iteration_data is not None and iteration_data.empty and last_valid_checkpoint is not None and not last_valid_checkpoint.empty:
@@ -3299,6 +3822,7 @@ def execute_tools_node(state: AgentState) -> Dict[str, Any]:
         iteration_data,
         approved_mappings=state.get("approved_mappings", []),
         business_rules=state.get("business_rules", []),
+        drop_excluded=False,
     )
     if context_actions:
         messages.extend(context_actions)
@@ -3356,6 +3880,13 @@ def execute_tools_node(state: AgentState) -> Dict[str, Any]:
             else {}
         ),
     }]
+    _record_pipeline_execution_deferral(
+        state,
+        defer_grain=defer_grain,
+        planned_tools=pre_defer_tools,
+        executed_tools=_tool_calls_from_history(tools_history[prev_tools_len:]),
+        deferred_tools=deferred_post_collate,
+    )
     out_execute = {
         "current_df": iteration_data,
         "current_frame": {
@@ -3440,6 +3971,13 @@ def verify_output_node(state: AgentState) -> Dict[str, Any]:
         )
 
     skip_weekly_contract = _should_defer_weekly_rollup_until_post_collate(state)
+    it_preview = int(state.get("iteration", 1) or 1)
+    mx_preview = int(state.get("max_iterations", 3) or 3)
+    _emit_job_progress(
+        state,
+        "verify_output",
+        f"Output verification running (iteration≈{it_preview}/{mx_preview})…",
+    )
     sparse_dim_names: List[str] = []
     src_summary = (
         ((cp.get("planning_summary") or {}).get("source_summary") or {})
@@ -3525,9 +4063,11 @@ def verify_output_node(state: AgentState) -> Dict[str, Any]:
     hitl_checkpoints = list(state.get("hitl_checkpoints", []))
     escalation_reason = state.get("escalation_reason", "")
     
-    if is_stalled(state):
+    stall_state = dict(state)
+    stall_state["confidence_trajectory"] = confidence_trajectory
+    if (not result.is_flat) and is_stalled(stall_state):
         # Determine stall type for better messaging
-        trajectory = state.get("confidence_trajectory", [])
+        trajectory = confidence_trajectory
         if len(trajectory) >= 3 and abs(trajectory[-1] - trajectory[-2]) < 0.05:
             stall_type = "Confidence Plateau"
             escalation_reason = f"Verification stalled: Confidence has plateaued at {result.confidence:.1%}"
@@ -3546,7 +4086,19 @@ def verify_output_node(state: AgentState) -> Dict[str, Any]:
                 state,
                 escalation_reason,
                 title=f"Verification Stalled ({stall_type})",
-                description=f"{escalation_reason} Human intervention is required to correct the approach."
+                description=f"{escalation_reason} Human intervention is required to correct the approach.",
+                available_actions=list(HITLManager.STALL_REVIEW_ACTIONS),
+                recommended_action="accept_as_is",
+                trigger_data={
+                    "iteration": state.get("iteration", 0),
+                    "verifier_issues": list(result.issues or []),
+                    "sheet_name": str(
+                        (state.get("scoped_source") or {}).get("sheet_name")
+                        or state.get("sheet_name")
+                        or ""
+                    ),
+                    "source_id": str(state.get("source_id") or ""),
+                },
             )
             hitl_checkpoints.append(checkpoint.to_dict())
 
@@ -3565,6 +4117,8 @@ def verify_output_node(state: AgentState) -> Dict[str, Any]:
         ),
     )
 
+    _record_pipeline_verify_eval(state, list(result.issues or []))
+
     return {
         "is_flat": result.is_flat,
         "verifier_issues": result.issues,  # NEW: Match AgentState field name
@@ -3575,6 +4129,7 @@ def verify_output_node(state: AgentState) -> Dict[str, Any]:
         "escalation_reason": escalation_reason,
         "hitl_checkpoints": hitl_checkpoints,
         "hitl_pending_approval": hitl_pending_approval,
+        "hitl_pause_type": "verification_stall" if hitl_pending_approval else None,
         "message": f"Verification: {'Flat' if result.is_flat else 'Issue found'}. Conf: {result.confidence:.1%}",
         "trace_steps": [{
             "step": "verify_output",
@@ -3607,7 +4162,7 @@ def replan_node(state: AgentState) -> Dict[str, Any]:
         )
         return {
             "iteration": int(state.get("iteration", 1)) + 1,
-            "current_df": None,
+            "current_df": state.get("current_df"),
             "suggested_tools": list(state.get("suggested_tools", [])),
             "trace_steps": [
                 {
@@ -3696,6 +4251,52 @@ def replan_node(state: AgentState) -> Dict[str, Any]:
         date_granularity_alignment=None if defer_union else date_granularity_alignment,
         defer_union_weekly_rollup=defer_union,
     )
+
+    previous_plan_tools = state.get("last_replan_tools")
+    if not isinstance(previous_plan_tools, list):
+        prior_plan = state.get("extraction_plan")
+        previous_plan_tools = list(getattr(prior_plan, "tool_calls", []) or [])
+    repeated_plan = bool(new_plan.tool_calls) and (
+        tool_plan_fingerprint(new_plan.tool_calls)
+        == tool_plan_fingerprint(previous_plan_tools)
+    )
+    hitl_checkpoints = list(state.get("hitl_checkpoints", []))
+    hitl_pending_approval = bool(new_plan.requires_human_review)
+    escalation_reason = str(new_plan.review_reason or "")
+    if repeated_plan:
+        escalation_reason = (
+            "Replanner produced the same effective tool plan for unresolved verification issues; "
+            "automatic retry was stopped to avoid repeating work."
+        )
+        new_plan.requires_human_review = True
+        new_plan.review_reason = escalation_reason
+        hitl_pending_approval = True
+        logger.warning("[REPLAN_STALL] %s", escalation_reason)
+    if hitl_pending_approval:
+        hitl_manager = state.get("hitl_manager")
+        if hitl_manager:
+            checkpoint = hitl_manager.create_checkpoint(
+                CheckpointType.VERIFICATION_STALL,
+                state,
+                escalation_reason,
+                title="Replanner Made No Progress" if repeated_plan else "Replanner Escalation",
+                description=(
+                    f"{escalation_reason} Review the latest verifier issues and choose a different approach."
+                ),
+                available_actions=list(HITLManager.STALL_REVIEW_ACTIONS),
+                recommended_action="accept_as_is",
+                trigger_data={
+                    "iteration": state.get("iteration", 0),
+                    "verifier_issues": list(state.get("verifier_issues") or []),
+                    "sheet_name": str(
+                        (state.get("scoped_source") or {}).get("sheet_name")
+                        or state.get("sheet_name")
+                        or ""
+                    ),
+                    "source_id": str(state.get("source_id") or ""),
+                },
+            )
+            hitl_checkpoints.append(checkpoint.to_dict())
     
     # Track confidence from replanning
     confidence_trajectory = list(state.get("confidence_trajectory", []))
@@ -3706,16 +4307,30 @@ def replan_node(state: AgentState) -> Dict[str, Any]:
     _emit_job_progress(
         state,
         "replan",
-        f"Replan produced {len(new_plan.tool_calls)} tool(s); re-executing from grid.",
+        (
+            f"Replan produced {len(new_plan.tool_calls)} tool(s); "
+            + (
+                "paused for analyst review."
+                if hitl_pending_approval
+                else "re-executing from the last processed frame."
+            )
+        ),
     )
 
     return {
         "iteration": int(state.get("iteration", 1)) + 1,
-        "current_df": None,  # Reset data to force re-execution from grid with new plan
+        # Keep the processed frame. Wiping it forced execute_tools to rebuild
+        # from the raw grid (0, 1, 2…) and broke rename/fill on the next pass.
+        "current_df": state.get("current_df"),
         "suggested_tools": new_plan.tool_calls,
+        "last_replan_tools": list(new_plan.tool_calls or []),
         "confidence_trajectory": confidence_trajectory,
         "requires_review": new_plan.requires_human_review,
         "review_reason": new_plan.review_reason,
+        "escalation_reason": escalation_reason,
+        "hitl_checkpoints": hitl_checkpoints,
+        "hitl_pending_approval": hitl_pending_approval,
+        "hitl_pause_type": "verification_stall" if hitl_pending_approval else None,
         "message": f"Replan: Generated {len(new_plan.tool_calls)} tools to fix issues",
         "trace_steps": [{
             "step": "replan",
@@ -3768,6 +4383,11 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
         if run_judge and llm_client and df is not None and not df.empty:
             try:
                 logger.info("finalize_node: running LLMJudge (trace + output critique)")
+                _emit_job_progress(
+                    state,
+                    "finalize",
+                    "Optional quality judge is running (skips if the model does not respond in time)…",
+                )
                 judge = LLMJudge(llm_client)
                 # Create a string representation of the input grid for the judge
                 input_grid = state.get("grid")
@@ -3787,11 +4407,16 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
                     state.get("trace_steps", []).append({"total_tokens_used": total_tokens})
 
                 # Run judge evaluate directly (Sync)
+                pipeline_evals_summary = ""
+                job, pe_runner = _pipeline_eval_job(state)
+                if job and pe_runner:
+                    pipeline_evals_summary = pe_runner.summarize_for_judge(job)
                 score = judge.evaluate(
                     input_sample=input_sample,
                     output_df=df,
                     schema=schema.to_dict(),
-                    trace=state.get("trace_steps", [])
+                    trace=state.get("trace_steps", []),
+                    pipeline_evals_summary=pipeline_evals_summary,
                 )
                 
                 # Additional logic: if judge failed to return total tokens, inject it manually
@@ -3825,6 +4450,31 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
                             "critique": step_score.get("critique", "")
                         }
                 logger.info(f"Merged {len(step_scores)} step scores into trace_steps.")
+
+                if job and pe_runner and judge_result:
+                    sid = _pipeline_eval_source_id(state)
+                    pe_runner.record_judge_mirror(job, {**judge_result, "source_id": sid})
+                    per_judge = dict((job.get("pipeline_evals") or {}).get("judge") or {})
+                    by_source = dict(per_judge.get("per_source") or {})
+                    by_source[sid or "__unknown__"] = judge_result
+                    per_judge["per_source"] = by_source
+                    per_judge["aggregate"] = judge_result
+                    job.setdefault("pipeline_evals", {})["judge"] = per_judge
+                    try:
+                        from sia.evals.quality_score import compute_quality_scores
+
+                        quality = compute_quality_scores(
+                            job,
+                            judge_result=judge_result,
+                            trace_steps=state.get("trace_steps", []),
+                            tool_executions=job.get("tool_executions") or [],
+                            llm_client=llm_client,
+                            schema=schema.to_dict() if schema else None,
+                            use_deepeval=True,
+                        )
+                        pe_runner.record_quality(job, quality, source_id=sid or "")
+                    except Exception as q_exc:
+                        logger.warning("Quality score computation failed: %s", q_exc)
 
             except Exception as e:
                 logger.error(f"Judge failed in finalize_node: {e}")

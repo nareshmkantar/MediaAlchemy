@@ -29,6 +29,7 @@
             <div class="status-header">
                 <span class="status-icon">⏳</span>
                 <span class="status-title">Waiting...</span>
+                <span id="activeContextChip" class="active-context-chip" hidden></span>
             </div>
             <div class="status-content">
                 <p>Upload a file to start processing</p>
@@ -37,7 +38,7 @@
 
         <div class="log-section">
             <details class="processing-log-details" id="processingLogDetails" open>
-                <summary class="processing-log-summary">Processing log <span class="processing-log-hint">(scrollable while running; collapses when finished)</span></summary>
+                <summary class="processing-log-summary">Processing log <span class="processing-log-hint">(scrollable while running; collapses when finished)</span> <a id="downloadProcessingLog" class="processing-log-download" href="#" hidden>Download log</a></summary>
                 <div class="log-timeline-scroll" id="logTimelineScroll">
                     <div class="log-timeline" id="logTimeline">
                         <div class="log-empty">Waiting for processing...</div>

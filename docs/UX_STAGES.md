@@ -8,8 +8,8 @@ Product-facing backend stages map to work as follows.
 
 | UX stage | User-facing intent | Backend / notes |
 |----------|-------------------|-----------------|
-| **0** | Upload data + optional JSON scope; start guided setup | Job created (`stage0_complete` when `data_files` non-empty). |
-| **1** | Per source/sheet: layout (demarcation) then semantic column mapping | `ux_source_progress[source_id].layout_complete` after demarcation submit; `.mapping_complete` after mapping submit. Multi-file jobs also require `relationships_gate_complete` (set when file relationships are saved) or a single data file. |
+| **0** | Upload data + JSON scope; register media hierarchy (publisher + grain); start guided setup | Job created; `hierarchy_register_complete` when each main-data source has publisher + grain (and mixed-grain ack if needed). `stage0_complete` requires data files **and** hierarchy registration. |
+| **1** | Per source/sheet: **Column shaping** (multipart split/combine → media dimensions) then semantic column mapping | `ux_source_progress[source_id].layout_complete` after column shaping save (also sets `column_standardize_complete`); `.mapping_complete` after mapping submit. Multi-file jobs also require `relationships_gate_complete` (set when file relationships are saved) or a single data file. Layout Demarcation is no longer on the Guided Setup happy path. |
 | **2** | Drop blank columns, column typing, date interpretation, **date normalisation**, then **hygiene** | Matches pipeline order in `sia/tools/pipeline_catalog.py`: `column_typing` and `date_normalisation` use lower `sort_key` than `hygiene`, so tools run **after** canonical dates exist, **before** row-level junk removal and **before** value standardisation. |
 | **3** | Value standardisation (`map_values`, `format`, `fuzzy_standardize`, …) | `value_standardisation` stage only. |
 | **4** | Reshape / aggregate / validate | `reshaping_aggregation` then `validation`. |
@@ -20,7 +20,7 @@ Product-facing backend stages map to work as follows.
 - `ux_source_progress`: map `source_id` → `{ layout_complete, mapping_complete }`.
 - `relationships_gate_complete`: `false` when a second data file is added; set `true` when relationship decisions are persisted (`save_file_relationships`) or automatically for single-file jobs.
 
-`GET /api/status/<job_id>` includes `ux_stepper_summary` with derived booleans `stage0_complete`, `stage1_complete`, and copies of the above for the stepper.
+`GET /api/status/<job_id>` includes `ux_stepper_summary` with derived booleans `stage0_complete`, `stage1_complete`, `hierarchy_register_complete`, and copies of the above for the stepper.
 
 ## PATCH
 

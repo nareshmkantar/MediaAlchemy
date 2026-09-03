@@ -12,6 +12,7 @@ PAUSE_TYPE_TRIGGER_NODE: Dict[str, str] = {
     "plan_review": "generate_plan",
     "file_relationship_review": "resolve_mapping",
     "destructive_approval": "execute_tools",
+    "integrity_review": "execute_tools",
     "verification_stall": "verify_output",
     "structural_review": "analyze_structure",
 }

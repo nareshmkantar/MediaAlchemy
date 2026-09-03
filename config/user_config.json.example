@@ -1,6 +1,6 @@
 {
   "llm_model": "azure-gpt-5.3-chat",
-  "debug_enabled": true,
+  "debug_enabled": false,
   "enable_llm_judge": false,
   "azure_api_version": "2025-04-01-preview",
   "azure_deployment": "gpt-5.3-chat",
