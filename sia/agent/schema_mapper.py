@@ -281,6 +281,7 @@ class SchemaMapper:
                         primary_targets=primary_targets_set,
                     ),
                     **target_suggestion,
+                    "date_semantic": self._date_semantic_for(str(col)),
                     "unique_values": meta.get("unique_values", []),
                     "stats": meta.get("stats", {})
                 }))
@@ -705,6 +706,7 @@ class SchemaMapper:
                     primary_targets=primary_targets,
                 ),
                 **target_suggestion,
+                "date_semantic": self._date_semantic_for(col_name),
                 "unique_values": samples,
                 "stats": meta.get("stats", {})
             }))
@@ -792,10 +794,10 @@ class SchemaMapper:
 
         Contract:
           * **exclude** - source column is blank, derived noise, or already decided as ``Discard``.
-          * **primary** - matched ``target_column`` is a date key, a ``uid_hierarchy`` member,
-            or a template metric in ``primary_targets``.
+          * **primary** - matched ``target_column`` is in ``primary_targets``
+            (Config enterprise fields, media hierarchy, date, spends / impressions / clicks).
           * **exclude** - metric-like columns that do not map to one of those primary targets.
-          * **supporting** - useful non-metric context that is neither excluded nor primary.
+          * **supporting** - IDs and other attributes that are neither excluded nor primary.
 
         Does not replace ``decision`` / ``target_column``; UI keeps those in sync via
         ``applyRoleRule`` on the frontend.
@@ -823,6 +825,15 @@ class SchemaMapper:
             return "exclude"
 
         return "supporting"
+
+    @staticmethod
+    def _date_semantic_for(column_name: str) -> str:
+        try:
+            from .hierarchy_register import suggest_date_semantic
+
+            return suggest_date_semantic(column_name) or ""
+        except Exception:
+            return ""
 
     @staticmethod
     def _normalize_name(name: str) -> str:

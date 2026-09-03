@@ -3040,7 +3040,7 @@ function inferDecisionFromTarget(col) {
 
 /**
  * AI-suggested UI role for a source column: 'primary', 'supporting', or 'exclude'.
- * Kept in sync with SchemaMapper.infer_column_role in schema_mapper.py.
+ * Primary = Config enterprise + media hierarchy + date + spends/impressions/clicks.
  */
 function inferRoleFromSemantics(col) {
     if (!col) return 'supporting';
@@ -3121,20 +3121,57 @@ function applyDecisionRule(col) {
     col.decision = inferDecisionFromTarget(col);
 }
 
+function compactMappingKey(value) {
+    return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+function dateRoleFromVisibleWords(name) {
+    const tokens = String(name || '')
+        .toLowerCase()
+        .split(/[\s_\-/|>.,;:()[\]{}]+/)
+        .filter(Boolean);
+    if (tokens.some((t) => t === 'start' || t === 'from' || t === 'begin')) return 'range_start';
+    if (tokens.some((t) => t === 'end' || t === 'to' || t === 'until' || t === 'finish')) return 'range_end';
+    if (tokens.includes('year')) return 'part_year';
+    if (tokens.includes('month')) return 'part_month';
+    if (tokens.includes('day')) return 'part_day';
+    if (tokens.includes('quarter') || tokens.some((t) => /^q[1-4]$/.test(t))) return 'part_quarter';
+    return '';
+}
+
+/** Config Date aliases whose wording already carries a role. Whole name only. */
+const DATE_ROLE_WHOLE_ALIASES = [
+    'interval start', 'interval end',
+    'start date', 'end date',
+    'flight start', 'flight end',
+    'order start date', 'order end date',
+];
+
+function dateRoleFromWholeAlias(name) {
+    const key = compactMappingKey(name);
+    if (!key) return '';
+    for (const alias of DATE_ROLE_WHOLE_ALIASES) {
+        if (compactMappingKey(alias) === key) {
+            return dateRoleFromVisibleWords(alias);
+        }
+    }
+    return '';
+}
+
 function inferDateSemanticFromColumn(col) {
     if (!col || typeof col !== 'object') return '';
-    const name = String(col.column_name || '').trim().toLowerCase();
+    const raw = String(col.column_name || '').trim();
+    const name = raw.toLowerCase();
     const target = String(col.target_column || '').trim().toLowerCase();
     const ctype = String(col.column_type || '').trim().toLowerCase();
     if (!(ctype.includes('date') || isDateLikeTargetName(target) || isLikelyDateColumnName(name))) {
         return '';
     }
-    if (/(^|[\s_])(start|from|begin)([\s_]|$)/.test(name)) return 'range_start';
-    if (/(^|[\s_])(end|to|until|finish)([\s_]|$)/.test(name)) return 'range_end';
-    if (/(^|[\s_])year([\s_]|$)/.test(name)) return 'part_year';
-    if (/(^|[\s_])month([\s_]|$)/.test(name)) return 'part_month';
-    if (/(^|[\s_])day([\s_]|$)/.test(name)) return 'part_day';
-    if (/(^|[\s_])q[1-4]([\s_]|$)|(^|[\s_])quarter([\s_]|$)/.test(name)) return 'part_quarter';
+    // Whole-name alias first: intervalStart == "interval start". Do not split camelCase.
+    const fromAlias = dateRoleFromWholeAlias(raw);
+    if (fromAlias) return fromAlias;
+    const fromVisible = dateRoleFromVisibleWords(raw);
+    if (fromVisible) return fromVisible;
     if (/(range|period|to|until|through)/.test(name)) return 'period_text';
     return 'point_in_time';
 }
@@ -3713,7 +3750,7 @@ window.updateCardTarget = function (columnName, newTarget, blockId) {
         }
     }
     if (target !== 'No match') {
-        col.role = (primaryTargetColumns.has(target) || isMetricTarget(target)) ? 'primary' : 'supporting';
+        col.role = primaryTargetColumns.has(target) ? 'primary' : 'supporting';
         col.decision = col.role === 'primary' ? 'Keep' : 'Metadata';
         applyOutputAliasForRole(col);
     } else {

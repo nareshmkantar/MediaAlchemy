@@ -106,7 +106,6 @@ from sia.agent.target_template_utils import (
     is_no_match_target,
     mapping_target_columns_for_ui,
     normalize_target_template,
-    primary_target_columns,
     validate_template_shape,
 )
 from sia.agent.planner import finalize_extraction_plan
@@ -8254,9 +8253,8 @@ def propose_mapping(job_id):
         )
         target_columns = load_target_columns_for_job(job)
         target_template = load_target_template_for_job(job)
-        primary_targets = primary_target_columns(target_template)
-        from sia.agent.hierarchy_register import mapping_metric_targets as _metric_tgts
-        primary_targets = set(primary_targets) | {m["id"] for m in _metric_tgts()}
+        from sia.agent.hierarchy_register import mapping_primary_targets as _mapping_primary
+        primary_targets = set(_mapping_primary())
         target_column_options = list(job.get("_mapping_target_options") or [])
         # Ensure every target_columns entry has a labeled option
         have = {str(o.get("id")) for o in target_column_options if isinstance(o, dict)}

@@ -37,6 +37,13 @@ _END_NAME_HINT = re.compile(
 
 def _header_start_score(col_name: str) -> float:
     """Loose name hint for **start** side of a range (word-boundary safe — avoids ``publisher``)."""
+    try:
+        from .hierarchy_register import suggest_date_semantic
+
+        if suggest_date_semantic(col_name) == "range_start":
+            return 1.0
+    except Exception:
+        pass
     n = str(col_name).lower().replace("_", " ")
     if re.search(r"\b(start|begin)\b", n):
         return 1.0
@@ -49,6 +56,13 @@ def _header_start_score(col_name: str) -> float:
 
 def _header_end_score(col_name: str) -> float:
     """Loose name hint for **end** side of a range."""
+    try:
+        from .hierarchy_register import suggest_date_semantic
+
+        if suggest_date_semantic(col_name) == "range_end":
+            return 1.0
+    except Exception:
+        pass
     n = str(col_name).lower().replace("_", " ")
     if re.search(r"\b(end|finish|through|until)\b", n):
         return 1.0

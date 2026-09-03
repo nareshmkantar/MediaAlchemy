@@ -1039,6 +1039,38 @@
       "target": "date"
     },
     {
+      "source": "interval start",
+      "target": "date"
+    },
+    {
+      "source": "interval end",
+      "target": "date"
+    },
+    {
+      "source": "start date",
+      "target": "date"
+    },
+    {
+      "source": "end date",
+      "target": "date"
+    },
+    {
+      "source": "flight start",
+      "target": "date"
+    },
+    {
+      "source": "flight end",
+      "target": "date"
+    },
+    {
+      "source": "order start date",
+      "target": "date"
+    },
+    {
+      "source": "order end date",
+      "target": "date"
+    },
+    {
       "source": "market",
       "target": "market"
     },

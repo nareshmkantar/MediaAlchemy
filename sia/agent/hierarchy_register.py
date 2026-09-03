@@ -98,6 +98,43 @@ def save_catalog(data: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+# Schema Mapping Primary Column targets. IDs and other attributes stay Supporting Meta.
+_MAPPING_PRIMARY_METRICS = ("spends", "impressions", "clicks")
+_MAPPING_PRIMARY_ALWAYS = ("date", "country", "category", "brand")
+
+
+def mapping_primary_targets(catalog: Optional[Dict[str, Any]] = None) -> List[str]:
+    """Targets that default to Primary Column in Schema Mapping.
+
+    Built from Config, not the target template: enterprise fields that exist
+    (Country / Category / Brand and any other required enterprise info), the
+    media-hierarchy spine, Date, and Spends / Impressions / Clicks. Everything
+    else — including identifier columns — defaults to Supporting Meta.
+    """
+    cat = catalog or load_catalog()
+    out: List[str] = []
+    seen = set()
+
+    def add(field_id: Any) -> None:
+        fid = str(field_id or "").strip()
+        if not fid or fid in seen:
+            return
+        seen.add(fid)
+        out.append(fid)
+
+    ei = cat.get("enterprise_info") or {}
+    for field in ei.get("mandatory_fields") or []:
+        if isinstance(field, dict):
+            add(field.get("id"))
+    for fid in _MAPPING_PRIMARY_ALWAYS:
+        add(fid)
+    for level in media_hierarchy_levels(cat):
+        add(level.get("id"))
+    for fid in _MAPPING_PRIMARY_METRICS:
+        add(fid)
+    return out
+
+
 def media_hierarchy_levels(catalog: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """Shared grain spine from Config — the same list for every publisher."""
     cat = catalog or load_catalog()
@@ -106,7 +143,7 @@ def media_hierarchy_levels(catalog: Optional[Dict[str, Any]] = None) -> List[Dic
         return [
             {
                 "level": int(lv.get("level") or i + 1),
-                "id": lv.get("id") or normalize_key(lv.get("name")).replace(" ", "_"),
+                "id": lv.get("id") or _name_slug(lv.get("name")),
                 "name": lv.get("name") or lv.get("id"),
                 "mandatory": bool(lv.get("mandatory", False)),
             }
@@ -294,15 +331,65 @@ def catalog_for_api() -> Dict[str, Any]:
     }
 
 
-_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 _KEY_SEPARATORS = re.compile(r"[\s_\-/|>.,;:()\[\]{}]+")
+_NON_ALNUM = re.compile(r"[^a-z0-9]+")
 
 
 def normalize_key(value: Any) -> str:
-    """Whole-name key for alias lookup: ``orderName`` and ``order_name`` both
-    become ``order name``, so a column matches an alias only as a complete name."""
-    text = _CAMEL_BOUNDARY.sub(" ", str(value or ""))
-    return " ".join(_KEY_SEPARATORS.sub(" ", text).lower().split())
+    """Whole-name key for alias lookup.
+
+    ``orderName``, ``order_name`` and ``order name`` are the same name because
+    separators and case are ignored — not because camelCase is split into
+    tokens. Splitting ``intervalStart`` into ``interval`` + ``Start`` would
+    invent words that are not in the header.
+    """
+    return _NON_ALNUM.sub("", str(value or "").lower())
+
+
+def _name_slug(value: Any) -> str:
+    """Separator-based id fallback (``Ad Group`` → ``ad_group``)."""
+    return "_".join(_KEY_SEPARATORS.sub(" ", str(value or "").lower()).split())
+
+
+def _date_role_from_visible_words(name: Any) -> str:
+    """Date role from words already separated in *name* — never camelCase pieces."""
+    tokens = [t for t in _KEY_SEPARATORS.split(str(name or "").lower()) if t]
+    if any(t in {"start", "from", "begin"} for t in tokens):
+        return "range_start"
+    if any(t in {"end", "to", "until", "finish"} for t in tokens):
+        return "range_end"
+    if "year" in tokens:
+        return "part_year"
+    if "month" in tokens:
+        return "part_month"
+    if "day" in tokens:
+        return "part_day"
+    if "quarter" in tokens or any(t in {"q1", "q2", "q3", "q4"} for t in tokens):
+        return "part_quarter"
+    return ""
+
+
+def suggest_date_semantic(source_col: str, catalog: Optional[Dict[str, Any]] = None) -> str:
+    """Date role for a header, using the whole name only.
+
+    ``intervalStart`` is Range start because Config has the alias
+    ``interval start`` (same compact name). The letters ``Start`` inside the
+    camelCase header are not read as their own word.
+    """
+    cat = catalog or load_catalog()
+    key = normalize_key(source_col)
+    if not key:
+        return ""
+    for entry in cat.get("mapping_dictionary") or []:
+        if not isinstance(entry, dict):
+            continue
+        source = str(entry.get("source") or "")
+        if normalize_key(source) != key:
+            continue
+        role = _date_role_from_visible_words(source)
+        if role:
+            return role
+    return _date_role_from_visible_words(source_col)
 
 
 def _column_alias_index(catalog: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -356,9 +443,10 @@ def _column_alias_index(catalog: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
 def suggest_column_target(source_col: str, catalog: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Map a source column to a standard field by whole-name alias match.
 
-    Deliberately exact: a header counts only when its full name matches an alias.
-    Substring matching used to read ``orderCurrency`` as Campaign (via ``order``)
-    and ``actions.onsite_conversion`` as Publisher (via ``site``). Unmatched
+    Deliberately exact: a header counts only when its full name matches an alias
+    (separators and case ignored). Substring matching used to read
+    ``orderCurrency`` as Campaign (via ``order``) and
+    ``actions.onsite_conversion`` as Publisher (via ``site``). Unmatched
     columns are left for the analyst rather than guessed at.
     """
     cat = catalog or load_catalog()

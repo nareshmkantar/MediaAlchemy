@@ -21,6 +21,8 @@ from sia.agent.hierarchy_register import (
     registration_is_complete,
     sample_preview,
     suggest_column_target,
+    suggest_date_semantic,
+    normalize_key,
 )
 from sia.agent.job_manager import JobManager
 
@@ -91,13 +93,31 @@ def test_column_matches_an_alias_only_as_a_whole_name(catalog):
     # "order" no longer leaks into every order* header.
     assert suggest_column_target("orderCurrency", catalog)["target"] is None
     assert suggest_column_target("orderBudget", catalog)["target"] is None
-    assert suggest_column_target("orderStartDate", catalog)["target"] is None
+    # Whole-name Date alias, not a Campaign leak from the letters "order".
+    assert suggest_column_target("orderStartDate", catalog)["target"] == "date"
     # "site" (a Publisher alias) no longer hides inside "onsite".
     assert suggest_column_target("actions.onsite_conversion.post_save.7d_click", catalog)["target"] is None
-    # camelCase and snake_case are still the same name as the spaced alias.
+    # Same whole name after separators/case are ignored — not camelCase tokens.
     assert suggest_column_target("orderName", catalog)["target"] == "campaign"
     assert suggest_column_target("order_name", catalog)["target"] == "campaign"
     assert suggest_column_target("adset_name", catalog)["target"] == "ad_group"
+
+
+def test_normalize_key_is_whole_name_not_camelcase_tokens():
+    """orderName equals 'order name' by compact letters, not by inventing tokens."""
+    assert normalize_key("orderName") == normalize_key("order name")
+    assert normalize_key("intervalStart") == normalize_key("interval start")
+    assert normalize_key("intervalStart") != normalize_key("start")
+
+
+def test_date_role_uses_whole_alias_not_camelcase_piece(catalog):
+    """intervalStart is Range start because Config has 'interval start'."""
+    assert suggest_date_semantic("intervalStart", catalog) == "range_start"
+    assert suggest_date_semantic("intervalEnd", catalog) == "range_end"
+    assert suggest_date_semantic("Start Date", catalog) == "range_start"
+    assert suggest_date_semantic("interval_start", catalog) == "range_start"
+    # reportDate matches the Date alias 'report date', which has no start/end word.
+    assert suggest_date_semantic("reportDate", catalog) == ""
 
 
 def test_grain_ignores_qualifier_columns(catalog):
@@ -147,6 +167,17 @@ def test_shared_media_hierarchy_spine(catalog):
     # Order → campaign, Line Item → ad_group
     assert grain["grain_level_id"] == "ad_group"
     assert grain["grain_level_name"] == "Ad Group"
+
+
+def test_mapping_primary_targets_come_from_config_not_template(catalog):
+    from sia.agent.hierarchy_register import mapping_primary_targets
+
+    primary = set(mapping_primary_targets(catalog))
+    assert {"date", "country", "category", "brand", "market"}.issubset(primary)
+    assert {"publisher", "campaign", "ad_group", "ad", "creative"}.issubset(primary)
+    assert {"spends", "impressions", "clicks"}.issubset(primary)
+    assert "advertiser" not in primary
+    assert "region" not in primary
 
 
 def test_infer_grain_uses_columns_not_publisher(catalog):
